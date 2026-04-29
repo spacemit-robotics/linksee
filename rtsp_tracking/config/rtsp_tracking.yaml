@@ -1,0 +1,14 @@
+# RTSP Tracking - ByteTrack 目标追踪模型配置
+# 用于实时 RTSP 推流 + 目标追踪 + 网页框选场景
+model_path: ~/.cache/models/vision/yolov8/yolov8n.q.onnx
+label_file_path: assets/labels/coco.txt
+image_size: [640, 640]
+class: deploy.bytetrack.ByteTrackTracker
+default_params:
+  conf_threshold: 0.25
+  iou_threshold: 0.45
+  track_buffer: 30
+  frame_rate: 30
+  num_threads: 4
+  providers:
+    - SpaceMITExecutionProvider
