@@ -1,0 +1,44 @@
+# Build outputs
+/build/
+dist/
+
+# Python environments
+.venv/
+venv/
+output/
+
+# Python cache and packaging
+__pycache__/
+scripts/__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Python tooling
+.python-version
+.coverage
+htmlcov/
+
+# IDE and editor files
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Models
+model/
+models/
+
+# Dataset records
+datasets/
+data/

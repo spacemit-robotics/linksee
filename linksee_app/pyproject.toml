@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linksee_app"
+version = "0.1.0"
+description = "Linksee native application for mobile grasp workflows"
+requires-python = ">=3.10"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [
+  { name = "Spacemit Robotics", email = "dev@spacemit.com" },
+]
+dependencies = [
+  "torch==2.7.1",
+  "torchvision==0.22.0",
+  "wandb==0.24.0",
+  "pyarrow==23.0.0",
+  "lerobot==0.5.0",
+  "lerobot[feetech]",
+  "zmq",
+]
+
+[project.urls]
+Homepage = "https://github.com/spacemit-robotics/sir"
+
+[tool.setuptools]
+py-modules = []
+
+[tool.srobot_env]
+env_subdir = "linksee_app"

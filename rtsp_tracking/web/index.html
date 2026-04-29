@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Object Tracking</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        h1 { margin-bottom: 20px; font-size: 1.5rem; color: #00d4ff; }
+        .container {
+            width: 100%;
+            max-width: 900px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        .video-box {
+            background: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            position: relative;
+            cursor: crosshair;
+        }
+        .video-box img {
+            width: 100%;
+            display: block;
+        }
+        .video-box canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        .video-box.selecting canvas {
+            pointer-events: auto;
+            cursor: crosshair;
+        }
+        .controls {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .btn-track-all {
+            background: #00c853;
+            color: #fff;
+        }
+        .btn-track-all:hover:not(:disabled) { background: #00e676; }
+        .btn-select {
+            background: #2979ff;
+            color: #fff;
+        }
+        .btn-select:hover:not(:disabled) { background: #448aff; }
+        .btn-select.active {
+            background: #ff6d00;
+        }
+        .btn-stop {
+            background: #ff1744;
+            color: #fff;
+        }
+        .btn-stop:hover:not(:disabled) { background: #ff5252; }
+        .status-bar {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            font-size: 0.85rem;
+            color: #aaa;
+        }
+        .status-bar .item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .status-bar .value {
+            color: #fff;
+            font-weight: 600;
+        }
+        .mode-badge {
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        .mode-off { background: #555; color: #aaa; }
+        .mode-track_all { background: #00c853; color: #fff; }
+        .mode-track_single { background: #2979ff; color: #fff; }
+        .alert-box {
+            display: none;
+            background: #ff1744;
+            color: #fff;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            text-align: center;
+        }
+        .alert-box.show { display: block; }
+        .hint {
+            font-size: 0.85rem;
+            color: #888;
+            text-align: center;
+            display: none;
+        }
+        .hint.show { display: block; }
+    </style>
+</head>
+<body>
+    <h1>AI Object Tracking</h1>
+    <div class="container">
+        <div class="video-box" id="videoBox">
+            <img id="mjpegImg" src="/stream" alt="Live Stream">
+            <canvas id="selectionCanvas"></canvas>
+        </div>
+
+        <div id="alertBox" class="alert-box">
+            目标丢失！请重新选择目标或切换到全部追踪模式。
+        </div>
+
+        <div id="selectHint" class="hint">
+            请在画面上拖拽框选要追踪的目标
+        </div>
+
+        <div class="controls">
+            <button id="btnTrackAll" class="btn-track-all" onclick="trackAll()">开始追踪</button>
+            <button id="btnSelect" class="btn-select" onclick="toggleSelect()">框选目标</button>
+            <button id="btnStop" class="btn-stop" onclick="stopTracking()">停止追踪</button>
+        </div>
+
+        <div class="status-bar">
+            <div class="item">模式: <span id="modeBadge" class="mode-badge mode-off">OFF</span></div>
+            <div class="item">采集: <span id="captureFps" class="value">0</span> fps</div>
+            <div class="item">推理: <span id="inferFps" class="value">0</span> fps</div>
+            <div class="item">目标数: <span id="trackCount" class="value">0</span></div>
+            <div class="item">选中ID: <span id="selectedId" class="value">-</span></div>
+            <div class="item">RTSP: <span id="rtspClients" class="value">0</span></div>
+            <div class="item">总帧数: <span id="totalFrames" class="value">0</span></div>
+        </div>
+    </div>
+
+    <script>
+        const API = window.location.origin;
+        let selectMode = false;
+        let drawing = false;
+        let startX = 0, startY = 0;
+
+        const canvas = document.getElementById('selectionCanvas');
+        const ctx = canvas.getContext('2d');
+        const videoBox = document.getElementById('videoBox');
+        const img = document.getElementById('mjpegImg');
+
+        function resizeCanvas() {
+            canvas.width = img.clientWidth;
+            canvas.height = img.clientHeight;
+        }
+
+        img.onload = resizeCanvas;
+        window.addEventListener('resize', resizeCanvas);
+
+        // Track all objects
+        async function trackAll() {
+            selectMode = false;
+            videoBox.classList.remove('selecting');
+            document.getElementById('selectHint').classList.remove('show');
+            document.getElementById('btnSelect').classList.remove('active');
+            clearCanvas();
+            await fetch(API + '/api/tracking/start', { method: 'POST' });
+        }
+
+        // Toggle selection mode
+        function toggleSelect() {
+            selectMode = !selectMode;
+            const btn = document.getElementById('btnSelect');
+            const hint = document.getElementById('selectHint');
+            if (selectMode) {
+                btn.classList.add('active');
+                hint.classList.add('show');
+                videoBox.classList.add('selecting');
+            } else {
+                btn.classList.remove('active');
+                hint.classList.remove('show');
+                videoBox.classList.remove('selecting');
+                clearCanvas();
+            }
+        }
+
+        // Stop tracking
+        async function stopTracking() {
+            selectMode = false;
+            videoBox.classList.remove('selecting');
+            document.getElementById('selectHint').classList.remove('show');
+            document.getElementById('btnSelect').classList.remove('active');
+            clearCanvas();
+            await fetch(API + '/api/tracking/stop', { method: 'POST' });
+        }
+
+        function clearCanvas() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+
+        // Canvas mouse events for ROI selection
+        canvas.addEventListener('mousedown', (e) => {
+            if (!selectMode) return;
+            resizeCanvas();
+            drawing = true;
+            const rect = canvas.getBoundingClientRect();
+            startX = e.clientX - rect.left;
+            startY = e.clientY - rect.top;
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (!drawing) return;
+            const rect = canvas.getBoundingClientRect();
+            const curX = e.clientX - rect.left;
+            const curY = e.clientY - rect.top;
+
+            clearCanvas();
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([6, 3]);
+            ctx.strokeRect(startX, startY, curX - startX, curY - startY);
+        });
+
+        canvas.addEventListener('mouseup', async (e) => {
+            if (!drawing) return;
+            drawing = false;
+
+            const rect = canvas.getBoundingClientRect();
+            const endX = e.clientX - rect.left;
+            const endY = e.clientY - rect.top;
+
+            // Normalize to [0, 1]
+            const w = canvas.width;
+            const h = canvas.height;
+            const x1 = Math.min(startX, endX) / w;
+            const y1 = Math.min(startY, endY) / h;
+            const x2 = Math.max(startX, endX) / w;
+            const y2 = Math.max(startY, endY) / h;
+
+            // Ignore tiny selections
+            if ((x2 - x1) < 0.01 || (y2 - y1) < 0.01) {
+                clearCanvas();
+                return;
+            }
+
+            // Draw final selection
+            clearCanvas();
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([]);
+            ctx.strokeRect(x1 * w, y1 * h, (x2 - x1) * w, (y2 - y1) * h);
+
+            // Send to backend
+            await fetch(API + '/api/tracking/select', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ x1, y1, x2, y2 })
+            });
+
+            // Exit selection mode
+            selectMode = false;
+            document.getElementById('btnSelect').classList.remove('active');
+            document.getElementById('selectHint').classList.remove('show');
+            videoBox.classList.remove('selecting');
+
+            // Clear canvas after a short delay (boxes are drawn on the video stream)
+            setTimeout(clearCanvas, 1000);
+        });
+
+        // Touch support for mobile
+        canvas.addEventListener('touchstart', (e) => {
+            if (!selectMode) return;
+            e.preventDefault();
+            resizeCanvas();
+            drawing = true;
+            const rect = canvas.getBoundingClientRect();
+            const touch = e.touches[0];
+            startX = touch.clientX - rect.left;
+            startY = touch.clientY - rect.top;
+        });
+
+        canvas.addEventListener('touchmove', (e) => {
+            if (!drawing) return;
+            e.preventDefault();
+            const rect = canvas.getBoundingClientRect();
+            const touch = e.touches[0];
+            const curX = touch.clientX - rect.left;
+            const curY = touch.clientY - rect.top;
+
+            clearCanvas();
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([6, 3]);
+            ctx.strokeRect(startX, startY, curX - startX, curY - startY);
+        });
+
+        canvas.addEventListener('touchend', (e) => {
+            if (!drawing) return;
+            e.preventDefault();
+            // Simulate mouseup with last known position
+            const rect = canvas.getBoundingClientRect();
+            const touch = e.changedTouches[0];
+            const fakeEvent = { clientX: touch.clientX, clientY: touch.clientY };
+            canvas.dispatchEvent(new MouseEvent('mouseup', fakeEvent));
+        });
+
+        // Status polling
+        async function pollStatus() {
+            try {
+                const res = await fetch(API + '/api/status');
+                const data = await res.json();
+
+                document.getElementById('captureFps').textContent = data.capture_fps.toFixed(1);
+                document.getElementById('inferFps').textContent = data.inference_fps.toFixed(1);
+                document.getElementById('trackCount').textContent = data.track_count;
+                document.getElementById('rtspClients').textContent = data.rtsp_clients;
+                document.getElementById('totalFrames').textContent = data.total_frames;
+
+                // Mode badge
+                const badge = document.getElementById('modeBadge');
+                badge.className = 'mode-badge mode-' + data.mode;
+                const modeNames = { off: 'OFF', track_all: '全部追踪', track_single: '单目标追踪' };
+                badge.textContent = modeNames[data.mode] || data.mode;
+
+                // Selected ID
+                const selId = document.getElementById('selectedId');
+                selId.textContent = data.selected_track_id >= 0 ? '#' + data.selected_track_id : '-';
+
+                // Track lost alert
+                const alertBox = document.getElementById('alertBox');
+                if (data.track_lost && data.mode === 'track_single') {
+                    alertBox.classList.add('show');
+                } else {
+                    alertBox.classList.remove('show');
+                }
+            } catch (e) {
+                // ignore
+            }
+        }
+
+        setInterval(pollStatus, 1000);
+        pollStatus();
+    </script>
+</body>
+</html>

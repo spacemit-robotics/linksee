@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI RTSP Detection</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        h1 { margin-bottom: 20px; font-size: 1.5rem; color: #00d4ff; }
+        .container {
+            width: 100%;
+            max-width: 900px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        .video-box {
+            background: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            aspect-ratio: 16/9;
+            position: relative;
+        }
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+        .video-overlay {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.6);
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            color: #0f0;
+        }
+        .video-placeholder {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #666;
+            font-size: 1.1rem;
+        }
+        .controls {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-enable {
+            background: #00c853;
+            color: #fff;
+        }
+        .btn-enable:hover { background: #00e676; }
+        .btn-disable {
+            background: #ff1744;
+            color: #fff;
+        }
+        .btn-disable:hover { background: #ff5252; }
+        .btn-enable:disabled, .btn-disable:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .status-panel {
+            background: #16213e;
+            border-radius: 8px;
+            padding: 16px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+        }
+        .stat-item {
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 1.4rem;
+            font-weight: bold;
+            color: #00d4ff;
+        }
+        .stat-label {
+            font-size: 0.8rem;
+            color: #888;
+            margin-top: 4px;
+        }
+        .indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+        .indicator.on { background: #00c853; box-shadow: 0 0 6px #00c853; }
+        .indicator.off { background: #666; }
+    </style>
+</head>
+<body>
+    <h1>AI RTSP Detection</h1>
+    <div class="container">
+        <div class="video-box">
+            <video id="video" autoplay muted playsinline></video>
+            <div class="video-overlay" id="videoOverlay" style="display:none">LIVE</div>
+            <div class="video-placeholder" id="placeholder">Connecting...</div>
+        </div>
+
+        <div class="controls">
+            <button class="btn-enable" id="btnEnable" onclick="enableInference()">开启检测</button>
+            <button class="btn-disable" id="btnDisable" onclick="disableInference()" disabled>关闭检测</button>
+            <span>
+                <span class="indicator off" id="aiIndicator"></span>
+                <span id="aiStatus">AI Off</span>
+            </span>
+        </div>
+
+        <div class="status-panel">
+            <div class="stat-item">
+                <div class="stat-value" id="captureFps">-</div>
+                <div class="stat-label">采集 FPS</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="inferFps">-</div>
+                <div class="stat-label">推理 FPS</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="detectCount">-</div>
+                <div class="stat-label">检测目标数</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="rtspClients">-</div>
+                <div class="stat-label">RTSP 客户端</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="totalFrames">-</div>
+                <div class="stat-label">总帧数</div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <script>
+        const API = window.location.origin;
+        const HLS_URL = API + '/stream/live.m3u8';
+        const video = document.getElementById('video');
+        let hls = null;
+        let retryTimer = null;
+
+        function initPlayer() {
+            if (Hls.isSupported()) {
+                hls = new Hls({
+                    liveSyncDurationCount: 2,
+                    liveMaxLatencyDurationCount: 4,
+                    manifestLoadingTimeOut: 5000,
+                    manifestLoadingMaxRetry: 100,
+                    manifestLoadingRetryDelay: 2000,
+                });
+                hls.loadSource(HLS_URL);
+                hls.attachMedia(video);
+                hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                    document.getElementById('placeholder').style.display = 'none';
+                    document.getElementById('videoOverlay').style.display = 'block';
+                    video.play();
+                });
+                hls.on(Hls.Events.ERROR, (event, data) => {
+                    if (data.fatal) {
+                        hls.destroy();
+                        hls = null;
+                        // Retry after 3 seconds
+                        document.getElementById('placeholder').textContent = '重连中...';
+                        document.getElementById('placeholder').style.display = 'flex';
+                        retryTimer = setTimeout(initPlayer, 3000);
+                    }
+                });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                // Safari native HLS
+                video.src = HLS_URL;
+                video.addEventListener('loadedmetadata', () => {
+                    document.getElementById('placeholder').style.display = 'none';
+                    document.getElementById('videoOverlay').style.display = 'block';
+                    video.play();
+                });
+            } else {
+                document.getElementById('placeholder').textContent = '浏览器不支持 HLS 播放';
+            }
+        }
+
+        async function enableInference() {
+            await fetch(API + '/api/inference/enable', { method: 'POST' });
+            pollStatus();
+        }
+
+        async function disableInference() {
+            await fetch(API + '/api/inference/disable', { method: 'POST' });
+            pollStatus();
+        }
+
+        async function pollStatus() {
+            try {
+                const res = await fetch(API + '/api/status');
+                const data = await res.json();
+
+                document.getElementById('captureFps').textContent = data.capture_fps.toFixed(1);
+                document.getElementById('inferFps').textContent = data.inference_fps.toFixed(1);
+                document.getElementById('detectCount').textContent = data.detection_count;
+                document.getElementById('rtspClients').textContent = data.rtsp_clients;
+                document.getElementById('totalFrames').textContent = data.total_frames;
+
+                const indicator = document.getElementById('aiIndicator');
+                const statusText = document.getElementById('aiStatus');
+                const btnEnable = document.getElementById('btnEnable');
+                const btnDisable = document.getElementById('btnDisable');
+
+                if (data.inference_enabled) {
+                    indicator.className = 'indicator on';
+                    statusText.textContent = 'AI On';
+                    btnEnable.disabled = true;
+                    btnDisable.disabled = false;
+                } else {
+                    indicator.className = 'indicator off';
+                    statusText.textContent = 'AI Off';
+                    btnEnable.disabled = false;
+                    btnDisable.disabled = true;
+                }
+            } catch (e) {
+                // ignore
+            }
+        }
+
+        // Auto-start
+        initPlayer();
+        setInterval(pollStatus, 2000);
+        pollStatus();
+    </script>
+</body>
+</html>
