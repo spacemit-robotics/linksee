@@ -1,0 +1,27 @@
+# Build and install artifacts
+build/
+install/
+log/
+
+# Colcon/CMake generated files
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+CTestTestfile.cmake
+cmake_install.cmake
+Makefile
+Testing/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store

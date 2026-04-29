@@ -1,0 +1,31 @@
+SpacemiT [linksee_native] Component
+Copyright 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+
+This product includes software developed at
+SpacemiT (Hangzhou) Technology Co. Ltd. (https://www.spacemit.com/).
+
+---------------------------------------------------------------------------
+Third-party Software Notices:
+---------------------------------------------------------------------------
+
+This product contains portions of the following third-party software:
+
+1. LeRobot (https://github.com/huggingface/lerobot)
+   Copyright (c) Hugging Face, Inc. and contributors
+   License information is provided by the installed Python package at runtime.
+
+2. PyTorch (https://github.com/pytorch/pytorch)
+   Copyright (c) PyTorch contributors
+   BSD-style license applies to the distributed package.
+
+3. Weights & Biases (https://github.com/wandb/wandb)
+   Copyright (c) Weights & Biases, Inc.
+   License information is provided by the distributed package.
+
+---------------------------------------------------------------------------
+Additional Attributions:
+---------------------------------------------------------------------------
+
+This component integrates with the mlink device and mlink gateway modules in
+this repository. Their licensing and notices are maintained in their own
+component directories.
