@@ -13,8 +13,8 @@ import signal
 import threading
 import numpy as np
 
-import space_audio
-from space_audio import AudioCapture
+import spacemit_audio
+from spacemit_audio import AudioCapture
 import spacemit_vad
 import spacemit_asr
 
@@ -137,7 +137,7 @@ def main():
             traceback.print_exc()
 
     # --- Audio capture ---
-    space_audio.init(
+    spacemit_audio.init(
         sample_rate=args.rate,
         channels=args.channels,
         chunk_size=args.rate * args.channels * 2 // 25,  # 40ms
