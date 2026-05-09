@@ -30,19 +30,31 @@ class VoiceCmdNode(Node):
         self.declare_parameter('angular_speed', 0.5)       # rad/s
         self.declare_parameter('linear_distance', 0.4)     # m
         self.declare_parameter('angular_angle', 90.0)      # degree
+        self.declare_parameter('linear_tolerance', 0.05)   # m
+        self.declare_parameter('angular_tolerance', 3.0)    # degree
+        self.declare_parameter('linear_kp', 1.2)
+        self.declare_parameter('angular_kp', 1.5)
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_footprint')
         self.declare_parameter('cmd_topic', 'voice_cmd')
         self.declare_parameter('control_rate', 20.0)       # Hz
 
-        self.linear_speed = self.get_parameter('linear_speed').value
-        self.angular_speed = self.get_parameter('angular_speed').value
-        self.linear_distance = self.get_parameter('linear_distance').value
-        self.angular_angle = math.radians(self.get_parameter('angular_angle').value)
+        self.linear_speed = abs(float(self.get_parameter('linear_speed').value))
+        self.angular_speed = abs(float(self.get_parameter('angular_speed').value))
+        self.linear_distance = abs(float(self.get_parameter('linear_distance').value))
+        self.angular_angle = math.radians(
+            abs(float(self.get_parameter('angular_angle').value))
+        )
+        self.linear_tolerance = abs(float(self.get_parameter('linear_tolerance').value))
+        self.angular_tolerance = math.radians(
+            abs(float(self.get_parameter('angular_tolerance').value))
+        )
+        self.linear_kp = abs(float(self.get_parameter('linear_kp').value))
+        self.angular_kp = abs(float(self.get_parameter('angular_kp').value))
         self.odom_frame = self.get_parameter('odom_frame').value
         self.base_frame = self.get_parameter('base_frame').value
         cmd_topic = self.get_parameter('cmd_topic').value
-        control_rate = self.get_parameter('control_rate').value
+        control_rate = float(self.get_parameter('control_rate').value)
 
         # ---------- TF ----------
         self.tf_buffer = Buffer()
@@ -61,6 +73,8 @@ class VoiceCmdNode(Node):
         self._start_yaw = 0.0
         self._target_distance = 0.0
         self._target_angle = 0.0
+        self._target_yaw = 0.0
+        self._motion_mode = None
         self._twist = Twist()
 
         # ---------- 控制定时器 ----------
@@ -126,20 +140,33 @@ class VoiceCmdNode(Node):
 
         twist = Twist()
         if mode == 'linear':
-            twist.linear.x = sign * self.linear_speed
-            self._target_distance = self.linear_distance
+            twist.linear.x = sign * min(
+                self.linear_speed, self.linear_kp * self.linear_distance
+            )
+            self._target_distance = sign * self.linear_distance
             self._target_angle = 0.0
+            self._target_yaw = self._start_yaw
         else:
-            twist.angular.z = sign * self.angular_speed
+            twist.angular.z = sign * min(
+                self.angular_speed, self.angular_kp * self.angular_angle
+            )
             self._target_distance = 0.0
-            self._target_angle = self.angular_angle
+            self._target_angle = sign * self.angular_angle
+            self._target_yaw = self._normalize_angle(
+                self._start_yaw + self._target_angle
+            )
 
+        self._motion_mode = mode
         self._twist = twist
         self._moving = True
         self.get_logger().info(
             f'Executing "{cmd}" — target: '
-            f'dist={self._target_distance:.2f} m, '
-            f'angle={math.degrees(self._target_angle):.1f}°'
+            f'dist={self._target_distance:.2f} m '
+            f'(tol={self.linear_tolerance:.2f} m), '
+            f'angle={math.degrees(self._target_angle):.1f}° '
+            f'(tol={math.degrees(self.angular_tolerance):.1f}°), '
+            f'start_yaw={math.degrees(self._start_yaw):.1f}°, '
+            f'target_yaw={math.degrees(self._target_yaw):.1f}°'
         )
 
     # ------------------------------------------------------------------ #
@@ -151,35 +178,70 @@ class VoiceCmdNode(Node):
 
         pose = self._get_current_pose()
         if pose is None:
-            # TF 暂时不可用，保持上一次指令
-            self.cmd_vel_pub.publish(self._twist)
+            # 精确控制依赖 TF 反馈；反馈丢失时先停车，避免无反馈超调。
+            self.cmd_vel_pub.publish(Twist())
             return
 
         x, y, yaw = pose
 
-        # 判断是否到达目标
-        reached = False
-        if self._target_distance > 0.0:
-            dx = x - self._start_x
-            dy = y - self._start_y
-            traveled = math.hypot(dx, dy)
-            if traveled >= self._target_distance:
-                reached = True
-        elif self._target_angle > 0.0:
-            delta_yaw = abs(self._normalize_angle(yaw - self._start_yaw))
-            if delta_yaw >= self._target_angle:
-                reached = True
+        if self._motion_mode == 'linear':
+            error = self._linear_error(x, y)
+            if abs(error) <= self.linear_tolerance:
+                self._stop(error)
+                return
 
-        if reached:
-            self._stop()
+            twist = Twist()
+            twist.linear.x = self._clamp(self.linear_kp * error, self.linear_speed)
+            self._publish_motion_command(twist)
+        elif self._motion_mode == 'angular':
+            error = self._angular_error(yaw)
+            if abs(error) <= self.angular_tolerance:
+                self._stop(error)
+                return
+
+            twist = Twist()
+            twist.angular.z = self._clamp(self.angular_kp * error, self.angular_speed)
+            self._publish_motion_command(twist)
         else:
-            self.cmd_vel_pub.publish(self._twist)
+            self._stop()
 
-    def _stop(self):
+    def _linear_error(self, x: float, y: float) -> float:
+        """返回沿起始朝向的剩余有符号距离."""
+        dx = x - self._start_x
+        dy = y - self._start_y
+        progress = dx * math.cos(self._start_yaw) + dy * math.sin(self._start_yaw)
+        return self._target_distance - progress
+
+    def _angular_error(self, yaw: float) -> float:
+        """基于 odom->base_footprint 的绝对 yaw 返回剩余有符号角度."""
+        return self._normalize_angle(self._target_yaw - yaw)
+
+    def _publish_motion_command(self, twist: Twist):
+        self._twist = twist
+        self.cmd_vel_pub.publish(twist)
+
+    def _stop(self, final_error=None):
         """停止机器人."""
         self.cmd_vel_pub.publish(Twist())
         self._moving = False
-        self.get_logger().info('Motion complete — robot stopped.')
+        self._motion_mode = None
+        if final_error is None:
+            self.get_logger().info('Motion complete — robot stopped.')
+        elif abs(self._target_distance) > 0.0:
+            self.get_logger().info(
+                'Motion complete — robot stopped. '
+                f'Final distance error: {abs(final_error):.3f} m'
+            )
+        else:
+            self.get_logger().info(
+                'Motion complete — robot stopped. '
+                f'Final angle error: {math.degrees(abs(final_error)):.2f}°'
+            )
+
+    @staticmethod
+    def _clamp(value: float, limit: float) -> float:
+        """将速度限制在 [-limit, limit]."""
+        return max(-limit, min(limit, value))
 
     @staticmethod
     def _normalize_angle(angle: float) -> float:
