@@ -34,8 +34,8 @@ static void print_usage(const char* prog) {
             "  --width <n>           Capture width (default: 1280)\n"
             "  --height <n>          Capture height (default: 720)\n"
             "  --fps <n>             Frame rate (default: 30)\n"
-            "  --rtsp-url <url>      RTSP output URL (default: rtsp://0.0.0.0:8554/live)\n"
-            "  --http-port <n>       HTTP API port (default: 8080)\n"
+            "  --rtsp-url <url>      RTSP output URL (default: rtsp://0.0.0.0:18554/live)\n"
+            "  --http-port <n>       HTTP API port (default: 18080)\n"
             "  --config <path>       VisionService YAML config path\n"
             "  --model <path>        Model path override (optional)\n"
             "  --web-root <path>     Web static files directory (default: ./web)\n"
@@ -46,15 +46,15 @@ static void print_usage(const char* prog) {
             "  %s --device /dev/video0 --config config/rtsp_detection.yaml\n"
             "\n"
             "Then:\n"
-            "  - View RTSP: ffplay rtsp://<board_ip>:8554/live\n"
-            "  - Web UI: http://<board_ip>:8080/\n"
-            "  - Enable AI: curl -X POST http://<board_ip>:8080/api/inference/enable\n",
+            "  - View RTSP: ffplay rtsp://<board_ip>:18554/live\n"
+            "  - Web UI: http://<board_ip>:18080/\n"
+            "  - Enable AI: curl -X POST http://<board_ip>:18080/api/inference/enable\n",
             prog, prog);
 }
 
 int main(int argc, char* argv[]) {
     PipelineConfig config;
-    int http_port = 8080;
+    int http_port = 18080;
     std::string web_root = "./web";
     std::string hls_dir = "/tmp/hls";
 
