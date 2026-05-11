@@ -85,8 +85,6 @@ bool Pipeline::Start() {
     UvcDevAttr devAttr;
     memset(&devAttr, 0, sizeof(devAttr));
     strncpy(devAttr.acDevNode, config_.device_node.c_str(), sizeof(devAttr.acDevNode) - 1);
-    devAttr.eIoMode = UVC_IO_MODE_MMAP;
-    devAttr.u32BufCnt = 4;
 
     if (UVC_CreateDev(kUvcDev, &devAttr) != 0) {
         fprintf(stderr, "[Pipeline] UVC_CreateDev failed\n");
@@ -102,7 +100,7 @@ bool Pipeline::Start() {
     memset(&uvcChnAttr, 0, sizeof(uvcChnAttr));
     uvcChnAttr.u32Width = config_.width;
     uvcChnAttr.u32Height = config_.height;
-    uvcChnAttr.ePixelFormat = PIXEL_FORMAT_MJPEG;
+    uvcChnAttr.ePixelFormat = MPP_PIXEL_FORMAT_MJPEG;
     uvcChnAttr.u32Fps = config_.fps;
     uvcChnAttr.u32Depth = 1;
 
@@ -119,11 +117,9 @@ bool Pipeline::Start() {
     VdecChnAttr vdecAttr;
     memset(&vdecAttr, 0, sizeof(vdecAttr));
     vdecAttr.eCodecType = MPP_STREAM_CODEC_MJPEG;
-    vdecAttr.eOutputPixelFormat = PIXEL_FORMAT_NV12;
+    vdecAttr.eOutputPixelFormat = MPP_PIXEL_FORMAT_NV12;
     vdecAttr.u32Width = config_.width;
     vdecAttr.u32Height = config_.height;
-    vdecAttr.u32FrameBufCnt = 12;
-    vdecAttr.eFrameBufMode = VDEC_FRAME_BUF_DMABUF_INTERNAL;
 
     if (VDEC_CreateChn(kVdecChn, &vdecAttr) != 0) {
         fprintf(stderr, "[Pipeline] VDEC_CreateChn failed\n");
@@ -138,10 +134,9 @@ bool Pipeline::Start() {
     VencChnAttr vencAttr;
     memset(&vencAttr, 0, sizeof(vencAttr));
     vencAttr.eCodecType = MPP_STREAM_CODEC_H264;
-    vencAttr.eInputPixelFormat = PIXEL_FORMAT_NV12;
+    vencAttr.eInputPixelFormat = MPP_PIXEL_FORMAT_NV12;
     vencAttr.u32Width = config_.width;
     vencAttr.u32Height = config_.height;
-    vencAttr.u32Stride = 0;
     vencAttr.u32Bitrate = 4000000;
     vencAttr.u32FrameRate = config_.fps;
     vencAttr.u32Gop = config_.fps;  // 1 second GOP
@@ -290,17 +285,36 @@ void Pipeline::CaptureLoop() {
         stream.bEndOfStream = MPP_FALSE;
         stream.u64PTS = uvcFrame.stVFrame.u64PTS;
 
-        ret = VDEC_SendStream(kVdecChn, &stream);
+        ret = VDEC_SendStream(kVdecChn, &stream, 0);
         UVC_ReleaseFrame(kUvcDev, kUvcChn, &uvcFrame);
         if (ret != 0) continue;
 
         // 3. Receive decoded NV12 frame
         VideoFrameInfo decFrame;
-        UL ulVbBuff = 0;
         memset(&decFrame, 0, sizeof(decFrame));
 
-        ret = VDEC_RecvFrame(kVdecChn, &decFrame, &ulVbBuff, vdec_timeout);
+        ret = VDEC_GetFrame(kVdecChn, &decFrame, vdec_timeout);
         if (ret != 0) continue;
+        UL ulVbBuff = decFrame.ulBufferId;
+
+        // NV12 plane layout assumes stride == width and UV plane right after Y.
+        // Hardware decoders can align stride (e.g. 16/32/64); enforce once per
+        // stream so a silent stride mismatch surfaces as a clear error instead
+        // of a smeared frame.
+        uint32_t y_stride = decFrame.stVFrame.u32PlaneStride[0];
+        if (!stride_checked_) {
+            if (y_stride != 0 && y_stride != config_.width) {
+                fprintf(stderr,
+                        "[Pipeline] FATAL: VDEC Y plane stride=%u != width=%u. "
+                        "Current nv12_draw / cv::cvtColor paths assume packed NV12. "
+                        "Either pick an aligned resolution or rewrite buffer handling to use stride.\n",
+                        y_stride, config_.width);
+                VDEC_ReleaseFrame(kVdecChn, ulVbBuff);
+                running_.store(false);
+                break;
+            }
+            stride_checked_ = true;
+        }
 
         // 4. If AI enabled: push frame to infer thread + draw cached results
         if (ai_enabled_.load()) {
@@ -348,14 +362,14 @@ void Pipeline::CaptureLoop() {
 
         // 5. Send NV12 frame to VENC
         decFrame.eFrameType = FRAME_TYPE_VENC;
-        ret = VENC_SendFrame(kVencChn, &decFrame);
+        ret = VENC_SendFrame(kVencChn, &decFrame, 0);
         VDEC_ReleaseFrame(kVdecChn, ulVbBuff);
         if (ret != 0) continue;
 
         // 6. Receive encoded stream and forward to MUX
         StreamBufferInfo encStream;
         memset(&encStream, 0, sizeof(encStream));
-        ret = VENC_RecvStream(kVencChn, &encStream, venc_timeout);
+        ret = VENC_GetStream(kVencChn, &encStream, venc_timeout);
         if (ret == 0) {
             MuxPacket muxPkt;
             memset(&muxPkt, 0, sizeof(muxPkt));
@@ -383,7 +397,11 @@ void Pipeline::CaptureLoop() {
 }
 
 void Pipeline::InferLoop() {
-    if (!vision_) return;
+    if (!vision_) {
+        fprintf(stderr, "[Pipeline] InferLoop: vision_ is null, exiting\n");
+        return;
+    }
+    fprintf(stderr, "[Pipeline] InferLoop started\n");
 
     using Clock = std::chrono::steady_clock;
     auto fps_start = Clock::now();
@@ -403,12 +421,19 @@ void Pipeline::InferLoop() {
             frame_ready_ = false;
         }
 
-        if (frame.empty() || !ai_enabled_.load()) continue;
+        if (frame.empty()) {
+            fprintf(stderr, "[Pipeline] InferLoop: frame is empty\n");
+            continue;
+        }
+        if (!ai_enabled_.load()) continue;
 
         // Run inference
         std::vector<VisionServiceResult> results;
         auto status = vision_->InferImage(frame, &results);
-        if (status != VISION_SERVICE_OK) continue;
+        if (status != VISION_SERVICE_OK) {
+            fprintf(stderr, "[Pipeline] InferImage failed: status=%d\n", status);
+            continue;
+        }
 
         // Update cached results
         {

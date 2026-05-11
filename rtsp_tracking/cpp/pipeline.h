@@ -84,6 +84,7 @@ private:
     std::thread capture_thread_;
     std::thread infer_thread_;
     std::atomic<bool> running_{false};
+    bool stride_checked_{false};
 
     // Tracking mode
     std::atomic<int> tracking_mode_{static_cast<int>(TrackingMode::OFF)};

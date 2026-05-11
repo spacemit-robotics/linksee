@@ -68,6 +68,7 @@ private:
     std::thread infer_thread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> ai_enabled_{false};
+    bool stride_checked_{false};
 
     // Inference result cache (infer thread writes, capture thread reads)
     mutable std::mutex result_mutex_;

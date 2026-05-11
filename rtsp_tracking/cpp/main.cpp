@@ -35,8 +35,8 @@ static void print_usage(const char* prog) {
             "  --width <n>           Capture width (default: 1280)\n"
             "  --height <n>          Capture height (default: 720)\n"
             "  --fps <n>             Frame rate (default: 30)\n"
-            "  --rtsp-url <url>      RTSP output URL (default: rtsp://0.0.0.0:8554/live)\n"
-            "  --http-port <n>       HTTP API port (default: 8080)\n"
+            "  --rtsp-url <url>      RTSP output URL (default: rtsp://0.0.0.0:18554/live)\n"
+            "  --http-port <n>       HTTP API port (default: 18080)\n"
             "  --config <path>       VisionService YAML config path\n"
             "  --model <path>        Model path override (optional)\n"
             "  --web-root <path>     Web static files directory (default: ./web)\n"
@@ -46,15 +46,15 @@ static void print_usage(const char* prog) {
             "  %s --device /dev/video0 --config config/rtsp_tracking.yaml\n"
             "\n"
             "Then:\n"
-            "  - Web UI:  http://<board_ip>:8080/\n"
-            "  - RTSP:    ffplay rtsp://<board_ip>:8554/live\n"
-            "  - MJPEG:   http://<board_ip>:8080/stream\n",
+            "  - Web UI:  http://<board_ip>:18080/\n"
+            "  - RTSP:    ffplay rtsp://<board_ip>:18554/live\n"
+            "  - MJPEG:   http://<board_ip>:18080/stream\n",
             prog, prog);
 }
 
 int main(int argc, char* argv[]) {
     PipelineConfig config;
-    int http_port = 8080;
+    int http_port = 18080;
     std::string web_root = "./web";
 
     for (int i = 1; i < argc; ++i) {
