@@ -8,19 +8,18 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Configuration
-DEVICE="${DEVICE:-/dev/video12}"
+DEVICE="${DEVICE:-/dev/video1}"
 WIDTH="${WIDTH:-1280}"
 HEIGHT="${HEIGHT:-720}"
 FPS="${FPS:-30}"
-RTSP_URL="${RTSP_URL:-rtsp://0.0.0.0:8554/live}"
-HTTP_PORT="${HTTP_PORT:-8080}"
+RTSP_URL="${RTSP_URL:-rtsp://0.0.0.0:18554/live}"
+HTTP_PORT="${HTTP_PORT:-18080}"
 CONFIG="${CONFIG:-${APP_DIR}/config/rtsp_detection.yaml}"
 WEB_ROOT="${WEB_ROOT:-${APP_DIR}/web}"
 HLS_DIR="${HLS_DIR:-/tmp/hls}"
 MPP_V4L2_LINLON_PLUGIN="${MPP_V4L2_LINLON_PLUGIN:-${APP_DIR}/build/mpp/al/vcodec/libv4l2_linlonv5v7_codec.so}"
 FFMPEG_LOGLEVEL="${FFMPEG_LOGLEVEL:-warning}"
 FFMPEG_MAX_DELAY_US="${FFMPEG_MAX_DELAY_US:-500000}"
-FFMPEG_RW_TIMEOUT_US="${FFMPEG_RW_TIMEOUT_US:-5000000}"
 FFMPEG_RECONNECT_DELAY_MAX="${FFMPEG_RECONNECT_DELAY_MAX:-2}"
 HLS_TIME="${HLS_TIME:-2}"
 HLS_LIST_SIZE="${HLS_LIST_SIZE:-5}"
@@ -91,22 +90,18 @@ wait_rtsp_ready() {
     return 1
 }
 
-wait_rtsp_ready 127.0.0.1 8554 20
+wait_rtsp_ready 127.0.0.1 18554 20
 
 # Start FFmpeg HLS transcoder (no re-encoding, just repackaging)
 BOARD_IP=$(hostname -I | awk '{print $1}')
-RTSP_PLAY_URL="rtsp://127.0.0.1:8554/live"
+RTSP_PLAY_URL="rtsp://127.0.0.1:18554/live"
 
 ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" \
     -rtsp_transport tcp \
     -fflags nobuffer \
     -flags low_delay \
     -max_delay "$FFMPEG_MAX_DELAY_US" \
-    -rw_timeout "$FFMPEG_RW_TIMEOUT_US" \
     -reorder_queue_size 0 \
-    -reconnect 1 \
-    -reconnect_streamed 1 \
-    -reconnect_delay_max "$FFMPEG_RECONNECT_DELAY_MAX" \
     -i "$RTSP_PLAY_URL" \
     -c copy \
     -f hls \
@@ -119,7 +114,7 @@ FFMPEG_PID=$!
 echo "[start.sh] FFmpeg HLS started (PID=$FFMPEG_PID)"
 echo ""
 echo "Access:"
-echo "  RTSP:  ffplay rtsp://${BOARD_IP}:8554/live"
+echo "  RTSP:  ffplay rtsp://${BOARD_IP}:18554/live"
 echo "  Web:   http://${BOARD_IP}:${HTTP_PORT}/"
 echo "  HLS:   ${HLS_DIR}/live.m3u8"
 echo ""
