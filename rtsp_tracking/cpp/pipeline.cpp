@@ -112,8 +112,6 @@ bool Pipeline::Start() {
     UvcDevAttr devAttr;
     memset(&devAttr, 0, sizeof(devAttr));
     strncpy(devAttr.acDevNode, config_.device_node.c_str(), sizeof(devAttr.acDevNode) - 1);
-    devAttr.eIoMode = UVC_IO_MODE_MMAP;
-    devAttr.u32BufCnt = 4;
 
     if (UVC_CreateDev(kUvcDev, &devAttr) != 0) {
         fprintf(stderr, "[Pipeline] UVC_CreateDev failed\n");
@@ -129,7 +127,7 @@ bool Pipeline::Start() {
     memset(&uvcChnAttr, 0, sizeof(uvcChnAttr));
     uvcChnAttr.u32Width = config_.width;
     uvcChnAttr.u32Height = config_.height;
-    uvcChnAttr.ePixelFormat = PIXEL_FORMAT_MJPEG;
+    uvcChnAttr.ePixelFormat = MPP_PIXEL_FORMAT_MJPEG;
     uvcChnAttr.u32Fps = config_.fps;
     uvcChnAttr.u32Depth = 1;
 
@@ -146,11 +144,9 @@ bool Pipeline::Start() {
     VdecChnAttr vdecAttr;
     memset(&vdecAttr, 0, sizeof(vdecAttr));
     vdecAttr.eCodecType = MPP_STREAM_CODEC_MJPEG;
-    vdecAttr.eOutputPixelFormat = PIXEL_FORMAT_NV12;
+    vdecAttr.eOutputPixelFormat = MPP_PIXEL_FORMAT_NV12;
     vdecAttr.u32Width = config_.width;
     vdecAttr.u32Height = config_.height;
-    vdecAttr.u32FrameBufCnt = 12;
-    vdecAttr.eFrameBufMode = VDEC_FRAME_BUF_DMABUF_INTERNAL;
 
     if (VDEC_CreateChn(kVdecChn, &vdecAttr) != 0) {
         fprintf(stderr, "[Pipeline] VDEC_CreateChn failed\n");
@@ -165,10 +161,9 @@ bool Pipeline::Start() {
     VencChnAttr vencAttr;
     memset(&vencAttr, 0, sizeof(vencAttr));
     vencAttr.eCodecType = MPP_STREAM_CODEC_H264;
-    vencAttr.eInputPixelFormat = PIXEL_FORMAT_NV12;
+    vencAttr.eInputPixelFormat = MPP_PIXEL_FORMAT_NV12;
     vencAttr.u32Width = config_.width;
     vencAttr.u32Height = config_.height;
-    vencAttr.u32Stride = 0;
     vencAttr.u32Bitrate = 4000000;
     vencAttr.u32FrameRate = config_.fps;
     vencAttr.u32Gop = config_.fps;
@@ -328,17 +323,17 @@ void Pipeline::CaptureLoop() {
         stream.bEndOfStream = MPP_FALSE;
         stream.u64PTS = uvcFrame.stVFrame.u64PTS;
 
-        ret = VDEC_SendStream(kVdecChn, &stream);
+        ret = VDEC_SendStream(kVdecChn, &stream, 0);
         UVC_ReleaseFrame(kUvcDev, kUvcChn, &uvcFrame);
         if (ret != 0) continue;
 
         // 3. Receive decoded NV12 frame
         VideoFrameInfo decFrame;
-        UL ulVbBuff = 0;
         memset(&decFrame, 0, sizeof(decFrame));
 
-        ret = VDEC_RecvFrame(kVdecChn, &decFrame, &ulVbBuff, vdec_timeout);
+        ret = VDEC_GetFrame(kVdecChn, &decFrame, vdec_timeout);
         if (ret != 0) continue;
+        UL ulVbBuff = decFrame.ulBufferId;
 
         uint8_t* y_ptr = reinterpret_cast<uint8_t*>(decFrame.stVFrame.ulPlaneVirAddr[0]);
         uint32_t y_size = config_.width * config_.height;
@@ -405,14 +400,14 @@ void Pipeline::CaptureLoop() {
 
         // 7. Send NV12 to VENC
         decFrame.eFrameType = FRAME_TYPE_VENC;
-        ret = VENC_SendFrame(kVencChn, &decFrame);
+        ret = VENC_SendFrame(kVencChn, &decFrame, 0);
         VDEC_ReleaseFrame(kVdecChn, ulVbBuff);
         if (ret != 0) continue;
 
         // 8. Receive encoded stream and forward to MUX
         StreamBufferInfo encStream;
         memset(&encStream, 0, sizeof(encStream));
-        ret = VENC_RecvStream(kVencChn, &encStream, venc_timeout);
+        ret = VENC_GetStream(kVencChn, &encStream, venc_timeout);
         if (ret == 0) {
             MuxPacket muxPkt;
             memset(&muxPkt, 0, sizeof(muxPkt));

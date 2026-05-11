@@ -1,12 +1,12 @@
 # RTSP Detection - YOLOv8 模型配置
 # 用于实时 RTSP 推流 + AI 检测场景
-model_path: ~/.cache/models/vision/yolov8/yolov8n.q.onnx
+model_path: /home/user/.cache/models/vision/yolov8/yolov8n.q.onnx
 label_file_path: assets/labels/coco.txt
 image_size: [640, 640]
 class: deploy.yolov8.YOLOv8Detector
 default_params:
   conf_threshold: 0.35
   iou_threshold: 0.45
-  num_threads: 4
+  num_threads: 8
   providers:
     - SpaceMITExecutionProvider

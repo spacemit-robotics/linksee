@@ -1,6 +1,6 @@
 # RTSP Tracking - ByteTrack 目标追踪模型配置
 # 用于实时 RTSP 推流 + 目标追踪 + 网页框选场景
-model_path: ~/.cache/models/vision/yolov8/yolov8n.q.onnx
+model_path: /home/user/.cache/models/vision/yolov8/yolov8n.q.onnx
 label_file_path: assets/labels/coco.txt
 image_size: [640, 640]
 class: deploy.bytetrack.ByteTrackTracker
