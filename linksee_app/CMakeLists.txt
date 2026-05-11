@@ -14,7 +14,7 @@ if(TARGET components::mlink_device)
     set(MLINK_DEVICE_TARGET components::mlink_device)
 else()
     set(MLINK_INCLUDE_DIR
-        ${REPO_ROOT}/components/agent_tools/mlink/device/include
+        ${REPO_ROOT}/components/agent_tools/mlink_device/include
     )
     set(MLINK_LIBRARY
         ${REPO_ROOT}/output/build/cmake/pkgs/components_agent_tools_mlink_device/libmlink_device.so
@@ -87,8 +87,6 @@ install(PROGRAMS
     DESTINATION share/linksee/scripts
 )
 
-install(DIRECTORY models/ DESTINATION share/linksee/models)
-install(DIRECTORY DESTINATION share/linksee/datasets)
 install(FILES
     LICENSE
     NOTICE
