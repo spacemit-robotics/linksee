@@ -149,7 +149,7 @@ def generate_launch_description():
 
     declare_feedback_enable = DeclareLaunchArgument(
         'feedback_enable',
-        default_value='false',
+        default_value='true',
         description='Whether to enable motor feedback from RCPU'
     )
 
