@@ -32,14 +32,17 @@ cd /path/to/spacemit_robot
 source build/envsetup.sh
 ```
 
-### 2. 编译 MPP
+### 2. 编译依赖（MPP + Vision）
+
+在仓库根目录执行（产物安装到 `output/staging`）：
 
 ```bash
-cd components/multimedia/mpp
-mm
+mm components/multimedia/mpp
+mm components/model_zoo/vision
 ```
 
-`mm` 命令会自动编译 mpp 并安装硬件编解码插件到 `/usr/lib/`。
+- 动态库（`output/staging/lib/`）：`libmpp.so`、`libv4l2_linlonv5v7_codec2.so`、`libvision.so`
+- 头文件（`output/staging/include/`）：如 `vision_service.h`
 
 ### 3. 下载模型
 
@@ -54,18 +57,40 @@ bash scripts/download_models.sh
 
 ```bash
 cd application/ros2/linksee/rtsp_tracking
+rm -rf CMakeCache.txt CMakeFiles
 mkdir -p build && cd build
 cmake .. && make -j
 ```
 
+CMake 会链接 `output/staging` 中的 `libmpp.so`、`libvision.so`；若 staging 无 vision 则回退 `third_party/vision`。
+
 ## 运行
 
-在 `application/ros2/linksee/rtsp_tracking` 目录执行：
+运行期需加载 `output/staging/lib` 中的 `libmpp.so`、`libvision.so`。在**仓库根目录**：
 
 ```bash
+cd /path/to/spacemit_robot
+source build/envsetup.sh
+```
+
+`source` 后请确认 `output/staging/lib` 在 `LD_LIBRARY_PATH` 中。未使用 `envsetup.sh` 时，请自行：
+
+```bash
+export LD_LIBRARY_PATH=/path/to/spacemit_robot/output/staging/lib:${LD_LIBRARY_PATH:-}
+```
+
+在 `rtsp_tracking` 目录启动：
+
+```bash
+cd application/ros2/linksee/rtsp_tracking
+
+export MPP_V4L2_LINLON_PLUGIN="${PWD}/build/lib/libv4l2_linlonv5v7_codec2.so"
+# 或: <repo>/output/staging/lib/libv4l2_linlonv5v7_codec2.so
+
 ./build/example_rtsp_tracking \
     --device /dev/video1 \
     --config ./config/rtsp_tracking.yaml \
+    --rtsp-url rtsp://0.0.0.0:18554/live \
     --width 1280 --height 720 --fps 30
 ```
 
@@ -165,9 +190,15 @@ sudo usermod -aG video $USER
 
 ### 2. `can not find v4l2_linlonv5v7 plugin`
 
-**原因**：mpp codec 插件未安装。
+**原因**：MPP 硬件 codec 插件未找到。
 
-**解决**：确认已用 root 执行 `mm` 编译 mpp，插件会自动安装到 `/usr/lib/libv4l2_linlonv5v7_codec2.so`。
+**解决**：
+
+```bash
+mm components/multimedia/mpp
+ls output/staging/lib/libv4l2_linlonv5v7_codec2.so
+export MPP_V4L2_LINLON_PLUGIN=/path/to/libv4l2_linlonv5v7_codec2.so
+```
 
 ### 3. `VB_CreatePool: no free pool slot, max=16`
 
@@ -182,9 +213,15 @@ sudo rm -f /dev/shm/tcm_sync_standalone /dev/shm/mpp_* /dev/shm/vb_*
 
 ### 4. 找不到 `libvision.so`
 
-**原因**：`third_party/vision/lib/libvision.so` 不存在或路径不对。
+**原因**：`output/staging/lib/libvision.so` 与 `third_party/vision` 均不可用。
 
-**解决**：检查文件是否存在，或使用 `-DVISION_LIBRARY=/path/to/libvision.so`。
+**解决**：
+
+```bash
+mm components/model_zoo/vision
+ls output/staging/lib/libvision.so
+# 或拷贝到 third_party/vision/lib/，或 cmake -DVISION_LIBRARY=...
+```
 
 ### 5. 启动时报 `--config is required`
 

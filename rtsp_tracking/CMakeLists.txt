@@ -5,22 +5,10 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# External VisionService dependency.
-set(_VISION_LOCAL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vision/include")
-set(_VISION_LOCAL_LIBRARY "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vision/lib/libvision.so")
-set(VISION_INCLUDE_DIR "${_VISION_LOCAL_INCLUDE}" CACHE PATH "Directory containing vision_service.h")
-set(VISION_LIBRARY "${_VISION_LOCAL_LIBRARY}" CACHE FILEPATH "Path to libvision.so")
-
-if(NOT EXISTS "${VISION_INCLUDE_DIR}/vision_service.h")
-    message(FATAL_ERROR "vision_service.h not found in VISION_INCLUDE_DIR=${VISION_INCLUDE_DIR}")
-endif()
-if(NOT EXISTS "${VISION_LIBRARY}")
-    message(FATAL_ERROR
-        "VISION_LIBRARY does not exist: ${VISION_LIBRARY}\n"
-        "Copy libvision.so to ${_VISION_LOCAL_LIBRARY}, or pass -DVISION_LIBRARY=/path/to/libvision.so")
-endif()
-
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../../components/multimedia/mpp ${CMAKE_BINARY_DIR}/mpp)
+get_filename_component(LINKSEE_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../" ABSOLUTE)
+set(LINKSEE_APP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/LinkseeVision.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/LinkseeMpp.cmake")
 
 function(_rtsp_httplib_header_ok hdr_path out_var)
     if(NOT EXISTS "${hdr_path}")
@@ -176,7 +164,7 @@ add_executable(example_rtsp_tracking
 target_include_directories(example_rtsp_tracking PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp
     ${VISION_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../components/multimedia/mpp/include
+    ${MPP_INCLUDE_DIRS}
     ${_httplib_include_dir}
     ${OpenCV_INCLUDE_DIRS}
 )
@@ -184,26 +172,26 @@ target_include_directories(example_rtsp_tracking PRIVATE
 target_link_libraries(example_rtsp_tracking PRIVATE
     ${VISION_LIBRARY}
     ${OpenCV_LIBS}
-    mpp_uvc
-    mpp_vdec
-    mpp_venc
-    mpp_mux
-    mpp_sys
+    mpp
     pthread
 )
 
 get_filename_component(_vision_lib_dir "${VISION_LIBRARY}" DIRECTORY)
+set(_mpp_lib_dir "${MPP_STAGING_DIR}/lib")
 set_target_properties(example_rtsp_tracking PROPERTIES
-    BUILD_RPATH "${_vision_lib_dir}"
-    INSTALL_RPATH "${_vision_lib_dir}"
+    BUILD_RPATH "${_vision_lib_dir};${_mpp_lib_dir}"
+    INSTALL_RPATH "${_vision_lib_dir};${_mpp_lib_dir}"
 )
 
 # Copy the codec plugin next to the executable so the MPP plugin loader
-# finds the freshly built version instead of the stale /usr/lib copy.
-add_custom_command(TARGET example_rtsp_tracking POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:example_rtsp_tracking>/lib"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:v4l2_linlonv5v7_codec2>"
-        "$<TARGET_FILE_DIR:example_rtsp_tracking>/lib/"
-    COMMENT "Copying v4l2_linlonv5v7_codec2.so next to executable"
-)
+# finds the build-tree plugin instead of a stale /usr/lib copy.
+# MPP_VCODEC_PLUGIN is not linked; copy beside binary for dlopen via MPP_V4L2_LINLON_PLUGIN at runtime.
+if(MPP_VCODEC_PLUGIN_AVAILABLE)
+    add_custom_command(TARGET example_rtsp_tracking POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:example_rtsp_tracking>/lib"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MPP_VCODEC_PLUGIN}"
+            "$<TARGET_FILE_DIR:example_rtsp_tracking>/lib/"
+        COMMENT "Copying v4l2_linlonv5v7_codec2.so next to executable"
+    )
+endif()

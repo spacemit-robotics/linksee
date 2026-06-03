@@ -31,14 +31,19 @@ cd /path/to/spacemit_robot
 source build/envsetup.sh
 ```
 
-### 2. 编译 MPP
+### 2. 编译依赖（MPP + Vision）
+
+在仓库根目录执行（产物安装到 `output/staging`）：
 
 ```bash
-cd components/multimedia/mpp
-mm
+mm components/multimedia/mpp
+mm components/model_zoo/vision
 ```
 
-`mm` 命令会自动编译 mpp 并安装硬件编解码插件到 `/usr/lib/`。
+- 动态库（`output/staging/lib/`）：`libmpp.so`、`libv4l2_linlonv5v7_codec2.so`、`libvision.so`
+- 头文件（`output/staging/include/`）：如 `vision_service.h`（与 `LinkseeVision.cmake` 查找路径一致）
+
+`mm` 也可能将 codec 插件安装到系统 `/usr/lib/`；rtsp 应用默认优先使用 staging 与可执行文件旁 `build/lib/` 中的插件。
 
 ### 3. 下载模型
 
@@ -53,11 +58,29 @@ bash scripts/download_models.sh
 
 ```bash
 cd application/ros2/linksee/rtsp_detection
+rm -rf CMakeCache.txt CMakeFiles   # 若曾在源码目录误执行过 cmake ..
 mkdir -p build && cd build
 cmake .. && make -j
 ```
 
+CMake 会链接 `output/staging` 中的 `libmpp.so`、`libvision.so`；若 staging 不存在则回退到 `third_party/vision/lib/libvision.so`。
+
 ## 运行
+
+可执行文件链接了 `libmpp.so`、`libvision.so`，**运行期**仍需能从 `output/staging/lib/` 加载它们（仅编译通过不够）。在**仓库根目录**执行：
+
+```bash
+cd /path/to/spacemit_robot
+source build/envsetup.sh
+```
+
+`source build/envsetup.sh` 后，请确认 `output/staging/lib` 已出现在 `LD_LIBRARY_PATH` 中（例如 `echo $LD_LIBRARY_PATH`）。本仓库默认以 `output/staging` 为安装前缀，一般无需再手工 export。
+
+若未使用 `envsetup.sh`，需手动设置，例如：
+
+```bash
+export LD_LIBRARY_PATH=/path/to/spacemit_robot/output/staging/lib:${LD_LIBRARY_PATH:-}
+```
 
 **重要**：运行前请根据实际摄像头设备修改 `scripts/start.sh` 中的 `DEVICE` 变量（默认 `/dev/video1`）。
 
@@ -78,9 +101,13 @@ bash scripts/start.sh
 ### 手动运行（不使用脚本）
 
 ```bash
+export MPP_V4L2_LINLON_PLUGIN="${PWD}/build/lib/libv4l2_linlonv5v7_codec2.so"
+# 或未 POST_BUILD 拷贝时: output/staging/lib/libv4l2_linlonv5v7_codec2.so
+
 ./build/example_rtsp_detection \
     --device /dev/video1 \
     --config ./config/rtsp_detection.yaml \
+    --rtsp-url rtsp://0.0.0.0:18554/live \
     --width 1280 --height 720 --fps 30
 ```
 
@@ -146,9 +173,16 @@ sudo usermod -aG video $USER
 
 ### 2. `can not find v4l2_linlonv5v7 plugin`
 
-**原因**：mpp codec 插件未安装。
+**原因**：MPP 硬件 codec 插件未找到。
 
-**解决**：确认已用 root 执行 `mm` 编译 mpp，插件会自动安装到 `/usr/lib/libv4l2_linlonv5v7_codec2.so`。
+**解决**：
+
+```bash
+mm components/multimedia/mpp
+ls output/staging/lib/libv4l2_linlonv5v7_codec2.so
+# 或使用 start.sh（自动选择 staging / build/lib）
+export MPP_V4L2_LINLON_PLUGIN=/path/to/libv4l2_linlonv5v7_codec2.so
+```
 
 ### 3. `VB_CreatePool: no free pool slot, max=16`
 
