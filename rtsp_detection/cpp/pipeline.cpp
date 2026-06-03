@@ -9,11 +9,6 @@
 #include <utility>
 #include <vector>
 
-#include "pipeline.h"
-#include "nv12_draw.h"
-
-#include <opencv2/imgproc.hpp>
-
 extern "C" {
 #include "sys_api.h"
 #include "vb_api.h"
@@ -22,6 +17,18 @@ extern "C" {
 #include "venc/venc_api.h"
 #include "mux/mux_api.h"
 }
+
+#ifdef MIN
+#undef MIN
+#endif
+#ifdef MAX
+#undef MAX
+#endif
+
+#include "pipeline.h"
+#include "nv12_draw.h"
+
+#include <opencv2/imgproc.hpp>
 
 // Channel IDs used throughout
 static constexpr int kUvcDev  = 0;

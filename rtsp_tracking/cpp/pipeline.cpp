@@ -15,13 +15,6 @@
 #include <utility>
 #include <vector>
 
-#include "pipeline.h"
-
-#include <opencv2/imgcodecs.hpp>
-#include <opencv2/imgproc.hpp>
-
-#include "nv12_draw.h"
-
 extern "C" {
 #include "sys_api.h"
 #include "vb_api.h"
@@ -30,6 +23,20 @@ extern "C" {
 #include "venc/venc_api.h"
 #include "mux/mux_api.h"
 }
+
+#ifdef MIN
+#undef MIN
+#endif
+#ifdef MAX
+#undef MAX
+#endif
+
+#include "pipeline.h"
+
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+
+#include "nv12_draw.h"
 
 static constexpr int kUvcDev  = 0;
 static constexpr int kUvcChn  = 0;

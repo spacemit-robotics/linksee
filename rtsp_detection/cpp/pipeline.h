@@ -23,7 +23,7 @@ struct PipelineConfig {
     uint32_t width = 1280;
     uint32_t height = 720;
     uint32_t fps = 30;
-    std::string rtsp_url = "rtsp://0.0.0.0:8554/live";
+    std::string rtsp_url = "rtsp://0.0.0.0:18554/live";
     std::string config_path;   // VisionService YAML config
     std::string model_path;    // optional model override
 };
