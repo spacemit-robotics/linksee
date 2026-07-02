@@ -1,0 +1,26 @@
+# Python dependencies for perceptive_grasp scripts.
+#
+# 通用依赖从配置的 PyPI 镜像解析，SpaceMIT wheel 从下方项目包索引解析。
+
+--index-url https://mirrors.aliyun.com/pypi/simple
+--extra-index-url https://git.spacemit.com/api/v4/projects/33/packages/pypi/simple
+
+# Common config/runtime helpers
+PyYAML
+numpy
+pybind11
+build
+setuptools
+wheel
+
+# Hand-eye calibration and ChArUco board generation
+opencv-contrib-python==v4.13.0.92
+pyrealsense2==2.57.7
+pyserial
+scipy
+
+# ASR/TTS voice control
+spacemit-audio
+spacemit-vad
+spacemit-asr
+spacemit-tts

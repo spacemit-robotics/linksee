@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>perceptive_grasp</name>
+  <version>0.1.0</version>
+  <description>Linksee visual grasping pipeline for SO101 arm with RealSense D435i.</description>
+  <maintainer email="dev@spacemit.com">Spacemit Robotics</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>cmake</buildtool_depend>
+
+  <depend>opencv</depend>
+  <depend>yaml-cpp</depend>
+  <depend>librealsense2</depend>
+
+  <exec_depend>python3</exec_depend>
+
+  <export>
+    <build_type>cmake</build_type>
+  </export>
+</package>
