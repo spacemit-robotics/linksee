@@ -74,7 +74,7 @@ class PipelineVoiceReleaseOrderTest(unittest.TestCase):
         terminal_body = match.group("body")
         idle_index = terminal_body.find("Voice: waiting for next command")
         self.assertNotIn("executor_->EmergencyStop()", terminal_body)
-        self.assertIn("return_to_observe_pending_", terminal_body)
+        self.assertNotIn("return_to_observe_pending_", terminal_body)
         self.assertGreaterEqual(idle_index, 0)
 
     def test_voice_success_does_not_schedule_extra_observe_return(self):
@@ -95,11 +95,13 @@ class PipelineVoiceReleaseOrderTest(unittest.TestCase):
         self.assertIn("executor_->MoveToObserve()", body)
         self.assertIn("Cancelled; returning to observe position", body)
 
-    def test_successful_place_returns_directly_to_observe(self):
+    def test_successful_place_returns_home_or_observe_by_mode(self):
         body = _function_body(self.source, "void GraspPipeline::HandleHoming")
         self.assertIn("move_to_observe_after_place", body)
+        self.assertIn("move_to_home_after_place", body)
+        self.assertIn("config_.voice.enabled", body)
         self.assertIn("executor_->MoveToObserve()", body)
-        self.assertNotIn("executor_->MoveToHome()", body)
+        self.assertIn("executor_->MoveToHome()", body)
 
     def test_home_voice_command_returns_home_then_exits(self):
         trigger_body = _function_body(

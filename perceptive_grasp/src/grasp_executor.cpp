@@ -54,7 +54,6 @@ GraspExecutor::~GraspExecutor() {
         grasp_free(gripper_);
     }
     if (arm_) {
-        manip_stop(arm_);
         manip_free(arm_);
         // kin_ 由 manip_free 自动释放 (所有权已转移)
     }

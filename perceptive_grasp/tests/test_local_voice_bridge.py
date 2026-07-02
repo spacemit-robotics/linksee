@@ -142,13 +142,87 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         self.assertEqual(rate, 16000)
         self.assertEqual(FakeAudio.probed_rates, [48000, 44100, 32000, 16000])
 
+    def test_spacemit_capture_format_falls_back_to_stereo(self):
+        class FakeAudio:
+            probed_formats = []
+
+            @classmethod
+            def init(cls, sample_rate, channels, chunk_size, capture_device):
+                cls.probed_formats.append((sample_rate, channels))
+                self.assertEqual(chunk_size, sample_rate * channels * 2 // 25)
+                self.assertEqual(capture_device, 0)
+
+        class FakeCapture:
+            def __init__(self):
+                self.rate, self.channels = FakeAudio.probed_formats[-1]
+                self.stopped = False
+
+            def set_callback(self, callback):
+                self.callback = callback
+
+            def start(self):
+                return self.rate == 16000 and self.channels == 2
+
+            def stop(self):
+                self.stopped = True
+
+        rate, channels = local_voice_bridge.resolve_spacemit_capture_format(
+            device=0,
+            requested_rate=16000,
+            requested_channels=None,
+            audio_module=FakeAudio,
+            capture_cls=FakeCapture,
+        )
+
+        self.assertEqual((rate, channels), (16000, 2))
+        self.assertEqual(FakeAudio.probed_formats[0], (16000, 2))
+
+    def test_spacemit_capture_format_keeps_non_primary_device_mono(self):
+        class FakeAudio:
+            probed_formats = []
+
+            @classmethod
+            def init(cls, sample_rate, channels, chunk_size, capture_device):
+                cls.probed_formats.append((sample_rate, channels))
+                self.assertEqual(chunk_size, sample_rate * channels * 2 // 25)
+                self.assertEqual(capture_device, 1)
+
+        class FakeCapture:
+            def __init__(self):
+                self.rate, self.channels = FakeAudio.probed_formats[-1]
+
+            def set_callback(self, callback):
+                self.callback = callback
+
+            def start(self):
+                return True
+
+            def stop(self):
+                pass
+
+        rate, channels = local_voice_bridge.resolve_spacemit_capture_format(
+            device=1,
+            requested_rate=16000,
+            requested_channels=None,
+            audio_module=FakeAudio,
+            capture_cls=FakeCapture,
+        )
+
+        self.assertEqual((rate, channels), (16000, 1))
+        self.assertEqual(FakeAudio.probed_formats, [(16000, 1)])
+
     def test_pipeline_config_uses_mono_asr_input(self):
         config_path = ROOT / "config" / "grasp_pipeline.yaml"
         with config_path.open("r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
 
-        self.assertEqual(set(config["voice"]["asr"].keys()), {"device", "rate"})
+        self.assertEqual(
+            set(config["voice"]["asr"].keys()),
+            {"device", "rate", "channels"},
+        )
         self.assertEqual(config["voice"]["asr"]["rate"], 16000)
+        self.assertEqual(config["voice"]["asr"]["device"], 1)
+        self.assertEqual(config["voice"]["asr"]["channels"], 1)
 
     def test_pipeline_config_enables_local_tts_on_usb_audio_output(self):
         config_path = ROOT / "config" / "grasp_pipeline.yaml"
@@ -171,7 +245,6 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         self.assertEqual(
             set(config["voice"].keys()),
             {
-                "enabled",
                 "trigger_words",
                 "asr",
                 "tts",
@@ -237,7 +310,15 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
             {"state": "IDLE", "message": "Home position reached; exiting"},
         )
 
-    def test_home_exit_status_stops_voice_bridge_after_tts_queue(self):
+    def test_ready_status_is_spoken_by_default(self):
+        event = "state=IDLE;message=Ready"
+
+        self.assertEqual(
+            local_voice_bridge.status_to_speech(event, {}, False),
+            "系统已就绪。",
+        )
+
+    def test_home_exit_status_stops_voice_bridge_without_extra_tts(self):
         class FakeStdout:
             def __init__(self):
                 self.lines = [
@@ -271,7 +352,6 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
 
         self.assertFalse(running.is_set())
         self.assertEqual(proc.terminate_count, 1)
-        self.assertEqual(text_queue.get_nowait(), "已回到初始位置，程序退出。")
         self.assertIsNone(text_queue.get_nowait())
 
     def test_status_reader_replaces_stale_tts_queue_with_latest_status(self):

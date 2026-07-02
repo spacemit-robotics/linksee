@@ -57,8 +57,8 @@ manipulator:
 
 - `uart_device`：SO101 串口。
 - `baudrate`：舵机总线波特率。
-- `home_joints`：收到结束、待命、回家或 home 指令后的退出前姿态。
-- `observe_joints`：检测前的观察姿态；抓取完成后也会停留在该姿态等待下一条命令。
+- `home_joints`：普通指定目标抓取完成后的退出前姿态；语音模式收到结束、待命、回家或 home 指令后也会回到该姿态。
+- `observe_joints`：检测前的观察姿态；语音模式下抓取完成后也会停留在该姿态等待下一条命令。
 - `wrist_yaw_scale`：腕部 yaw 映射比例。
 
 ## 4. 放置参数
@@ -82,5 +82,4 @@ timing:
   release_wait_ms: 800
 ```
 
-这些参数只控制固定等待时间；机械臂速度由 `manipulator.move_speed` 和
-`manipulator.line_speed` 控制。
+这些参数只控制固定等待时间；机械臂速度由 `manipulator.move_speed` 和 `manipulator.line_speed` 控制。

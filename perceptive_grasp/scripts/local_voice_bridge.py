@@ -27,7 +27,7 @@ from tts_node import (
 
 
 STATUS_PREFIX = "VOICE_STATUS\t"
-VOICE_BRIDGE_VERSION = "2026-07-01-asr-rate-probe-v3"
+VOICE_BRIDGE_VERSION = "2026-07-02-asr-format-probe-v6"
 CAPTURE_RATE_CANDIDATES = (48000, 44100, 32000, 16000, 8000)
 WAITING_PROMPT = "请继续说要抓取的物体。"
 
@@ -152,18 +152,15 @@ def _read_grasp_stdout(proc, text_queue, running, reverse_aliases,
             except queue.Full:
                 pass
         should_exit = status_requests_bridge_exit(event)
+        if should_exit:
+            request_shutdown(proc, running, text_queue)
+            break
         speech = status_to_speech(event, reverse_aliases, speak_all_states)
         if not speech or speech == last_spoken:
-            if should_exit:
-                request_shutdown(proc, running, text_queue)
-                break
             continue
         last_spoken = speech
         if queue_tts_update(text_queue, speech):
             print(f"[VoiceBridge] Queue TTS: {speech}", flush=True)
-        if should_exit:
-            request_shutdown(proc, running, text_queue)
-            break
     running.clear()
 
 
@@ -269,6 +266,15 @@ def candidate_capture_rates(requested_rate: int) -> List[int]:
     return rates
 
 
+def candidate_capture_channels(device: int,
+                               requested_channels: Optional[int]) -> List[int]:
+    if requested_channels is not None:
+        return [int(requested_channels)]
+    if device == 0:
+        return [2, 1]
+    return [1]
+
+
 def _stop_capture_quietly(capture) -> None:
     for method_name in ("stop", "close"):
         method = getattr(capture, method_name, None)
@@ -286,56 +292,73 @@ def _stop_capture_quietly(capture) -> None:
 def resolve_spacemit_capture_rate(device: int, requested_rate: int,
                                   channels: int, audio_module,
                                   capture_cls) -> int:
+    rate, _ = resolve_spacemit_capture_format(
+        device,
+        requested_rate,
+        channels,
+        audio_module,
+        capture_cls,
+    )
+    return rate
+
+
+def resolve_spacemit_capture_format(device: int, requested_rate: int,
+                                    requested_channels: Optional[int],
+                                    audio_module, capture_cls):
     print(
-        "[VoiceBridge] Probe SpaceMIT ASR capture rates: "
-        f"device={device}, requested={requested_rate}Hz",
+        "[VoiceBridge] Probe SpaceMIT ASR capture formats: "
+        f"device={device}, requested={requested_rate}Hz, "
+        f"channels={requested_channels or 'auto'}",
         flush=True,
     )
-    for rate in candidate_capture_rates(requested_rate):
-        capture = None
-        try:
-            audio_module.init(
-                sample_rate=rate,
-                channels=channels,
-                chunk_size=rate * channels * 2 // 25,
-                capture_device=device,
-            )
-            capture = capture_cls()
-            capture.set_callback(lambda data: None)
-            started = bool(capture.start())
-        except Exception as exc:
-            started = False
-            print(
-                "[VoiceBridge] Probe SpaceMIT ASR capture: "
-                f"device={device}, rate={rate}Hz -> fail ({exc})",
-                flush=True,
-            )
-        else:
-            print(
-                "[VoiceBridge] Probe SpaceMIT ASR capture: "
-                f"device={device}, rate={rate}Hz -> "
-                f"{'ok' if started else 'fail'}",
-                flush=True,
-            )
-        finally:
-            if capture is not None:
-                _stop_capture_quietly(capture)
-
-        if started:
-            if rate != requested_rate:
+    for channels in candidate_capture_channels(device, requested_channels):
+        for rate in candidate_capture_rates(requested_rate):
+            capture = None
+            try:
+                audio_module.init(
+                    sample_rate=rate,
+                    channels=channels,
+                    chunk_size=rate * channels * 2 // 25,
+                    capture_device=device,
+                )
+                capture = capture_cls()
+                capture.set_callback(lambda data: None)
+                started = bool(capture.start())
+            except Exception as exc:
+                started = False
                 print(
-                    "[VoiceBridge] ASR capture rate fallback: "
-                    f"{requested_rate} -> {rate} Hz",
+                    "[VoiceBridge] Probe SpaceMIT ASR capture: "
+                    f"device={device}, rate={rate}Hz, channels={channels} "
+                    f"-> fail ({exc})",
                     flush=True,
                 )
-            return rate
+            else:
+                print(
+                    "[VoiceBridge] Probe SpaceMIT ASR capture: "
+                    f"device={device}, rate={rate}Hz, channels={channels} -> "
+                    f"{'ok' if started else 'fail'}",
+                    flush=True,
+                )
+            finally:
+                if capture is not None:
+                    _stop_capture_quietly(capture)
+
+            if started:
+                if rate != requested_rate or channels != requested_channels:
+                    print(
+                        "[VoiceBridge] ASR capture format selected: "
+                        f"{rate} Hz, {channels} ch",
+                        flush=True,
+                    )
+                return rate, channels
 
     print(
-        "[VoiceBridge] No probed SpaceMIT ASR capture rate worked; "
-        f"keep configured rate {requested_rate} Hz",
+        "[VoiceBridge] No probed SpaceMIT ASR capture format worked; "
+        f"keep configured {requested_rate} Hz, "
+        f"{requested_channels or 1} ch",
         flush=True,
     )
-    return requested_rate
+    return requested_rate, requested_channels or 1
 
 
 def resolve_capture_rate(device: int, requested_rate: int, channels: int,
@@ -406,11 +429,12 @@ def run_asr_loop(args, proc, running):
     asr_cfg = voice_cfg.get("asr", {}) or {}
     device = args.device if args.device is not None else int(asr_cfg.get("device", -1))
     rate = args.rate if args.rate is not None else int(asr_cfg.get("rate", 16000))
-    channels = (
+    configured_channels = (
         args.channels if args.channels is not None
-        else default_asr_channels(asr_cfg)
+        else asr_cfg.get("channels")
     )
-    rate = resolve_spacemit_capture_rate(
+    channels = int(configured_channels) if configured_channels is not None else None
+    rate, channels = resolve_spacemit_capture_format(
         device,
         rate,
         channels,

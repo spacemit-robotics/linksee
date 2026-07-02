@@ -12,6 +12,7 @@
     */
 
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
@@ -23,6 +24,8 @@
 #include <thread>
 
 #include <yaml-cpp/yaml.h>
+
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -52,19 +55,16 @@ static bool TriggerVoiceCommand(const std::string& command_text) {
     return g_pipeline->TriggerVoiceCommand(command_text);
 }
 
-static void CleanupRuntime() {
+static void CleanupRuntime(bool destroy_pipeline = true) {
 #ifdef ENABLE_ROS2_VOICE
     if (g_voice_listener) {
         g_voice_listener->Stop();
         g_voice_listener.reset();
     }
 #endif
-    {
+    if (destroy_pipeline) {
         std::lock_guard<std::mutex> lock(g_pipeline_mutex);
-        if (g_pipeline) {
-            g_pipeline->Stop();
-            g_pipeline.reset();
-        }
+        g_pipeline.reset();
     }
     if (g_local_voice_thread.joinable()) {
         g_local_voice_thread.detach();
@@ -158,10 +158,9 @@ static std::string MakeStatusEvent(PipelineState state,
 }
 
 static void SignalHandler(int sig) {
-    (void)sig;
-    std::cout << "\n[Main] Signal received, stopping..." << std::endl;
-    CleanupRuntime();
-    exit(0);
+    const char msg[] = "\n[Main] Signal received, exiting...\n";
+    (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    std::_Exit(128 + sig);
 }
 
 static void PrintUsage(const char* prog) {
@@ -372,7 +371,6 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
 
     // Voice command interface (ASR text integration)
     if (auto voice = root["voice"]) {
-        cfg.voice.enabled = voice["enabled"].as<bool>(false);
         cfg.voice.input_topic =
             voice["input_topic"].as<std::string>(cfg.voice.input_topic);
         cfg.voice.status_topic =
@@ -549,7 +547,7 @@ int main(int argc, char* argv[]) {
     }
     cfg.auto_loop = auto_loop;
     cfg.step_mode = step_mode;
-    if (voice_mode || voice_stdin) cfg.voice.enabled = true;
+    cfg.voice.enabled = voice_mode || voice_stdin;
     if (tts_mode || status_stdout) cfg.voice.tts_enabled = true;
     if (!voice_topic.empty()) cfg.voice.input_topic = voice_topic;
     if (!status_topic.empty()) cfg.voice.status_topic = status_topic;
@@ -651,6 +649,8 @@ int main(int argc, char* argv[]) {
             std::cerr << "Failed to trigger voice command." << std::endl;
             return 1;
         }
+    } else if (!target_name.empty()) {
+        g_pipeline->TriggerGrasp(target_name);
     } else if (cfg.voice.enabled) {
         if (voice_stdin) {
             std::cout << "[Voice] Waiting for command on stdin" << std::endl;
@@ -660,12 +660,17 @@ int main(int argc, char* argv[]) {
         }
     } else if (target_name.empty()) {
         g_pipeline->TriggerGrasp();
-    } else {
-        g_pipeline->TriggerGrasp(target_name);
     }
 
     // 主循环
     g_pipeline->Run();
+
+    if (voice_stdin) {
+        CleanupRuntime(false);
+        std::cout << std::flush;
+        std::cerr << std::flush;
+        std::_Exit(0);
+    }
 
     CleanupRuntime();
 

@@ -58,8 +58,7 @@ source ~/spacemit_robot/build/envsetup.sh
 ./read_joints --device /dev/ttyACM0
 ```
 
-输出包含 rad、deg 和可复制到 YAML 的关节数组。记录 `home_joints`、`observe_joints`
-和 `place_joints` 时，先手动移动到目标姿态，再执行该命令。
+输出包含 rad、deg 和可复制到 YAML 的关节数组。记录 `home_joints`、`observe_joints` 和 `place_joints` 时，先手动移动到目标姿态，再执行该命令。
 
 ## 6. 安全执行验证
 
@@ -92,5 +91,4 @@ debug:
 
 - `grasp_YYYYMMDD_HHMMSS_mmm_result.json`
 
-失败时先查看 `*_result.json` 的 `terminal_state`、`message`、`last_executor_action`、
-`last_executor_detail` 和 `last_executor_result`。
+失败时先查看 `*_result.json` 的 `terminal_state`、`message`、`last_executor_action`、`last_executor_detail` 和 `last_executor_result`。

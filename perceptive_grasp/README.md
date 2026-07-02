@@ -146,7 +146,7 @@ source ~/spacemit_robot/build/envsetup.sh
 
 语音桥负责录音、VAD、ASR、TTS，并通过 stdin/stdout 与 `perceptive_grasp` 进程通信。
 
-启动本地语音桥：
+推荐使用 Python 语音桥启动完整语音控制：
 
 ```bash
 cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
@@ -157,9 +157,20 @@ python3 scripts/local_voice_bridge.py \
   --binary build/perceptive_grasp
 ```
 
-语音桥识别到“抓香蕉”“停止”“结束”等命令后，会把文本写入抓取进程 stdin；
-抓取进程通过 stdout 输出状态事件，语音桥再调用 TTS 播报。抓取完成后机械臂停在观察位
-等待下一条命令；说“结束”或“回家”时回到 Home 姿态并退出程序。
+调试命令解析时，也可以直接启动文本语音模式，然后在终端输入“抓香蕉”等文本：
+
+```bash
+build/perceptive_grasp \
+  --config config/grasp_pipeline.yaml \
+  --voice-stdin \
+  --status-stdout
+```
+
+语音桥识别到“抓香蕉”“停止”“结束”等命令后，会把文本写入抓取进程 stdin；抓取进程通过 stdout 输出状态事件，语音桥再调用 TTS 播报。语音模式下，抓取完成后机械臂停在观察位等待下一条命令；说“结束”或“回家”时回到 Home 姿态并退出程序。
+
+语音模式由启动命令决定：
+- `local_voice_bridge.py` 会自动以 `--voice-stdin --status-stdout` 启动抓取进程；
+- `./perceptive_grasp --target banana` 不会进入语音等待模式。
 
 ## 主配置
 
