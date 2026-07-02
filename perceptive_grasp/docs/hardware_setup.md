@@ -119,9 +119,10 @@ voice:
   asr:
     device: 1
     rate: 16000
+    channels: 1
   tts:
     playback_device: 1
     mixer_volume: 80
 ```
 
-K3 上的 USB 麦克风按 `16000Hz` 采集，语音桥会直接把该采样率送入 ASR。TTS 播报使用 USB Audio 输出，并在启动时把该设备的 ALSA `PCM` 音量设为 80%。
+K3 上默认使用 USB Camera 的单声道麦克风输入。TTS 播报使用 USB Audio 输出，并在启动时把该设备的 ALSA `PCM` 音量设为 80%。

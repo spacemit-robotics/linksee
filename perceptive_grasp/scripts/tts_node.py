@@ -242,6 +242,8 @@ def status_to_speech(message: str, reverse_aliases: Dict[str, str],
             return "抓取完成。"
         if state == "ERROR":
             return "抓取失败。"
+        if state == "IDLE" and detail == "Ready":
+            return "系统已就绪。"
         if detail.startswith("Cancelled") or detail.startswith("Cancelling"):
             return "已停止抓取。"
         if detail.startswith("Home position reached; exiting"):
@@ -270,6 +272,8 @@ def status_to_speech(message: str, reverse_aliases: Dict[str, str],
     if msg.startswith("Moving to observe"):
         target = label_to_spoken(_extract_target(msg), reverse_aliases)
         return f"收到，准备抓取{target}。" if target else "收到，准备抓取。"
+    if msg == "Ready":
+        return "系统已就绪。"
     if msg.startswith("Target not found"):
         target = label_to_spoken(_extract_target(msg), reverse_aliases)
         return f"没有看到{target}。" if target else "没有看到指定物体。"

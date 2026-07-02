@@ -193,19 +193,20 @@ timing:
 
 # ============ 语音接口 ============
 voice:
-  # 命令行 --voice-stdin 时，perceptive_grasp 从 stdin 读取 ASR 文本命令。
-  enabled: true
+  # 语音参数配置。是否进入语音模式由启动命令决定。
+  # local_voice_bridge.py 会自动以 --voice-stdin --status-stdout 启动抓取进程。
   # 文本命令触发词。ASR 输出 "抓香蕉" 后会触发抓取 banana
   trigger_words: ["抓", "拿", "pick", "grab"]
   # 本地 ASR 输入设备
   asr:
     device: 1
     rate: 16000
+    channels: 1
   # 本地 TTS 输出设备
   tts:
     playback_device: 1
     # ALSA PCM 播放音量，-1 表示不修改系统 mixer
-    mixer_volume: 10
+    mixer_volume: 80
   # 取消/停止命令。抓取过程中说这些词会停止当前任务，并回到观察位等待下一条指令
   cancel_words: ["停止", "停", "取消", "别抓", "不要抓", "stop", "cancel"]
   # 中文语音目标名到检测类别名的映射。检测类别名需与 YOLO/COCO label 一致

@@ -849,7 +849,6 @@ void GraspPipeline::SpinOnce(float dt_s) {
         case PipelineState::ERROR:
             if (config_.voice.enabled) {
                 ResetTaskState();
-                return_to_observe_pending_ = true;
                 SetState(PipelineState::IDLE,
                         "Voice: waiting for next command");
             }
@@ -1271,8 +1270,11 @@ void GraspPipeline::HandlePlacing() {
     auto result = PollAction(PipelineState::PLACING);
     if (!result.has_value()) return;
     if (*result == GraspResult::SUCCESS) {
+        const char* target_pose = config_.voice.enabled ? "observe position"
+                                                        : "home position";
         SetState(PipelineState::HOMING,
-                "Object released, returning to observe position...");
+                std::string("Object released, returning to ") +
+                    target_pose + "...");
     } else {
         SetState(PipelineState::ERROR,
                 ResultMessage("Place failed", *result));
@@ -1281,9 +1283,16 @@ void GraspPipeline::HandlePlacing() {
 
 void GraspPipeline::HandleHoming() {
     if (!action_.active) {
-        if (!WaitForConfirm("即将回到观察位")) return;
-        StartAction(PipelineState::HOMING, "move_to_observe_after_place", [this]() {
-            return executor_->MoveToObserve();
+        if (!WaitForConfirm(config_.voice.enabled ? "即将回到观察位"
+                                                : "即将回到 Home 位")) {
+            return;
+        }
+        const std::string action_name = config_.voice.enabled
+            ? "move_to_observe_after_place"
+            : "move_to_home_after_place";
+        StartAction(PipelineState::HOMING, action_name, [this]() {
+            return config_.voice.enabled ? executor_->MoveToObserve()
+                                        : executor_->MoveToHome();
         });
         return;
     }
@@ -1294,7 +1303,7 @@ void GraspPipeline::HandleHoming() {
         SetState(PipelineState::DONE, "Task completed!");
     } else {
         SetState(PipelineState::ERROR,
-                ResultMessage("Observe move failed", *result));
+                ResultMessage("Final move failed", *result));
     }
 }
 
