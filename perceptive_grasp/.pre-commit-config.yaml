@@ -1,0 +1,16 @@
+repos:
+  - repo: local
+    hooks:
+      - id: perceptive-grasp-cpp-lint
+        name: perceptive_grasp C++ lint
+        entry: bash -c '../../../scripts/lint/lint_cpp.sh "$PWD/perceptive_grasp"'
+        language: system
+        pass_filenames: false
+        types_or: [c, c++]
+
+      - id: perceptive-grasp-python-lint
+        name: perceptive_grasp Python lint
+        entry: bash -c '../../../scripts/lint/lint_python.sh "$PWD/perceptive_grasp"'
+        language: system
+        pass_filenames: false
+        types: [python]

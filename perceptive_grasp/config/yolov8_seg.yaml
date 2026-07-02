@@ -1,0 +1,12 @@
+# YOLOv8-Seg 实例分割模型配置 (用于抓取 pipeline)
+# 模型路径指向用户缓存；SDK 交付时如模型随包放置，可改成实际模型路径。
+model_path: ~/.cache/models/vision/yolov8_seg/yolov8n-seg.q.onnx
+label_file_path: ~/.cache/models/vision/labels/coco.txt
+image_size: [640, 640]
+class: deploy.yolov8_seg.YOLOv8SegDetector
+default_params:
+  conf_threshold: 0.35
+  iou_threshold: 0.45
+  num_threads: 4
+  providers:
+    - SpaceMITExecutionProvider
