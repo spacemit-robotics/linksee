@@ -26,6 +26,7 @@
 #include "depth_camera.h"
 #include "grasp_executor.h"
 #include "grasp_planner.h"
+#include "mobile_base_controller.h"
 #include "orientation_estimator.h"
 #include "target_detector.h"
 #include "voice_command_parser.h"
@@ -38,6 +39,7 @@ enum class PipelineState {
     OBSERVING,      // 移到观察位，准备检测
     DETECTING,      // 正在检测目标
     PLANNING,       // 规划抓取
+    BASE_ALIGNING,  // 底盘短距离对齐目标后重新检测
     APPROACHING,    // 接近目标
     GRASPING,       // 执行抓取
     LIFTING,        // 抬起
@@ -56,6 +58,7 @@ struct PipelineConfig {
     DetectorConfig detector;
     GraspPlannerConfig planner;
     ExecutorConfig executor;
+    MobileBaseAlignmentConfig mobile_base;
     OrientationConfig orientation;  // 夹爪方向估计配置
 
     // Pipeline 行为
@@ -174,6 +177,7 @@ private:
     std::unique_ptr<TargetDetector> detector_;
     std::unique_ptr<GraspPlanner> planner_;
     std::unique_ptr<GraspExecutor> executor_;
+    std::unique_ptr<MobileBaseController> mobile_base_;
 
     // 状态
     std::atomic<PipelineState> state_{PipelineState::IDLE};
@@ -181,6 +185,7 @@ private:
     int retry_count_ = 0;
     int stable_count_ = 0;
     int missing_count_ = 0;
+    int base_align_attempts_ = 0;
     AsyncAction action_;
 
     // 回调
@@ -205,6 +210,7 @@ private:
     cv::Mat current_depth_;
     Pose3D grasp_pose_;
     Pose3D pre_grasp_pose_;
+    MobileBaseAlignmentCommand base_alignment_command_;
     float grasp_yaw_rad_ = NAN;  // 夹爪旋转角 (NAN=不覆盖)
     std::string task_id_;
     std::string last_debug_image_path_;
@@ -233,6 +239,7 @@ private:
     void HandleObserving();
     void HandleDetecting();
     void HandlePlanning();
+    void HandleBaseAligning();
     void HandleApproaching();
     void HandleGrasping();
     void HandleLifting();

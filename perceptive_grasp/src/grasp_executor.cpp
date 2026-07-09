@@ -177,6 +177,11 @@ GraspResult GraspExecutor::MoveToPreGrasp(const Pose3D& pre_grasp_pose,
                     "motion timeout");
         return GraspResult::TIMEOUT;
     }
+    if (!VerifyPoseReached("move_to_pre_grasp", pre_grasp_pose)) {
+        RecordResult(GraspResult::MOVE_FAILED, "move_to_pre_grasp",
+                    "pose verification failed");
+        return GraspResult::MOVE_FAILED;
+    }
     RecordResult(GraspResult::SUCCESS, "move_to_pre_grasp");
     return GraspResult::SUCCESS;
 }
@@ -207,6 +212,11 @@ GraspResult GraspExecutor::MoveToGrasp(const Pose3D& grasp_pose,
         RecordResult(GraspResult::TIMEOUT, "move_to_grasp",
                     "motion timeout");
         return GraspResult::TIMEOUT;
+    }
+    if (!VerifyPoseReached("move_to_grasp", grasp_pose)) {
+        RecordResult(GraspResult::MOVE_FAILED, "move_to_grasp",
+                    "pose verification failed");
+        return GraspResult::MOVE_FAILED;
     }
     RecordResult(GraspResult::SUCCESS, "move_to_grasp");
     return GraspResult::SUCCESS;
@@ -318,6 +328,11 @@ GraspResult GraspExecutor::LiftFromGrasp(const Pose3D& pre_grasp_pose,
                     "motion timeout");
         return GraspResult::TIMEOUT;
     }
+    if (!VerifyPoseReached("lift_from_grasp", pre_grasp_pose)) {
+        RecordResult(GraspResult::MOVE_FAILED, "lift_from_grasp",
+                    "pose verification failed");
+        return GraspResult::MOVE_FAILED;
+    }
     RecordResult(GraspResult::SUCCESS, "lift_from_grasp");
     return GraspResult::SUCCESS;
 }
@@ -374,6 +389,9 @@ GraspResult GraspExecutor::MoveToPreGraspSafe(const Pose3D& pre_grasp_pose,
     GraspResult result = MoveToPoseWithIKJoints(pre_grasp_pose, speed);
     if (result != GraspResult::SUCCESS) return result;
     if (!WaitMotionDone()) return GraspResult::TIMEOUT;
+    if (!VerifyPoseReached("move_to_pre_grasp_safe", pre_grasp_pose)) {
+        return GraspResult::MOVE_FAILED;
+    }
     return GraspResult::SUCCESS;
 }
 
@@ -419,8 +437,11 @@ void GraspExecutor::EmergencyStop() {
 bool GraspExecutor::GetCurrentPose(Pose3D& pose) {
     if (!arm_) return false;
 
+    manip_joint_t joints;
+    std::memset(&joints, 0, sizeof(joints));
     manip_pose_t mp;
-    int ret = manip_get_state(arm_, nullptr, &mp);
+    std::memset(&mp, 0, sizeof(mp));
+    int ret = manip_get_state(arm_, &joints, &mp);
     if (ret != MANIP_OK) return false;
 
     pose.x = mp.x;
@@ -1071,6 +1092,38 @@ bool GraspExecutor::WaitMotionDone(int timeout_ms) {
 
         prev_joints = cur_joints;
     }
+}
+
+bool GraspExecutor::VerifyPoseReached(const char* action,
+    const Pose3D& target_pose) {
+    Pose3D actual_pose{};
+    if (!GetCurrentPose(actual_pose)) {
+        std::cerr << "[GraspExecutor] " << action
+                    << " pose verification failed: cannot read FK pose"
+                    << std::endl;
+        return false;
+    }
+
+    const float dx = actual_pose.x - target_pose.x;
+    const float dy = actual_pose.y - target_pose.y;
+    const float dz = actual_pose.z - target_pose.z;
+    const float position_error = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+    std::cout << "[GraspExecutor] " << action
+                << " target_pose=[" << target_pose.x << ", "
+                << target_pose.y << ", " << target_pose.z << "]"
+                << " actual_pose=[" << actual_pose.x << ", "
+                << actual_pose.y << ", " << actual_pose.z << "]"
+                << " position_error=" << position_error << " m"
+                << " tolerance=" << config_.pose_position_tolerance << " m"
+                << std::endl;
+
+    if (position_error > config_.pose_position_tolerance) {
+        std::cerr << "[GraspExecutor] " << action
+                    << " target not reached" << std::endl;
+        return false;
+    }
+    return true;
 }
 
 }  // namespace perceptive_grasp

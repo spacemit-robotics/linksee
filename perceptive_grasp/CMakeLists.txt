@@ -59,6 +59,7 @@ set(SOURCES
     src/depth_camera.cpp
     src/grasp_planner.cpp
     src/grasp_pipeline.cpp
+    src/mobile_base_controller.cpp
     src/orientation_estimator.cpp
     src/voice_command_parser.cpp
 )
@@ -78,6 +79,32 @@ set(EXTRA_LIBRARIES
     yaml-cpp
     pthread
 )
+
+# ============ 可选底盘控制 ============
+
+if(NOT DEFINED _STAGING_DIR)
+    set(_STAGING_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../output/staging")
+endif()
+
+find_path(CHASSIS_INCLUDE_DIR chassis.h
+    PATHS "${_STAGING_DIR}/include"
+    NO_DEFAULT_PATH
+)
+find_library(CHASSIS_LIBRARY chassis
+    PATHS "${_STAGING_DIR}/lib"
+    NO_DEFAULT_PATH
+)
+
+if(CHASSIS_INCLUDE_DIR AND CHASSIS_LIBRARY)
+    message(STATUS "[MobileBase] chassis SDK enabled")
+    list(APPEND EXTRA_INCLUDE_DIRS ${CHASSIS_INCLUDE_DIR})
+    list(APPEND EXTRA_LIBRARIES ${CHASSIS_LIBRARY})
+    add_definitions(-DHAVE_CHASSIS=1)
+else()
+    message(WARNING
+        "[MobileBase] chassis SDK not found; mobile_base.enabled=true "
+        "will fail at runtime")
+endif()
 
 # ============ 检测器选择 ============
 
@@ -206,6 +233,31 @@ if(HAVE_ROS2_VOICE)
         ${std_msgs_LIBRARIES}
     )
 endif()
+
+# ============ 单元测试 ============
+
+enable_testing()
+
+add_executable(mobile_base_alignment_test
+    tests/mobile_base_alignment_test.cpp
+    src/mobile_base_controller.cpp
+)
+target_include_directories(mobile_base_alignment_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(mobile_base_alignment_test PRIVATE pthread)
+if(CHASSIS_INCLUDE_DIR AND CHASSIS_LIBRARY)
+    target_include_directories(mobile_base_alignment_test PRIVATE
+        ${CHASSIS_INCLUDE_DIR}
+    )
+    target_link_libraries(mobile_base_alignment_test PRIVATE
+        ${CHASSIS_LIBRARY}
+    )
+endif()
+add_test(NAME mobile_base_alignment_test
+    COMMAND mobile_base_alignment_test)
+
 
 # ============ 安装 ============
 
