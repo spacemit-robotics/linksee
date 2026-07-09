@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="420" viewBox="0 0 980 420" role="img" aria-labelledby="title desc">
+  <title id="title">Perceptive Grasp 抓取链路</title>
+  <desc id="desc">ASR 将语音命令发送到抓取规划，TTS 接收抓取状态并播报，D435i 与 VisionService 提供感知输入，grasp_planner 完成抓取规划，机械臂执行抓取，底盘在目标超出舒适区时辅助对齐并重新检测。</desc>
+  <defs>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 10 5 0 10z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 10 5 0 10z" fill="#059669"/>
+    </marker>
+    <marker id="arrow-slate" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 10 5 0 10z" fill="#64748b"/>
+    </marker>
+    <style>
+      .panel { fill: #f8fafc; stroke: #dbeafe; }
+      .panel-green { fill: #f8fafc; stroke: #dcfce7; }
+      .title { font-family: Arial, 'Noto Sans CJK SC', sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .text { font-family: Arial, 'Noto Sans CJK SC', sans-serif; font-size: 12px; fill: #475569; }
+      .tag { font-family: Arial, 'Noto Sans CJK SC', sans-serif; font-size: 11px; font-weight: 700; fill: #475569; }
+      .caption { font-family: Arial, 'Noto Sans CJK SC', sans-serif; font-size: 12px; fill: #64748b; }
+    </style>
+  </defs>
+
+  <rect width="980" height="420" fill="#ffffff"/>
+
+  <g>
+    <rect class="panel" x="70" y="150" width="160" height="116" rx="14"/>
+    <rect class="panel" x="290" y="150" width="170" height="116" rx="14"/>
+    <rect class="panel" x="520" y="150" width="170" height="116" rx="14"/>
+    <rect class="panel" x="750" y="150" width="160" height="116" rx="14"/>
+
+    <rect class="panel" x="280" y="30" width="90" height="72" rx="14"/>
+    <rect class="panel" x="380" y="30" width="90" height="72" rx="14"/>
+    <rect class="panel-green" x="290" y="326" width="170" height="58" rx="14"/>
+  </g>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M246 208H278" stroke="#2563eb" stroke-width="2.2" marker-end="url(#arrow-blue)"/>
+    <path d="M476 208H508" stroke="#2563eb" stroke-width="2.2" marker-end="url(#arrow-blue)"/>
+    <path d="M706 208H738" stroke="#2563eb" stroke-width="2.2" marker-end="url(#arrow-blue)"/>
+
+    <path d="M325 114V138" stroke="#64748b" stroke-width="2.2" marker-end="url(#arrow-slate)"/>
+    <path d="M425 138V114" stroke="#64748b" stroke-width="2.2" marker-end="url(#arrow-slate)"/>
+    <path d="M375 278V314" stroke="#059669" stroke-width="2.2" marker-end="url(#arrow-green)"/>
+    <path d="M290 355H150V280" stroke="#059669" stroke-width="2.2" marker-end="url(#arrow-green)"/>
+  </g>
+
+  <text x="375" y="20" text-anchor="middle" class="caption">语音交互</text>
+  <text x="470" y="302" text-anchor="middle" class="caption">目标超出舒适区</text>
+  <text x="220" y="376" text-anchor="middle" class="caption">停车后重新检测</text>
+
+  <text x="150" y="186" text-anchor="middle" class="title">感知输入</text>
+  <text x="150" y="217" text-anchor="middle" class="text">D435i RGB-D</text>
+  <text x="150" y="241" text-anchor="middle" class="text">VisionService</text>
+
+  <text x="375" y="186" text-anchor="middle" class="title">抓取规划</text>
+  <text x="375" y="217" text-anchor="middle" class="text">深度定位</text>
+  <text x="375" y="241" text-anchor="middle" class="text">grasp_planner</text>
+
+  <text x="605" y="186" text-anchor="middle" class="title">机械臂执行</text>
+  <text x="605" y="217" text-anchor="middle" class="text">manipulator / grasp</text>
+  <text x="605" y="241" text-anchor="middle" class="text">SO101 抓取放置</text>
+
+  <text x="830" y="186" text-anchor="middle" class="title">执行结果</text>
+  <text x="830" y="217" text-anchor="middle" class="text">抓取 / 抬起</text>
+  <text x="830" y="241" text-anchor="middle" class="text">放置 / 返回观察位</text>
+
+  <text x="325" y="61" text-anchor="middle" class="title">ASR</text>
+  <text x="325" y="86" text-anchor="middle" class="text">语音命令</text>
+  <text x="425" y="61" text-anchor="middle" class="title">TTS</text>
+  <text x="425" y="86" text-anchor="middle" class="text">状态播报</text>
+
+  <text x="375" y="349" text-anchor="middle" class="title">底盘辅助</text>
+  <text x="375" y="372" text-anchor="middle" class="text">chassis / Linksee</text>
+
+  <g>
+    <rect x="115" y="278" width="70" height="22" rx="11" fill="#eff6ff"/>
+    <text x="150" y="293" text-anchor="middle" class="tag">重新检测</text>
+  </g>
+</svg>

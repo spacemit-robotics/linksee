@@ -77,6 +77,7 @@ static const char* PipelineStateName(PipelineState state) {
         case PipelineState::OBSERVING: return "OBSERVING";
         case PipelineState::DETECTING: return "DETECTING";
         case PipelineState::PLANNING: return "PLANNING";
+        case PipelineState::BASE_ALIGNING: return "BASE_ALIGNING";
         case PipelineState::APPROACHING: return "APPROACHING";
         case PipelineState::GRASPING: return "GRASPING";
         case PipelineState::LIFTING: return "LIFTING";
@@ -286,6 +287,9 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         cfg.executor.tip_link = m["tip_link"].as<std::string>("Fixed_Jaw");
         cfg.executor.move_speed = m["move_speed"].as<float>(0.5f);
         cfg.executor.line_speed = m["line_speed"].as<float>(0.3f);
+        cfg.executor.pose_position_tolerance =
+            m["pose_position_tolerance"].as<float>(
+                cfg.executor.pose_position_tolerance);
         if (auto hj = m["home_joints"]) {
             cfg.executor.home_joints.clear();
             for (size_t i = 0; i < hj.size(); i++)
@@ -337,6 +341,79 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         }
         cfg.executor.place_release_open =
             p["release_open"].as<float>(cfg.executor.place_release_open);
+    }
+
+    // Mobile base alignment
+    if (auto base = root["mobile_base"]) {
+        cfg.mobile_base.enabled =
+            base["enabled"].as<bool>(cfg.mobile_base.enabled);
+        cfg.mobile_base.driver =
+            base["driver"].as<std::string>(cfg.mobile_base.driver);
+        cfg.mobile_base.dev_path =
+            base["dev_path"].as<std::string>(cfg.mobile_base.dev_path);
+        cfg.mobile_base.baud =
+            base["baud"].as<int>(cfg.mobile_base.baud);
+        cfg.mobile_base.ctrl_dev =
+            base["ctrl_dev"].as<std::string>(cfg.mobile_base.ctrl_dev);
+        cfg.mobile_base.data_dev =
+            base["data_dev"].as<std::string>(cfg.mobile_base.data_dev);
+        cfg.mobile_base.service_name =
+            base["service_name"].as<std::string>(cfg.mobile_base.service_name);
+        cfg.mobile_base.wheel_diameter =
+            base["wheel_diameter"].as<float>(cfg.mobile_base.wheel_diameter);
+        cfg.mobile_base.wheel_base =
+            base["wheel_base"].as<float>(cfg.mobile_base.wheel_base);
+        cfg.mobile_base.wheel_track =
+            base["wheel_track"].as<float>(cfg.mobile_base.wheel_track);
+        cfg.mobile_base.left_wheel_gain =
+            base["left_wheel_gain"].as<float>(
+                cfg.mobile_base.left_wheel_gain);
+        cfg.mobile_base.max_speed =
+            base["max_speed"].as<float>(cfg.mobile_base.max_speed);
+        cfg.mobile_base.max_angular =
+            base["max_angular"].as<float>(cfg.mobile_base.max_angular);
+        cfg.mobile_base.reduction_ratio =
+            base["reduction_ratio"].as<float>(
+                cfg.mobile_base.reduction_ratio);
+        cfg.mobile_base.ff_factor =
+            base["ff_factor"].as<float>(cfg.mobile_base.ff_factor);
+        cfg.mobile_base.pid_kp =
+            base["pid_kp"].as<float>(cfg.mobile_base.pid_kp);
+        cfg.mobile_base.pid_ki =
+            base["pid_ki"].as<float>(cfg.mobile_base.pid_ki);
+        cfg.mobile_base.pid_kd =
+            base["pid_kd"].as<float>(cfg.mobile_base.pid_kd);
+        cfg.mobile_base.cfg_send_on_startup =
+            base["cfg_send_on_startup"].as<bool>(
+                cfg.mobile_base.cfg_send_on_startup);
+        cfg.mobile_base.feedback_enable =
+            base["feedback_enable"].as<bool>(
+                cfg.mobile_base.feedback_enable);
+        cfg.mobile_base.target_x =
+            base["target_x"].as<float>(cfg.mobile_base.target_x);
+        cfg.mobile_base.x_tolerance =
+            base["x_tolerance"].as<float>(cfg.mobile_base.x_tolerance);
+        cfg.mobile_base.y_tolerance =
+            base["y_tolerance"].as<float>(cfg.mobile_base.y_tolerance);
+        cfg.mobile_base.max_step_m =
+            base["max_step_m"].as<float>(cfg.mobile_base.max_step_m);
+        cfg.mobile_base.linear_speed =
+            base["linear_speed"].as<float>(cfg.mobile_base.linear_speed);
+        cfg.mobile_base.angular_speed =
+            base["angular_speed"].as<float>(cfg.mobile_base.angular_speed);
+        cfg.mobile_base.yaw_gain =
+            base["yaw_gain"].as<float>(cfg.mobile_base.yaw_gain);
+        cfg.mobile_base.min_cmd_duration_ms =
+            base["min_cmd_duration_ms"].as<int>(
+                cfg.mobile_base.min_cmd_duration_ms);
+        cfg.mobile_base.max_cmd_duration_ms =
+            base["max_cmd_duration_ms"].as<int>(
+                cfg.mobile_base.max_cmd_duration_ms);
+        cfg.mobile_base.settle_ms =
+            base["settle_ms"].as<int>(cfg.mobile_base.settle_ms);
+        cfg.mobile_base.max_align_attempts =
+            base["max_align_attempts"].as<int>(
+                cfg.mobile_base.max_align_attempts);
     }
 
     // Timing between pipeline/executor stages

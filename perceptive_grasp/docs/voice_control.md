@@ -2,11 +2,7 @@
 
 Perceptive Grasp 使用本地语音桥接入 ASR/TTS：
 
-```text
-麦克风 -> spacemit_audio -> spacemit_vad -> spacemit_asr
-      -> scripts/local_voice_bridge.py -> perceptive_grasp --voice-stdin
-perceptive_grasp --status-stdout -> scripts/local_voice_bridge.py -> spacemit_tts -> 扬声器
-```
+![语音控制链路](assets/voice-control-flow.svg)
 
 ## 1. 安装依赖
 
@@ -21,7 +17,7 @@ python3 -c "import spacemit_audio, spacemit_vad, spacemit_asr, spacemit_tts"
 
 ## 2. 配置命令解析
 
-修改 `config/grasp_pipeline.yaml`：
+修改 [config/grasp_pipeline.yaml](../config/grasp_pipeline.yaml)：
 
 ```yaml
 voice:
@@ -62,17 +58,7 @@ voice:
 
 K3 上默认使用 USB Camera 的单声道麦克风输入。TTS 播报使用 USB Audio 输出，并在启动时把该设备的 ALSA `PCM` 音量设为 80%。
 
-## 4. 构建程序
-
-```bash
-cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
-rm -rf build && mkdir -p build && cd build
-source ~/spacemit_robot/build/envsetup.sh
-cmake ..
-make -j$(nproc)
-```
-
-## 5. 启动语音控制
+## 4. 启动语音控制
 
 推荐方式是启动本地 Python 语音桥。语音桥会自动启动 `perceptive_grasp --voice-stdin --status-stdout`，并负责录音、VAD、ASR、TTS 和状态播报：
 
@@ -104,6 +90,6 @@ build/perceptive_grasp \
 结束
 ```
 
-`停止` 会停止当前任务，并回到观察位等待下一条抓取命令。`结束`、`待命`、`休息`、`回家`、`回 home`、`回初始`、`end` 和 `home` 会让机械臂回到 Home 姿态，然后退出程序。
+`停止` 会停止当前任务，并回到观察位等待下一条抓取命令；`结束`、`待命`、`休息`、`回家`、`回 home`、`回初始`、`end` 和 `home` 会让机械臂回到 Home 姿态，然后退出程序。
 
 抓取状态会通过 TTS 播报，终态调试文件保存在 `debug.output_dir`。

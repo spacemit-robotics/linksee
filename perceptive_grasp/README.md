@@ -1,6 +1,12 @@
 # Perceptive Grasp
 
-Perceptive Grasp 是面向 Linksee 轮式机器人的感知抓取应用。系统通过深度相机获取场景图像，基于 YOLOv8-seg 完成目标检测，并结合深度定位和顶抓规划，引导机械臂执行抓取任务。此外，还接入 ASR/TTS 模块来支持语音控制和播报。
+Perceptive Grasp 是面向 Linksee 轮式机器人的感知抓取方案，用于完成桌面或近距离场景中的目标识别、空间定位、抓取规划和机械臂执行。系统以 D435i 深度相机作为感知输入，通过 YOLOv8-seg 目标检测，再结合深度反投影、手眼标定结果和顶抓策略生成 SO101 机械臂可执行的抓取位姿。
+
+方案同时支持底盘辅助对齐和本地语音交互。当目标超出机械臂舒适抓取区时，系统会在规划阶段触发 Linksee 底盘短距离调整，停车后重新检测并重新规划；语音侧通过本地 ASR/TTS 语音桥接收抓取命令并播报任务状态，形成“语音输入、视觉感知、抓取规划、底盘辅助、机械臂执行”的闭环。
+
+本方案抓取链路如图所示：
+
+![Perceptive Grasp 抓取链路](docs/assets/grasp-system-flow.svg)
 
 ## 项目目录
 
@@ -70,7 +76,10 @@ pip install -r requirements.txt
 cd ~/spacemit_robot
 source build/envsetup.sh
 
-cd components/model_zoo/vision
+cd components/control/base
+mm
+
+cd ~/spacemit_robot/components/model_zoo/vision
 mm
 
 cd ~/spacemit_robot/components/control/grasp
@@ -104,8 +113,6 @@ cmake ..
 make -j$(nproc)
 ```
 
-语音输入和播报通过本地 ASR/TTS 语音桥接入。
-
 ## 运行前检查
 
 ```bash
@@ -114,6 +121,8 @@ source ~/spacemit_robot/build/envsetup.sh
 source ~/.venv-grasp/bin/activate
 python3 scripts/check_runtime_env.py --config config/grasp_pipeline.yaml
 ```
+
+如果脚本输出 `[SUGGEST]` 串口建议，按 [抓取配置](docs/grasp_config.md) 写回 `config/grasp_pipeline.yaml`。
 
 脚本加入 `dialout`、`audio`、`video` 用户组后，执行下面命令让当前终端重新加载用户组：
 
@@ -142,6 +151,12 @@ source ~/spacemit_robot/build/envsetup.sh
 
 如果更换相机、调整安装位置，或抓取偏移/不稳定，运行前先按 [手眼标定](docs/hand_eye_calibration.md) 重新采集并写回 [配置文件](config/grasp_pipeline.yaml)。
 
+## 底盘辅助对齐
+
+当目标超出机械臂舒适抓取区时，可以启用底盘辅助对齐。底盘会先做短距离前进、后退或原地转向，停车后重新检测目标并重新规划抓取。
+
+首次测试前确保机器人周围有安全空间，保持默认低速，观察一次短距离对齐动作后再调整参数。
+
 ## 语音模式
 
 语音桥负责录音、VAD、ASR、TTS，并通过 stdin/stdout 与 `perceptive_grasp` 进程通信。
@@ -167,20 +182,3 @@ build/perceptive_grasp \
 ```
 
 语音桥识别到“抓香蕉”“停止”“结束”等命令后，会把文本写入抓取进程 stdin；抓取进程通过 stdout 输出状态事件，语音桥再调用 TTS 播报。语音模式下，抓取完成后机械臂停在观察位等待下一条命令；说“结束”或“回家”时回到 Home 姿态并退出程序。
-
-语音模式由启动命令决定：
-- `local_voice_bridge.py` 会自动以 `--voice-stdin --status-stdout` 启动抓取进程；
-- `./perceptive_grasp --target banana` 不会进入语音等待模式。
-
-## 主配置
-
-部署时主要修改 `config/grasp_pipeline.yaml`：
-
-- `calibration.T_base_camera`：Eye-to-Hand 手眼标定结果。
-- `grasp.*`：抓取高度、下探深度、夹爪张开程度和抓取点偏移。
-- `orientation.*`：夹爪 yaw 估计参数。
-- `manipulator.uart_device`：SO101 串口，通常为 `/dev/ttyACM0`。
-- `timing.*`：各阶段等待时间。
-- `voice.*`：ASR/TTS 设备、触发词和目标别名。
-
-参数说明见 [docs/grasp_config.md](docs/grasp_config.md)。

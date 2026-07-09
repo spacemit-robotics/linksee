@@ -26,6 +26,7 @@
 #include <iostream>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -63,6 +64,7 @@ const char* PipelineStateName(PipelineState state) {
         case PipelineState::OBSERVING: return "OBSERVING";
         case PipelineState::DETECTING: return "DETECTING";
         case PipelineState::PLANNING: return "PLANNING";
+        case PipelineState::BASE_ALIGNING: return "BASE_ALIGNING";
         case PipelineState::APPROACHING: return "APPROACHING";
         case PipelineState::GRASPING: return "GRASPING";
         case PipelineState::LIFTING: return "LIFTING";
@@ -84,6 +86,43 @@ const char* GraspResultName(GraspResult result) {
         case GraspResult::TIMEOUT: return "TIMEOUT";
     }
     return "UNKNOWN";
+}
+
+int ClampPixel(int value, int limit) {
+    return std::clamp(value, 0, std::max(0, limit - 1));
+}
+
+bool MedianDepthAtPixel(const cv::Mat& depth, int cx, int cy, int roi_size,
+                        uint16_t& depth_mm) {
+    if (depth.empty()) {
+        return false;
+    }
+
+    cx = ClampPixel(cx, depth.cols);
+    cy = ClampPixel(cy, depth.rows);
+
+    const int x_start = std::max(0, cx - roi_size);
+    const int y_start = std::max(0, cy - roi_size);
+    const int x_end = std::min(depth.cols - 1, cx + roi_size);
+    const int y_end = std::min(depth.rows - 1, cy + roi_size);
+
+    std::vector<uint16_t> depth_values;
+    for (int y = y_start; y <= y_end; y++) {
+        for (int x = x_start; x <= x_end; x++) {
+            uint16_t d = depth.at<uint16_t>(y, x);
+            if (d > 0) {
+                depth_values.push_back(d);
+            }
+        }
+    }
+
+    if (depth_values.empty()) {
+        return false;
+    }
+
+    std::sort(depth_values.begin(), depth_values.end());
+    depth_mm = depth_values[depth_values.size() / 2];
+    return true;
 }
 
 std::string TimestampString() {
@@ -173,6 +212,14 @@ bool GraspPipeline::Init() {
         return false;
     }
 
+    std::cout << "[Pipeline] Initializing mobile base..." << std::endl;
+    mobile_base_ = std::make_unique<MobileBaseController>(config_.mobile_base);
+    std::cout << "[Pipeline] Mobile base controller created" << std::endl;
+    if (!mobile_base_->Init()) {
+        std::cerr << "[Pipeline] Failed to init mobile base" << std::endl;
+        return false;
+    }
+
     std::cout << "[Pipeline] All modules initialized successfully" << std::endl;
     SetState(PipelineState::IDLE, "Ready");
     return true;
@@ -187,6 +234,7 @@ bool GraspPipeline::TriggerGrasp() {
     retry_count_ = 0;
     stable_count_ = 0;
     missing_count_ = 0;
+    base_align_attempts_ = 0;
     task_id_.clear();
     last_debug_image_path_.clear();
     last_debug_json_path_.clear();
@@ -204,6 +252,7 @@ bool GraspPipeline::TriggerGrasp(const std::string& target_label) {
     retry_count_ = 0;
     stable_count_ = 0;
     missing_count_ = 0;
+    base_align_attempts_ = 0;
     task_id_.clear();
     last_debug_image_path_.clear();
     last_debug_json_path_.clear();
@@ -371,6 +420,7 @@ void GraspPipeline::ResetTaskState() {
     retry_count_ = 0;
     stable_count_ = 0;
     missing_count_ = 0;
+    base_align_attempts_ = 0;
     {
         std::lock_guard<std::mutex> lock(voice_queue_mutex_);
         waiting_voice_target_ = false;
@@ -381,6 +431,7 @@ void GraspPipeline::ResetTaskState() {
     current_target_ = DetectionTarget{};
     grasp_pose_ = Pose3D{};
     pre_grasp_pose_ = Pose3D{};
+    base_alignment_command_ = MobileBaseAlignmentCommand{};
     last_candidates_.clear();
     current_color_.release();
     current_depth_.release();
@@ -820,6 +871,9 @@ void GraspPipeline::SpinOnce(float dt_s) {
         case PipelineState::PLANNING:
             HandlePlanning();
             break;
+        case PipelineState::BASE_ALIGNING:
+            HandleBaseAligning();
+            break;
         case PipelineState::APPROACHING:
             HandleApproaching();
             break;
@@ -1042,37 +1096,43 @@ void GraspPipeline::HandlePlanning() {
         grasp_py = current_target_.center.y;
     }
 
-    int cx = static_cast<int>(grasp_px);
-    int cy = static_cast<int>(grasp_py);
+    int cx = ClampPixel(static_cast<int>(std::lround(grasp_px)),
+                        current_depth_.cols);
+    int cy = ClampPixel(static_cast<int>(std::lround(grasp_py)),
+                        current_depth_.rows);
 
     std::cout << "[Pipeline] Grasp pixel (offset_ratio=" << offset_ratio << "): ["
-                << cx << ", " << cy << "]" << std::endl;
+                << cx << ", " << cy << "]";
+    if (cx != static_cast<int>(std::lround(grasp_px)) ||
+        cy != static_cast<int>(std::lround(grasp_py))) {
+        std::cout << " clamped from [" << grasp_px << ", " << grasp_py << "]";
+    }
+    std::cout << std::endl;
 
     // 取深度值 (取中心区域的中值，更鲁棒)
-    int roi_size = 5;
-    int x_start = std::max(0, cx - roi_size);
-    int y_start = std::max(0, cy - roi_size);
-    int x_end = std::min(current_depth_.cols - 1, cx + roi_size);
-    int y_end = std::min(current_depth_.rows - 1, cy + roi_size);
-
-    std::vector<uint16_t> depth_values;
-    for (int y = y_start; y <= y_end; y++) {
-        for (int x = x_start; x <= x_end; x++) {
-            uint16_t d = current_depth_.at<uint16_t>(y, x);
-            if (d > 0) depth_values.push_back(d);
+    constexpr int roi_size = 5;
+    uint16_t depth_mm = 0;
+    if (!MedianDepthAtPixel(current_depth_, cx, cy, roi_size, depth_mm)) {
+        const int fallback_cx = ClampPixel(
+            static_cast<int>(std::lround(current_target_.center.x)),
+            current_depth_.cols);
+        const int fallback_cy = ClampPixel(
+            static_cast<int>(std::lround(current_target_.center.y)),
+            current_depth_.rows);
+        std::cout << "[Pipeline] No valid depth at grasp pixel, fallback to "
+                << "target center [" << fallback_cx << ", " << fallback_cy
+                << "]" << std::endl;
+        cx = fallback_cx;
+        cy = fallback_cy;
+        if (!MedianDepthAtPixel(current_depth_, cx, cy, roi_size, depth_mm)) {
+            std::cerr << "[Pipeline] No valid depth at grasp pixel or target "
+                    << "center" << std::endl;
+            stable_count_ = 0;
+            SetState(PipelineState::ERROR,
+                    "Target depth invalid at grasp pixel and center");
+            return;
         }
     }
-
-    if (depth_values.empty()) {
-        std::cerr << "[Pipeline] No valid depth at target center" << std::endl;
-        stable_count_ = 0;
-        SetState(PipelineState::ERROR, "Target depth invalid at grasp pixel");
-        return;
-    }
-
-    // 取中值
-    std::sort(depth_values.begin(), depth_values.end());
-    uint16_t depth_mm = depth_values[depth_values.size() / 2];
 
     // 反投影到 3D
     float cam_point[3];
@@ -1089,6 +1149,24 @@ void GraspPipeline::HandlePlanning() {
 
     std::cout << "[Pipeline] 3D position (base): [" << base_point[0] << ", "
                 << base_point[1] << ", " << base_point[2] << "]" << std::endl;
+
+    base_alignment_command_ = PlanMobileBaseAlignment(
+        config_.mobile_base, base_point, base_align_attempts_);
+    if (base_alignment_command_.type !=
+        MobileBaseAlignmentCommand::Type::NONE) {
+        std::cout << "[Pipeline] Mobile base alignment needed: "
+                    << base_alignment_command_.reason
+                    << " (attempt " << (base_align_attempts_ + 1)
+                    << "/" << config_.mobile_base.max_align_attempts << ")"
+                    << std::endl;
+        SetState(PipelineState::BASE_ALIGNING,
+                "Moving base to improve grasp distance");
+        return;
+    }
+    if (base_alignment_command_.max_attempts_reached) {
+        std::cout << "[Pipeline] Mobile base alignment reached max attempts; "
+                    << "continue with arm planning" << std::endl;
+    }
 
     // 规划抓取
     if (!planner_->PlanTopGrasp(base_point, grasp_pose_, pre_grasp_pose_)) {
@@ -1137,8 +1215,8 @@ void GraspPipeline::HandlePlanning() {
                     << " -> dx=" << dx << " dy=" << dy << std::endl;
     }
 
-    SaveGraspDebug(grasp_px, grasp_py, depth_mm, cam_point, base_point,
-                    offset_dir_angle);
+    SaveGraspDebug(static_cast<float>(cx), static_cast<float>(cy), depth_mm,
+                    cam_point, base_point, offset_dir_angle);
 
     if (config_.performance_log_enabled) {
         const auto planning_end = std::chrono::steady_clock::now();
@@ -1151,6 +1229,36 @@ void GraspPipeline::HandlePlanning() {
     }
 
     SetState(PipelineState::APPROACHING, "Moving to pre-grasp...");
+}
+
+void GraspPipeline::HandleBaseAligning() {
+    if (!mobile_base_) {
+        SetState(PipelineState::ERROR, "Mobile base controller not initialized");
+        return;
+    }
+    if (!action_.active) {
+        if (!WaitForConfirm("即将移动底盘对齐目标")) return;
+        StartAction(PipelineState::BASE_ALIGNING, "mobile_base_align",
+                    [this]() {
+                        return mobile_base_->Execute(base_alignment_command_);
+                    });
+        return;
+    }
+
+    auto result = PollAction(PipelineState::BASE_ALIGNING);
+    if (!result.has_value()) return;
+    if (*result == GraspResult::SUCCESS) {
+        base_align_attempts_++;
+        stable_count_ = 0;
+        missing_count_ = 0;
+        current_color_.release();
+        current_depth_.release();
+        SetState(PipelineState::DETECTING,
+                "Base aligned, detecting target again");
+    } else {
+        SetState(PipelineState::ERROR,
+                ResultMessage("Mobile base alignment failed", *result));
+    }
 }
 
 void GraspPipeline::HandleApproaching() {

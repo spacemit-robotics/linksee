@@ -120,6 +120,7 @@ struct ExecutorConfig {
     // 速度
     float move_speed = 0.5f;
     float line_speed = 0.3f;
+    float pose_position_tolerance = 0.03f;
 
     // 夹爪
     float gripper_open = 1.0f;
@@ -268,6 +269,7 @@ private:
     GraspResult MoveToPose(const Pose3D& pose, float speed);
     GraspResult MoveLinear(const Pose3D& pose, float speed);
     bool WaitMotionDone(int timeout_ms = -1);
+    bool VerifyPoseReached(const char* action, const Pose3D& target_pose);
     bool GetCurrentJoints(std::vector<float>& joints);
     bool NeedsCollisionAvoidance(const std::vector<float>& current_joints,
                                 const std::vector<float>& target_joints);

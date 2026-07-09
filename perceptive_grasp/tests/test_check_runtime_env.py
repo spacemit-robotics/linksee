@@ -8,8 +8,10 @@
 
 import contextlib
 import io
+import os
 import stat
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -153,6 +155,41 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         self.assertNotIn("video device read/write: /dev/video-dec0",
                          output.getvalue())
 
+    def test_realsense_check_fails_without_d435i_device(self):
+        with mock.patch.object(check_runtime_env.glob, "glob",
+                               return_value=["/dev/video1", "/dev/video2"]), \
+                mock.patch.object(check_runtime_env, "_udev_properties",
+                                  return_value={"ID_MODEL": "2K_USB_Camera"}):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_realsense_camera()
+
+        self.assertFalse(ok)
+        self.assertIn("RealSense D435i", output.getvalue())
+        self.assertIn("not found", output.getvalue())
+
+    def test_realsense_check_passes_when_d435i_video_device_exists(self):
+        def fake_props(device):
+            if device == "/dev/video3":
+                return {
+                    "ID_VENDOR_ID": "8086",
+                    "ID_MODEL_ID": "0b3a",
+                    "ID_MODEL": "Intel_R__RealSense_TM__Depth_Camera_435i",
+                }
+            return {"ID_MODEL": "2K_USB_Camera"}
+
+        with mock.patch.object(check_runtime_env.glob, "glob",
+                               return_value=["/dev/video1", "/dev/video3"]), \
+                mock.patch.object(check_runtime_env, "_udev_properties",
+                                  side_effect=fake_props):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_realsense_camera()
+
+        self.assertTrue(ok)
+        self.assertIn("/dev/video3", output.getvalue())
+        self.assertIn("RealSense D435i", output.getvalue())
+
     def test_kinematics_check_reports_missing_pinocchio_backend(self):
         cache_text = (
             "//The directory containing a CMake configuration file for pinocchio.\n"
@@ -260,6 +297,333 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         self.assertEqual(command[:4], [sys.executable, "-m", "pip", "install"])
         self.assertIn("-r", command)
         self.assertIn("requirements.txt", command[-1])
+
+    def test_serial_report_shows_by_id_and_config_roles(self):
+        def fake_realpath(path):
+            mapping = {
+                "/dev/serial/by-id/usb-camera-if00": "/dev/ttyACM1",
+                "/dev/serial/by-id/usb-single-serial-if00": "/dev/ttyACM2",
+            }
+            return mapping.get(path, path)
+
+        def fake_info(command, *args, **kwargs):
+            node = command[-1]
+            model = "USB Single Serial" if node == "/dev/ttyACM2" else "2K USB Camera"
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"ID_MODEL={model}\nID_VENDOR=Vendor\n",
+                stderr="",
+            )
+
+        with mock.patch.object(check_runtime_env.glob, "glob",
+                               side_effect=[
+                                   ["/dev/ttyACM1", "/dev/ttyACM2"],
+                                   [
+                                       "/dev/serial/by-id/usb-camera-if00",
+                                       "/dev/serial/by-id/usb-single-serial-if00",
+                                   ],
+                               ]), \
+                mock.patch.object(check_runtime_env.os.path, "realpath",
+                                  side_effect=fake_realpath), \
+                mock.patch.object(check_runtime_env.subprocess, "run",
+                                  side_effect=fake_info):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                check_runtime_env.report_serial_devices(
+                    manipulator_device="/dev/ttyACM2",
+                    mobile_base_device="/dev/ttyACM1",
+                )
+
+        text = output.getvalue()
+        self.assertIn("[INFO] serial devices:", text)
+        self.assertIn("/dev/ttyACM2", text)
+        self.assertIn("role=manipulator.uart_device", text)
+        self.assertIn("/dev/serial/by-id/usb-single-serial-if00", text)
+        self.assertIn("ID_MODEL=USB Single Serial", text)
+        self.assertIn("/dev/ttyACM1", text)
+        self.assertIn("role=mobile_base.dev_path", text)
+        self.assertIn("ID_MODEL=2K USB Camera", text)
+
+    def test_main_checks_mobile_base_serial_device(self):
+        config = {
+            "manipulator": {"uart_device": "/dev/ttyACM2"},
+            "mobile_base": {
+                "enabled": True,
+                "driver": "drv_uart_esp32",
+                "dev_path": "/dev/ttyACM1",
+            },
+        }
+
+        with mock.patch.object(check_runtime_env, "load_yaml",
+                               return_value=config), \
+                mock.patch.object(check_runtime_env, "report_serial_devices"), \
+                mock.patch.object(check_runtime_env, "check_tty",
+                                  return_value=True) as check_tty, \
+                mock.patch.object(check_runtime_env, "check_realsense_camera",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env,
+                                  "check_chassis_driver_registered",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "check_video_permissions",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "check_kinematics_backend",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "check_import",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "check_audio_permissions",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "list_audio_devices",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env.os, "getcwd",
+                                  return_value=str(ROOT)), \
+                mock.patch.object(check_runtime_env.sys, "argv",
+                                  ["check_runtime_env.py", "--config", "cfg.yaml"]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = check_runtime_env.main()
+
+        self.assertEqual(rc, 0)
+        checked_devices = [call.args[0] for call in check_tty.call_args_list]
+        self.assertIn("/dev/ttyACM2", checked_devices)
+        self.assertIn("/dev/ttyACM1", checked_devices)
+
+    def test_main_checks_rpmsg_base_without_serial_base_suggestion(self):
+        config = {
+            "manipulator": {"uart_device": "/dev/ttyACM2"},
+            "mobile_base": {
+                "enabled": True,
+                "driver": "drv_rpmsg_esos",
+                "ctrl_dev": "/dev/rpmsg_ctrl0",
+                "data_dev": "/dev/rpmsg0",
+            },
+        }
+
+        with mock.patch.object(check_runtime_env, "load_yaml",
+                               return_value=config), \
+                mock.patch.object(check_runtime_env, "report_serial_devices") as report, \
+                mock.patch.object(check_runtime_env,
+                                  "check_serial_role_configuration",
+                                  return_value=True) as serial_roles, \
+                mock.patch.object(check_runtime_env, "check_tty",
+                                  return_value=True) as check_tty, \
+                mock.patch.object(check_runtime_env, "check_rpmsg_device",
+                                  return_value=True) as check_rpmsg, \
+                mock.patch.object(check_runtime_env,
+                                  "check_chassis_driver_registered",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "check_realsense_camera",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "check_video_permissions",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "check_kinematics_backend",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "check_import",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "check_audio_permissions",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "list_audio_devices",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env.os, "getcwd",
+                                  return_value=str(ROOT)), \
+                mock.patch.object(check_runtime_env.sys, "argv",
+                                  ["check_runtime_env.py", "--config", "cfg.yaml"]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = check_runtime_env.main()
+
+        self.assertEqual(rc, 0)
+        report.assert_called_once_with("/dev/ttyACM2", "")
+        serial_roles.assert_called_once_with(
+            "/dev/ttyACM2", "", False, mock.ANY)
+        check_rpmsg.assert_called_once_with(
+            "/dev/rpmsg_ctrl0", "/dev/rpmsg0", mock.ANY)
+        checked_devices = [call.args[0] for call in check_tty.call_args_list]
+        self.assertEqual(checked_devices, ["/dev/ttyACM2"])
+
+    def test_rpmsg_data_device_can_be_created_at_runtime(self):
+        def fake_exists(path):
+            return path == "/dev/rpmsg_ctrl0"
+
+        fake_stat = os.stat_result((stat.S_IFCHR | 0o660, 0, 0, 0, 0, 20, 0,
+                                    0, 0, 0))
+        with mock.patch.object(check_runtime_env.os.path, "exists",
+                               side_effect=fake_exists), \
+                mock.patch.object(check_runtime_env.os, "stat",
+                                  return_value=fake_stat), \
+                mock.patch.object(check_runtime_env.os, "access",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env.grp, "getgrgid",
+                                  return_value=SimpleNamespace(gr_name="dialout")), \
+                mock.patch.object(check_runtime_env, "check_group_status",
+                                  return_value=True):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_rpmsg_device(
+                    "/dev/rpmsg_ctrl0", "/dev/rpmsg0")
+
+        self.assertTrue(ok)
+        self.assertIn("will be created by chassis driver", output.getvalue())
+
+    def test_chassis_driver_check_fails_when_driver_is_not_registered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib_dir = Path(tmp) / "output" / "staging" / "lib"
+            lib_dir.mkdir(parents=True)
+            (lib_dir / "libchassis.so").write_bytes(b"drv_rpmsg_esos")
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_chassis_driver_registered(
+                    tmp, "drv_uart_esp32")
+
+        self.assertFalse(ok)
+        self.assertIn("chassis driver drv_uart_esp32", output.getvalue())
+        self.assertIn("not registered", output.getvalue())
+
+    def test_chassis_driver_check_passes_when_driver_is_registered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib_dir = Path(tmp) / "output" / "staging" / "lib"
+            lib_dir.mkdir(parents=True)
+            (lib_dir / "libchassis.so").write_bytes(b"drv_uart_esp32")
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_chassis_driver_registered(
+                    tmp, "drv_uart_esp32")
+
+        self.assertTrue(ok)
+        self.assertIn("chassis driver drv_uart_esp32", output.getvalue())
+
+    def test_serial_role_check_rejects_camera_as_manipulator(self):
+        def fake_realpath(path):
+            mapping = {
+                "/dev/serial/by-id/usb-camera-if00": "/dev/ttyACM0",
+                "/dev/serial/by-id/usb-arm-if00": "/dev/ttyACM1",
+                "/dev/serial/by-id/usb-base-if00": "/dev/ttyACM2",
+            }
+            return mapping.get(path, path)
+
+        def fake_props(device):
+            if device == "/dev/ttyACM0":
+                return {"ID_MODEL": "2K_USB_Camera"}
+            return {"ID_MODEL": "USB_Single_Serial", "ID_VENDOR": "1a86"}
+
+        with mock.patch.object(check_runtime_env.glob, "glob",
+                               side_effect=[
+                                   ["/dev/ttyACM0", "/dev/ttyACM1",
+                                    "/dev/ttyACM2"],
+                                   [
+                                       "/dev/serial/by-id/usb-camera-if00",
+                                       "/dev/serial/by-id/usb-arm-if00",
+                                       "/dev/serial/by-id/usb-base-if00",
+                                   ],
+                               ]), \
+                mock.patch.object(check_runtime_env.os.path, "realpath",
+                                  side_effect=fake_realpath), \
+                mock.patch.object(check_runtime_env, "_udev_properties",
+                                  side_effect=fake_props), \
+                mock.patch.object(check_runtime_env, "_probe_so101_device",
+                                  side_effect=lambda d, r: d == "/dev/ttyACM1"):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_serial_role_configuration(
+                    "/dev/ttyACM0",
+                    "/dev/ttyACM2",
+                    True,
+                    str(ROOT),
+                )
+
+        text = output.getvalue()
+        self.assertFalse(ok)
+        self.assertIn("manipulator.uart_device role", text)
+        self.assertIn("camera serial", text)
+        self.assertIn(
+            'manipulator.uart_device: "/dev/serial/by-id/usb-arm-if00"',
+            text,
+        )
+        self.assertIn(
+            'mobile_base.dev_path: "/dev/serial/by-id/usb-base-if00"',
+            text,
+        )
+
+    def test_serial_role_check_fails_when_base_uses_detected_arm_port(self):
+        def fake_realpath(path):
+            mapping = {
+                "/dev/serial/by-id/usb-arm-if00": "/dev/ttyACM1",
+                "/dev/serial/by-id/usb-base-if00": "/dev/ttyACM2",
+            }
+            return mapping.get(path, path)
+
+        with mock.patch.object(check_runtime_env.glob, "glob",
+                               side_effect=[
+                                   ["/dev/ttyACM1", "/dev/ttyACM2"],
+                                   [
+                                       "/dev/serial/by-id/usb-arm-if00",
+                                       "/dev/serial/by-id/usb-base-if00",
+                                   ],
+                               ]), \
+                mock.patch.object(check_runtime_env.os.path, "realpath",
+                                  side_effect=fake_realpath), \
+                mock.patch.object(check_runtime_env, "_udev_properties",
+                                  return_value={
+                                      "ID_MODEL": "USB_Single_Serial",
+                                      "ID_VENDOR": "1a86",
+                                  }), \
+                mock.patch.object(check_runtime_env, "_probe_so101_device",
+                                  side_effect=lambda d, r: d == "/dev/ttyACM1"):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_serial_role_configuration(
+                    "/dev/ttyACM1",
+                    "/dev/ttyACM1",
+                    True,
+                    str(ROOT),
+                )
+
+        text = output.getvalue()
+        self.assertFalse(ok)
+        self.assertIn("mobile_base.dev_path role", text)
+        self.assertIn("SO101 manipulator port", text)
+        self.assertIn(
+            'mobile_base.dev_path: "/dev/serial/by-id/usb-base-if00"',
+            text,
+        )
+
+    def test_serial_role_check_fails_when_no_so101_port_responds(self):
+        def fake_realpath(path):
+            mapping = {
+                "/dev/serial/by-id/usb-arm-if00": "/dev/ttyACM1",
+                "/dev/serial/by-id/usb-base-if00": "/dev/ttyACM2",
+            }
+            return mapping.get(path, path)
+
+        with mock.patch.object(check_runtime_env.glob, "glob",
+                               side_effect=[
+                                   ["/dev/ttyACM1", "/dev/ttyACM2"],
+                                   [
+                                       "/dev/serial/by-id/usb-arm-if00",
+                                       "/dev/serial/by-id/usb-base-if00",
+                                   ],
+                               ]), \
+                mock.patch.object(check_runtime_env.os.path, "realpath",
+                                  side_effect=fake_realpath), \
+                mock.patch.object(check_runtime_env, "_udev_properties",
+                                  return_value={
+                                      "ID_MODEL": "USB_Single_Serial",
+                                      "ID_VENDOR": "1a86",
+                                  }), \
+                mock.patch.object(check_runtime_env, "_probe_so101_device",
+                                  return_value=False):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_serial_role_configuration(
+                    "/dev/ttyACM1",
+                    "/dev/ttyACM2",
+                    True,
+                    str(ROOT),
+                )
+
+        text = output.getvalue()
+        self.assertFalse(ok)
+        self.assertIn("manipulator.uart_device role", text)
+        self.assertIn("SO101 did not respond", text)
 
 
 if __name__ == "__main__":

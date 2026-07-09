@@ -320,6 +320,11 @@ int main(int argc, char* argv[]) {
         if (app.has_joints) {
             // 直接关节模式: 跳过 IK
             ret = executor.MoveToJointsSafe(app.target_joints, app.safe_move_speed);
+        } else if (app.wrist_pitch < 0.0f && app.wrist_yaw <= -900.0f) {
+            std::cout << "[debug_execute_safe] using executor pose path"
+                        << " with FK arrival verification" << std::endl;
+            ret = executor.MoveToPreGraspSafe(
+                app.pre_grasp_pose, app.safe_move_speed);
         } else {
             // IK 模式: 多种子采样，筛选满足关节约束的解
             const auto& constraints = exec_cfg.joint_constraints;

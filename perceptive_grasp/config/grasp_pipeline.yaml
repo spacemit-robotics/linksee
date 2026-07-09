@@ -107,7 +107,7 @@ orientation:
 manipulator:
   driver: "so101"
   # SO101/Feetech 总线串口。换硬件或 USB 插拔顺序变化后，用 ls /dev/ttyACM* 重新确认。
-  uart_device: "/dev/ttyACM0"
+  uart_device: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A7A057974-if00"
   baudrate: 1000000
   urdf_path: "../urdf/so101.urdf"
   base_link: "base_link"
@@ -115,6 +115,7 @@ manipulator:
   # 运动速度
   move_speed: 1          # 关节运动速度倍率 [0~1]
   line_speed: 0.5          # 直线运动速度倍率 [0~1]
+  pose_position_tolerance: 0.03  # 末端到位检查容差 (米)
   # 预定义姿态 (关节角, rad)
   # Linksee 结构: D435i 在机身顶部面朝前方，臂需要收起避免遮挡相机视野
   home_joints: [1.816, -1.850, 1.639, 1.147, 0.189]
@@ -158,6 +159,44 @@ place:
   place_joints: [-1.636, 0.087, -0.140, 1.389, 0.033]
   # 放置释放时夹爪张开程度 [0~1]
   release_open: 0.5
+
+# ============ 底盘辅助对齐 ============
+mobile_base:
+  enabled: true
+  driver: "drv_uart_esp32"
+  # Linksee 真实底盘默认通过 UART 串口连接。
+  dev_path: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5958002008-if00"
+  baud: 115200
+  # RPMsg 字段仅在 driver 改为 drv_rpmsg_esos 时使用。
+  ctrl_dev: "/dev/rpmsg_ctrl0"
+  data_dev: "/dev/rpmsg0"
+  service_name: "rpmsg:motor_ctrl"
+  wheel_diameter: 0.067
+  wheel_base: 0.183
+  wheel_track: 0.0
+  left_wheel_gain: 1.0
+  max_speed: 0.3
+  max_angular: 3.14
+  reduction_ratio: 56.0
+  ff_factor: 0.3
+  pid_kp: 0.05
+  pid_ki: 0.2
+  pid_kd: 0.01
+  cfg_send_on_startup: true
+  feedback_enable: true
+  # 目标在机械臂 base 坐标下的舒适抓取距离，单位米。
+  target_x: 0.30
+  x_tolerance: 0.05
+  y_tolerance: 0.08
+  # 每次底盘只做短距离动作，动作后重新检测和规划。
+  max_step_m: 0.12
+  linear_speed: 0.20
+  angular_speed: 1.2
+  yaw_gain: 8.0
+  min_cmd_duration_ms: 200
+  max_cmd_duration_ms: 2000
+  settle_ms: 500
+  max_align_attempts: 6
 
 # ============ 抓取调试输出 ============
 debug:

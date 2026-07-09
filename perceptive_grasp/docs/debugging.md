@@ -74,6 +74,22 @@ source ~/spacemit_robot/build/envsetup.sh
 
 ## 7. 调试产物
 
+## 7. 底盘辅助不动作
+
+如果抓取日志出现 `Mobile base alignment needed`，但现场底盘没有明显动作，先确认底盘串口有回包且轮速不为 0。UART 差速底盘的低速启动区可能较高，`angular_speed` 过小时会出现方向字段变化但反馈轮速接近 `0.000 rev/s` 的情况。
+
+当前默认配置使用：
+
+```yaml
+mobile_base:
+  angular_speed: 1.2
+  max_angular: 3.14
+```
+
+该配置会让原地转向轮速约为 `0.52 rev/s`，可跨过当前 Linksee 底盘的低速启动死区。
+
+## 8. 调试产物
+
 `config/grasp_pipeline.yaml` 中保持：
 
 ```yaml
