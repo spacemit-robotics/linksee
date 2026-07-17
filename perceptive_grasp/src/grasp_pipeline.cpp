@@ -1640,7 +1640,7 @@ void GraspPipeline::HandlePlanning() {
                     cam_point, base_point, offset_dir_angle);
 
     if (!planner_->InWorkspace(pre_grasp_pose_.x, pre_grasp_pose_.y,
-                               base_point[2])) {
+                                base_point[2])) {
         SetState(PipelineState::ERROR,
             "Adjusted grasp pose out of workspace after gripper_offset: "
             "pose=[" + std::to_string(pre_grasp_pose_.x) + ", " +
