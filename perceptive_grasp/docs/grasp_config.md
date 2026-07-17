@@ -119,8 +119,8 @@ orientation:
 
 - `approach_height`：预抓取点高于目标表面的距离，单位米。
 - `grasp_depth`：最终抓取点相对目标表面的下探距离，单位米。
-- `gripper_offset`：沿夹爪固定爪方向施加的三维补偿，单位米。
-- `grasp_point_x_ratio`：抓取像素沿目标短轴的偏移比例；`0` 表示中心，`1` 表示短轴边缘。
+- `grasp_point_x_ratio`：二维抓取像素的无量纲偏移比例。程序根据分割结果计算目标短轴，并从目标中心向固定爪一侧移动抓取像素；`0` 表示目标中心，`0.5` 表示中心到短轴边缘的中点，`1` 表示短轴边缘。
+- `gripper_offset`：三维工具补偿，单位米。程序完成深度反投影和手眼坐标变换后，根据抓取方向平移预抓取位和抓取位，用于补偿夹爪 tcp 与固定爪接触位置之间的机械偏差；该参数不会改变调试图中的抓取像素。
 - `gripper_open`：下探前的夹爪张开度，范围为 `[0, 1]`；`0` 表示全闭，`1` 表示全开。
 - `gripper_effort`：闭合抓取时请求的归一化力度，范围为 `[0, 1]`。
 - `gripper_hold_load_threshold`：夹爪闭合后用于判断是否夹住目标的负载阈值。
@@ -129,6 +129,17 @@ orientation:
 - `workspace`：机械臂基座坐标系下允许抓取的三维范围，单位米。
 - `orientation.enabled`：根据目标分割结果估计夹爪方向。
 - `orientation.aspect_ratio_threshold`：目标长宽比达到该阈值时才估计夹爪方向。
+
+两个偏移按以下顺序叠加：
+
+```text
+二维抓取像素偏移 = 目标短轴半长 × grasp_point_x_ratio
+三维位姿偏移 dx = -gripper_offset × sin(grasp_yaw)
+三维位姿偏移 dy =  gripper_offset × cos(grasp_yaw)
+```
+
+- `grasp_point_x_ratio` 作用于目标图像，用于决定从目标的哪个位置计算三维坐标。目标长宽比低于 `orientation.aspect_ratio_threshold` 或短轴长度不足 10 px 时，程序会改用目标中心，此时该参数不产生偏移。
+- `gripper_offset` 作用于机械臂基座坐标系。值为 `0` 时不进行三维补偿；值大于 `0` 时向程序选定的固定爪一侧偏移。
 
 底盘将目标移动到舒适区后，pipeline 仍会执行工作空间和 ik 可达性检查。
 
