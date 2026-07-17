@@ -299,6 +299,32 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         self.assertIn("liblas2_usb_stereo.so", output.getvalue())
         self.assertIn("LAS2 runtime libraries", output.getvalue())
 
+    def test_las2_check_rejects_non_ai_core_affinity(self):
+        camera = {
+            "type": "spacemit_las2",
+            "spacemit_las2": {
+                "video_device": "/dev/video1",
+                "model_path": "/opt/las2/models/model.onnx",
+                "calib_path": "/opt/las2/config/stereo.json",
+                "core_count": 2,
+                "core_affinity": "7,8",
+            },
+        }
+
+        with mock.patch.object(check_runtime_env.os.path, "exists",
+                               return_value=False), \
+                mock.patch.object(check_runtime_env.os.path, "isfile",
+                                  return_value=False), \
+                mock.patch.object(check_runtime_env.os, "access",
+                                  return_value=False):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_las2_camera(camera, "/tmp/sdk")
+
+        self.assertFalse(ok)
+        self.assertIn("LAS2 core_affinity", output.getvalue())
+        self.assertIn("range 8-15", output.getvalue())
+
     def test_las2_runtime_check_reports_missing_opencv(self):
         result = SimpleNamespace(
             returncode=0,
