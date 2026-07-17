@@ -1,9 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 project(perceptive_grasp LANGUAGES C CXX)
 
+include(GNUInstallDirs)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 # 抑制 K3 镜像上 libvision.so 已知的 OpenCV DT_NEEDED 链接警告。
 # SDK 视觉库与系统 OpenCV 运行时保持 ABI 兼容。
@@ -18,6 +21,8 @@ option(X86_STANDALONE "Shortcut: OPENCV_DNN detector + MOCK executor" OFF)
 option(USE_OPENCV_DNN "Use OpenCV DNN for detection (no VisionService needed)" OFF)
 option(USE_MOCK_EXECUTOR "Use mock executor (no real arm)" OFF)
 option(ENABLE_ROS2_VOICE "Enable optional ROS2 std_msgs/String voice bridge" OFF)
+option(ENABLE_LAS2_CAMERA
+       "Enable optional spacemit_las2 stereo camera backend" ON)
 
 # X86_STANDALONE 是主机侧规划和调试构建的快捷选项。
 if(X86_STANDALONE)
@@ -27,7 +32,7 @@ endif()
 
 # ============ 通用依赖 ============
 
-find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc highgui imgcodecs dnn)
+find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc highgui imgcodecs dnn calib3d)
 find_package(yaml-cpp REQUIRED)
 
 set(REALSENSE2_HINTS)
@@ -36,7 +41,14 @@ if(EXISTS "/opt/ros/humble/lib/riscv64-linux-gnu/cmake/realsense2")
         "/opt/ros/humble"
         "/opt/ros/humble/lib/riscv64-linux-gnu/cmake/realsense2")
 endif()
-find_package(realsense2 REQUIRED CONFIG PATHS ${REALSENSE2_HINTS})
+find_package(realsense2 QUIET CONFIG PATHS ${REALSENSE2_HINTS})
+set(HAVE_REALSENSE_CAMERA OFF)
+if(realsense2_FOUND)
+    set(HAVE_REALSENSE_CAMERA ON)
+    message(STATUS "[Camera] realsense backend found")
+else()
+    message(STATUS "[Camera] realsense backend not found")
+endif()
 
 set(HAVE_ROS2_VOICE OFF)
 if(ENABLE_ROS2_VOICE)
@@ -56,13 +68,19 @@ endif()
 
 set(SOURCES
     src/main.cpp
-    src/depth_camera.cpp
     src/grasp_planner.cpp
     src/grasp_pipeline.cpp
+    src/stereo_camera.cpp
+    src/stereo_geometry.cpp
     src/mobile_base_controller.cpp
     src/orientation_estimator.cpp
     src/voice_command_parser.cpp
 )
+
+if(HAVE_REALSENSE_CAMERA)
+    list(APPEND SOURCES src/depth_camera.cpp)
+    add_definitions(-DHAVE_REALSENSE_CAMERA=1)
+endif()
 
 if(HAVE_ROS2_VOICE)
     list(APPEND SOURCES src/voice_command_listener.cpp)
@@ -74,16 +92,121 @@ set(EXTRA_INCLUDE_DIRS
 )
 
 set(EXTRA_LIBRARIES
-    realsense2::realsense2
     ${OpenCV_LIBS}
     yaml-cpp
     pthread
 )
+if(HAVE_REALSENSE_CAMERA)
+    list(APPEND EXTRA_LIBRARIES realsense2::realsense2)
+endif()
+set(EXTRA_LINK_OPTIONS)
+set(EXTRA_BUILD_RPATH)
+set(EXTRA_INSTALL_RPATH)
 
 # ============ 可选底盘控制 ============
 
 if(NOT DEFINED _STAGING_DIR)
     set(_STAGING_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../output/staging")
+endif()
+
+# ============ 可选 spacemit_las2 双目相机 ============
+
+set(HAVE_LAS2_CAMERA OFF)
+if(ENABLE_LAS2_CAMERA)
+    set(_LAS2_HINTS)
+    if(DEFINED LAS2_RUNTIME_DIR)
+        list(APPEND _LAS2_HINTS "${LAS2_RUNTIME_DIR}")
+    endif()
+    if(DEFINED ENV{LAS2_RUNTIME_DIR})
+        list(APPEND _LAS2_HINTS "$ENV{LAS2_RUNTIME_DIR}")
+    endif()
+    if(DEFINED ENV{HOME})
+        list(APPEND _LAS2_HINTS "$ENV{HOME}/las2_runtime")
+    endif()
+    list(REMOVE_DUPLICATES _LAS2_HINTS)
+
+    find_path(LAS2_INCLUDE_DIR las2_usb_stereo.h
+        PATHS
+            ${_LAS2_HINTS}
+            "${_STAGING_DIR}"
+        PATH_SUFFIXES include
+        NO_DEFAULT_PATH
+    )
+    find_library(LAS2_LIBRARY las2_usb_stereo
+        PATHS
+            ${_LAS2_HINTS}
+            "${_STAGING_DIR}"
+        PATH_SUFFIXES lib
+        NO_DEFAULT_PATH
+    )
+
+    if(LAS2_INCLUDE_DIR AND LAS2_LIBRARY)
+        set(HAVE_LAS2_CAMERA ON)
+        message(STATUS "[Camera] spacemit_las2 backend found")
+        list(APPEND SOURCES src/las2_stereo_camera.cpp)
+        list(APPEND EXTRA_INCLUDE_DIRS ${LAS2_INCLUDE_DIR})
+        get_filename_component(_LAS2_LIB_DIR "${LAS2_LIBRARY}" DIRECTORY)
+        get_filename_component(_LAS2_ROOT_DIR "${_LAS2_LIB_DIR}" DIRECTORY)
+
+        # The delivered library carries RUNPATH entries from its build host.
+        # Patch a private build copy so its OpenCV/ORT dependencies resolve on
+        # the deployed K3 without modifying the original runtime package.
+        set(_LAS2_LINK_LIBRARY "${LAS2_LIBRARY}")
+        find_program(PATCHELF_EXECUTABLE patchelf)
+        if(PATCHELF_EXECUTABLE)
+            set(_LAS2_PATCH_DIR "${CMAKE_BINARY_DIR}/las2_runtime")
+            set(_LAS2_PATCHED_LIBRARY
+                "${_LAS2_PATCH_DIR}/liblas2_usb_stereo.so")
+            string(CONCAT _LAS2_PRIVATE_RPATH
+                "${_LAS2_LIB_DIR}:${_LAS2_ROOT_DIR}/lib/spacemit_ort:"
+                "${_LAS2_ROOT_DIR}/lib/opencv")
+            add_custom_command(
+                OUTPUT "${_LAS2_PATCHED_LIBRARY}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory
+                    "${_LAS2_PATCH_DIR}"
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${LAS2_LIBRARY}" "${_LAS2_PATCHED_LIBRARY}"
+                COMMAND "${PATCHELF_EXECUTABLE}" --set-rpath
+                    "${_LAS2_PRIVATE_RPATH}" "${_LAS2_PATCHED_LIBRARY}"
+                DEPENDS "${LAS2_LIBRARY}"
+                COMMENT "Preparing private spacemit_las2 runtime"
+                VERBATIM
+            )
+            add_custom_target(spacemit_las2_runtime
+                DEPENDS "${_LAS2_PATCHED_LIBRARY}")
+            set(_LAS2_RUNTIME_TARGET spacemit_las2_runtime)
+            set(_LAS2_LINK_LIBRARY "${_LAS2_PATCHED_LIBRARY}")
+            list(APPEND EXTRA_BUILD_RPATH "${_LAS2_PATCH_DIR}")
+            message(STATUS
+                "[Camera] LAS2 private runtime will be prepared during build")
+        else()
+            message(WARNING
+                "[Camera] patchelf not found; LD_LIBRARY_PATH is required "
+                "for LAS2 private dependencies")
+        endif()
+        list(APPEND EXTRA_LIBRARIES "${_LAS2_LINK_LIBRARY}")
+
+        foreach(_LAS2_DEP_DIR
+                "${_LAS2_LIB_DIR}"
+                "${_LAS2_ROOT_DIR}/lib/spacemit_ort"
+                "${_LAS2_ROOT_DIR}/lib/opencv")
+            list(APPEND EXTRA_LINK_OPTIONS "-Wl,-rpath-link,${_LAS2_DEP_DIR}")
+            list(APPEND EXTRA_BUILD_RPATH "${_LAS2_DEP_DIR}")
+        endforeach()
+        list(APPEND EXTRA_INSTALL_RPATH
+            "\$ORIGIN/../${CMAKE_INSTALL_LIBDIR}/perceptive_grasp")
+        add_definitions(-DHAVE_LAS2_CAMERA=1)
+    else()
+        message(STATUS
+            "[Camera] spacemit_las2 backend not found; "
+            "camera.type=spacemit_las2 will fail with a clear runtime message")
+    endif()
+endif()
+
+if(NOT HAVE_REALSENSE_CAMERA AND NOT HAVE_LAS2_CAMERA)
+    message(FATAL_ERROR
+        "No stereo camera backend found. Install realsense dependencies or "
+        "place spacemit_las2 in ~/las2_runtime.")
 endif()
 
 find_path(CHASSIS_INCLUDE_DIR chassis.h
@@ -208,31 +331,66 @@ if(USE_MOCK_EXECUTOR)
 else()
     message(STATUS "  Executor:  Real hardware")
 endif()
-message(STATUS "  Camera:    RealSense D435i (always real)")
+set(_CAMERA_BACKENDS)
+if(HAVE_REALSENSE_CAMERA)
+    list(APPEND _CAMERA_BACKENDS "realsense")
+endif()
+if(HAVE_LAS2_CAMERA)
+    list(APPEND _CAMERA_BACKENDS "spacemit_las2")
+endif()
+list(JOIN _CAMERA_BACKENDS ", " _CAMERA_BACKENDS_SUMMARY)
+message(STATUS "  Camera:    ${_CAMERA_BACKENDS_SUMMARY}")
 message(STATUS "")
 
-# ============ 主目标 ============
+# ============ 主程序与日志入口 ============
 
-add_executable(perceptive_grasp ${SOURCES})
+add_executable(perceptive_grasp_core ${SOURCES})
+if(DEFINED _LAS2_RUNTIME_TARGET)
+    add_dependencies(perceptive_grasp_core ${_LAS2_RUNTIME_TARGET})
+endif()
 
-target_include_directories(perceptive_grasp PRIVATE ${EXTRA_INCLUDE_DIRS})
-target_link_libraries(perceptive_grasp PRIVATE ${EXTRA_LIBRARIES})
+target_include_directories(perceptive_grasp_core PRIVATE ${EXTRA_INCLUDE_DIRS})
+target_link_libraries(perceptive_grasp_core PRIVATE ${EXTRA_LIBRARIES})
+target_link_options(perceptive_grasp_core PRIVATE ${EXTRA_LINK_OPTIONS})
+if(EXTRA_BUILD_RPATH)
+    set_target_properties(perceptive_grasp_core PROPERTIES
+        BUILD_RPATH "${EXTRA_BUILD_RPATH}"
+    )
+endif()
+if(EXTRA_INSTALL_RPATH)
+    set_target_properties(perceptive_grasp_core PROPERTIES
+        INSTALL_RPATH "${EXTRA_INSTALL_RPATH}"
+    )
+endif()
 if(HAVE_ROS2_VOICE)
-    target_compile_definitions(perceptive_grasp PRIVATE ENABLE_ROS2_VOICE=1)
-    target_include_directories(perceptive_grasp PRIVATE
+    target_compile_definitions(perceptive_grasp_core PRIVATE ENABLE_ROS2_VOICE=1)
+    target_include_directories(perceptive_grasp_core PRIVATE
         ${rclcpp_INCLUDE_DIRS}
         ${std_msgs_INCLUDE_DIRS}
     )
     if(TARGET rclcpp::rclcpp)
-        target_link_libraries(perceptive_grasp PRIVATE rclcpp::rclcpp)
+        target_link_libraries(perceptive_grasp_core PRIVATE rclcpp::rclcpp)
     else()
-        target_link_libraries(perceptive_grasp PRIVATE ${rclcpp_LIBRARIES})
+        target_link_libraries(perceptive_grasp_core PRIVATE ${rclcpp_LIBRARIES})
     endif()
-    target_link_libraries(perceptive_grasp PRIVATE
+    target_link_libraries(perceptive_grasp_core PRIVATE
         ${std_msgs_TARGETS}
         ${std_msgs_LIBRARIES}
     )
 endif()
+
+# The public executable filters third-party stdout and stderr before
+# any SDK static initializer runs. --debug bypasses filtering.
+add_custom_target(perceptive_grasp ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_perceptive_grasp.py"
+        "${CMAKE_BINARY_DIR}/perceptive_grasp"
+    COMMAND chmod +x "${CMAKE_BINARY_DIR}/perceptive_grasp"
+    DEPENDS
+        perceptive_grasp_core
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_perceptive_grasp.py"
+    COMMENT "Preparing perceptive_grasp structured-log launcher"
+)
 
 # ============ 单元测试 ============
 
@@ -258,12 +416,33 @@ endif()
 add_test(NAME mobile_base_alignment_test
     COMMAND mobile_base_alignment_test)
 
+add_executable(stereo_geometry_test
+    tests/stereo_geometry_test.cpp
+    src/stereo_geometry.cpp
+)
+target_include_directories(stereo_geometry_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(stereo_geometry_test PRIVATE ${OpenCV_LIBS})
+add_test(NAME stereo_geometry_test COMMAND stereo_geometry_test)
+
 
 # ============ 安装 ============
 
-install(TARGETS perceptive_grasp DESTINATION bin)
+install(TARGETS perceptive_grasp_core DESTINATION bin)
+install(PROGRAMS scripts/run_perceptive_grasp.py
+    DESTINATION bin
+    RENAME perceptive_grasp)
 install(DIRECTORY config/ DESTINATION share/perceptive_grasp/config)
 install(DIRECTORY docs/ DESTINATION share/perceptive_grasp/docs)
+install(DIRECTORY urdf/ DESTINATION share/perceptive_grasp/urdf)
+install(FILES resources/eye-to-hand.jpg
+    DESTINATION share/perceptive_grasp/resources)
+if(HAVE_LAS2_CAMERA)
+    install(FILES "${_LAS2_LINK_LIBRARY}"
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/perceptive_grasp")
+endif()
 install(PROGRAMS
     scripts/asr_node.py
     scripts/check_runtime_env.py
@@ -271,78 +450,168 @@ install(PROGRAMS
     scripts/tts_node.py
     DESTINATION share/perceptive_grasp/scripts)
 
-# ============ 调试工具 ============
+# ============ 立体相机调试工具 ============
 
-add_executable(debug_view tools/debug_view.cpp)
-target_include_directories(debug_view PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${OpenCV_INCLUDE_DIRS}
-)
-target_link_libraries(debug_view PRIVATE
-    realsense2::realsense2
-    ${OpenCV_LIBS}
-    pthread
-)
+if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA)
+    set(DEBUG_VIEW_SOURCES
+        tools/debug_view.cpp
+        src/stereo_camera.cpp
+        src/stereo_geometry.cpp
+    )
+    if(HAVE_REALSENSE_CAMERA)
+        list(APPEND DEBUG_VIEW_SOURCES src/depth_camera.cpp)
+    endif()
+    if(HAVE_LAS2_CAMERA)
+        list(APPEND DEBUG_VIEW_SOURCES src/las2_stereo_camera.cpp)
+    endif()
 
-if(USE_OPENCV_DNN)
-    target_compile_definitions(debug_view PRIVATE NO_VISION_SERVICE=1)
+    add_executable(debug_view ${DEBUG_VIEW_SOURCES})
+    target_include_directories(debug_view PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(debug_view PRIVATE
+        ${OpenCV_LIBS}
+        yaml-cpp
+        pthread
+    )
+    if(HAVE_REALSENSE_CAMERA)
+        target_link_libraries(debug_view PRIVATE realsense2::realsense2)
+    endif()
+    if(HAVE_LAS2_CAMERA)
+        if(DEFINED _LAS2_RUNTIME_TARGET)
+            add_dependencies(debug_view ${_LAS2_RUNTIME_TARGET})
+        endif()
+        target_include_directories(debug_view PRIVATE ${LAS2_INCLUDE_DIR})
+        target_link_libraries(debug_view PRIVATE ${_LAS2_LINK_LIBRARY})
+        target_link_options(debug_view PRIVATE ${EXTRA_LINK_OPTIONS})
+        if(EXTRA_BUILD_RPATH)
+            set_target_properties(debug_view PROPERTIES
+                BUILD_RPATH "${EXTRA_BUILD_RPATH}"
+            )
+        endif()
+        if(EXTRA_INSTALL_RPATH)
+            set_target_properties(debug_view PROPERTIES
+                INSTALL_RPATH "${EXTRA_INSTALL_RPATH}"
+            )
+        endif()
+    endif()
+
+    if(USE_OPENCV_DNN)
+        target_compile_definitions(debug_view PRIVATE NO_VISION_SERVICE=1)
+    else()
+        target_include_directories(debug_view PRIVATE ${VISION_INCLUDE_DIR})
+        target_link_libraries(debug_view PRIVATE ${VISION_LIBRARY})
+    endif()
+
+    install(TARGETS debug_view DESTINATION bin)
 else()
-    target_include_directories(debug_view PRIVATE ${VISION_INCLUDE_DIR})
-    target_link_libraries(debug_view PRIVATE ${VISION_LIBRARY})
+    message(STATUS
+        "[Tools] debug_view skipped: no camera backend available")
 endif()
 
-install(TARGETS debug_view DESTINATION bin)
+if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA)
+    set(DEBUG_LOCALIZE_SOURCES
+        tools/debug_localize.cpp
+        src/grasp_planner.cpp
+        src/stereo_camera.cpp
+        src/stereo_geometry.cpp
+    )
+    if(HAVE_REALSENSE_CAMERA)
+        list(APPEND DEBUG_LOCALIZE_SOURCES src/depth_camera.cpp)
+    endif()
+    if(HAVE_LAS2_CAMERA)
+        list(APPEND DEBUG_LOCALIZE_SOURCES src/las2_stereo_camera.cpp)
+    endif()
 
-add_executable(debug_localize
-    tools/debug_localize.cpp
-    src/grasp_planner.cpp
-)
-target_include_directories(debug_localize PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${OpenCV_INCLUDE_DIRS}
-)
-target_link_libraries(debug_localize PRIVATE
-    realsense2::realsense2
-    ${OpenCV_LIBS}
-    yaml-cpp
-    pthread
-)
+    add_executable(debug_localize ${DEBUG_LOCALIZE_SOURCES})
+    target_include_directories(debug_localize PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(debug_localize PRIVATE
+        ${OpenCV_LIBS}
+        yaml-cpp
+        pthread
+    )
+    if(HAVE_REALSENSE_CAMERA)
+        target_link_libraries(debug_localize PRIVATE
+            realsense2::realsense2)
+    endif()
+    if(HAVE_LAS2_CAMERA)
+        if(DEFINED _LAS2_RUNTIME_TARGET)
+            add_dependencies(debug_localize ${_LAS2_RUNTIME_TARGET})
+        endif()
+        target_include_directories(debug_localize PRIVATE ${LAS2_INCLUDE_DIR})
+        target_link_libraries(debug_localize PRIVATE ${_LAS2_LINK_LIBRARY})
+        target_link_options(debug_localize PRIVATE ${EXTRA_LINK_OPTIONS})
+        if(EXTRA_BUILD_RPATH)
+            set_target_properties(debug_localize PROPERTIES
+                BUILD_RPATH "${EXTRA_BUILD_RPATH}"
+            )
+        endif()
+        if(EXTRA_INSTALL_RPATH)
+            set_target_properties(debug_localize PROPERTIES
+                INSTALL_RPATH "${EXTRA_INSTALL_RPATH}"
+            )
+        endif()
+    endif()
 
-if(USE_OPENCV_DNN)
-    message(WARNING "debug_localize skipped: requires VisionService (USE_OPENCV_DNN=OFF)")
-    set_target_properties(debug_localize PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    if(USE_OPENCV_DNN)
+        message(WARNING
+            "debug_localize skipped: requires VisionService "
+            "(USE_OPENCV_DNN=OFF)")
+        set_target_properties(debug_localize PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    else()
+        target_include_directories(debug_localize PRIVATE
+            ${VISION_INCLUDE_DIR})
+        target_link_libraries(debug_localize PRIVATE ${VISION_LIBRARY})
+    endif()
+
+    install(TARGETS debug_localize DESTINATION bin)
 else()
-    target_include_directories(debug_localize PRIVATE ${VISION_INCLUDE_DIR})
-    target_link_libraries(debug_localize PRIVATE ${VISION_LIBRARY})
+    message(STATUS
+        "[Tools] debug_localize skipped: no camera backend available")
 endif()
 
-install(TARGETS debug_localize DESTINATION bin)
+if(HAVE_REALSENSE_CAMERA)
+    add_executable(debug_grasp
+        tools/debug_grasp.cpp
+        src/grasp_planner.cpp
+        src/orientation_estimator.cpp
+    )
+    target_include_directories(debug_grasp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(debug_grasp PRIVATE
+        realsense2::realsense2
+        ${OpenCV_LIBS}
+        yaml-cpp
+        pthread
+    )
 
-add_executable(debug_grasp
-    tools/debug_grasp.cpp
-    src/grasp_planner.cpp
-    src/orientation_estimator.cpp
-)
-target_include_directories(debug_grasp PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${OpenCV_INCLUDE_DIRS}
-)
-target_link_libraries(debug_grasp PRIVATE
-    realsense2::realsense2
-    ${OpenCV_LIBS}
-    yaml-cpp
-    pthread
-)
+    if(USE_OPENCV_DNN)
+        message(WARNING
+            "debug_grasp skipped: requires VisionService "
+            "(USE_OPENCV_DNN=OFF)")
+        set_target_properties(debug_grasp PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    else()
+        target_include_directories(debug_grasp PRIVATE
+            ${VISION_INCLUDE_DIR}
+            ${MANIP_INCLUDE_DIR}
+        )
+        target_link_libraries(debug_grasp PRIVATE
+            ${VISION_LIBRARY}
+            ${MANIP_LIBRARY}
+        )
+    endif()
 
-if(USE_OPENCV_DNN)
-    message(WARNING "debug_grasp skipped: requires VisionService (USE_OPENCV_DNN=OFF)")
-    set_target_properties(debug_grasp PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    install(TARGETS debug_grasp DESTINATION bin)
 else()
-    target_include_directories(debug_grasp PRIVATE ${VISION_INCLUDE_DIR} ${MANIP_INCLUDE_DIR})
-    target_link_libraries(debug_grasp PRIVATE ${VISION_LIBRARY} ${MANIP_LIBRARY})
+    message(STATUS
+        "[Tools] debug_grasp skipped: realsense backend not available")
 endif()
-
-install(TARGETS debug_grasp DESTINATION bin)
 
 if(NOT USE_MOCK_EXECUTOR)
     add_executable(debug_ik tools/debug_ik.cpp)

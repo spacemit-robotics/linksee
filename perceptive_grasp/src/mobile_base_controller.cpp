@@ -1,7 +1,10 @@
 /*
- * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
- * SPDX-License-Identifier: Apache-2.0
- */
+* Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+* SPDX-License-Identifier: Apache-2.0
+*
+* @file mobile_base_controller.cpp
+* @brief Chassis-assisted target alignment implementation.
+*/
 
 #include "mobile_base_controller.h"
 
@@ -24,6 +27,14 @@ namespace {
 int ClampDurationMs(int duration_ms, const MobileBaseAlignmentConfig& config) {
     return std::clamp(
         duration_ms, config.min_cmd_duration_ms, config.max_cmd_duration_ms);
+}
+
+int ClampRotationDurationMs(
+    int duration_ms, const MobileBaseAlignmentConfig& config) {
+    return std::clamp(duration_ms,
+                    std::max(config.min_cmd_duration_ms,
+                            config.min_rotation_duration_ms),
+                    config.max_cmd_duration_ms);
 }
 
 #ifdef HAVE_CHASSIS
@@ -63,21 +74,36 @@ MobileBaseAlignmentCommand PlanMobileBaseAlignment(
         command.reason = "mobile base disabled";
         return command;
     }
+    const float x_error = base_point[0] - config.target_x;
+    const float y_error = base_point[1];
+    const float y_limit =
+        config.y_tolerance + std::max(0.0f, config.y_hysteresis);
+
+    if (std::fabs(x_error) <= config.x_tolerance &&
+        std::fabs(y_error) <= y_limit) {
+        command.reason = "target in comfortable range";
+        return command;
+    }
     if (align_attempts >= config.max_align_attempts) {
         command.max_attempts_reached = true;
         command.reason = "max base alignment attempts reached";
         return command;
     }
 
-    const float x_error = base_point[0] - config.target_x;
-    const float y_error = base_point[1];
-
-    if (std::fabs(y_error) > config.y_tolerance) {
-        const float yaw_delta = std::fabs(y_error) * config.yaw_gain;
+    if (std::fabs(y_error) > y_limit) {
+        const float target_range = std::hypot(base_point[0], y_error);
+        const float target_angle = std::atan2(
+            std::fabs(y_error), base_point[0]);
+        const float allowed_angle = std::asin(std::clamp(
+            y_limit / target_range, 0.0f, 1.0f));
+        const float yaw_error = std::max(0.0f,
+            target_angle - allowed_angle);
+        const float yaw_gain = std::clamp(config.yaw_gain, 0.5f, 8.0f);
+        const float yaw_delta = yaw_error * yaw_gain;
         command.type = MobileBaseAlignmentCommand::Type::ROTATE;
         command.linear_x = 0.0f;
         command.angular_z = std::copysign(config.angular_speed, y_error);
-        command.duration_ms = ClampDurationMs(
+        command.duration_ms = ClampRotationDurationMs(
             static_cast<int>((yaw_delta / config.angular_speed) * 1000.0f),
             config);
         command.reason = "target lateral offset";
@@ -99,6 +125,46 @@ MobileBaseAlignmentCommand PlanMobileBaseAlignment(
 
     command.reason = "target in comfortable range";
     return command;
+}
+
+float MeasureMobileBaseAlignmentProgress(
+    const float previous_base_point[3], const float current_base_point[3],
+    const MobileBaseAlignmentCommand& previous_command) {
+    if (previous_command.type == MobileBaseAlignmentCommand::Type::DRIVE) {
+        const float direction = std::copysign(1.0f, previous_command.linear_x);
+        return direction *
+            (previous_base_point[0] - current_base_point[0]);
+    }
+    if (previous_command.type == MobileBaseAlignmentCommand::Type::ROTATE) {
+        return std::fabs(previous_base_point[1]) -
+            std::fabs(current_base_point[1]);
+    }
+    return 0.0f;
+}
+
+float RequiredMobileBaseAlignmentProgress(
+    const MobileBaseAlignmentConfig& config,
+    const float previous_base_point[3],
+    const MobileBaseAlignmentCommand& previous_command) {
+    float requested_correction_m = 0.0f;
+    if (previous_command.type == MobileBaseAlignmentCommand::Type::DRIVE) {
+        requested_correction_m =
+            std::fabs(previous_command.linear_x) *
+            static_cast<float>(previous_command.duration_ms) / 1000.0f;
+    } else if (previous_command.type ==
+            MobileBaseAlignmentCommand::Type::ROTATE) {
+        const float y_limit =
+            config.y_tolerance + std::max(0.0f, config.y_hysteresis);
+        requested_correction_m = std::max(
+            0.0f, std::fabs(previous_base_point[1]) - y_limit);
+    }
+
+    const float scaled =
+        requested_correction_m * std::max(0.0f, config.min_progress_ratio);
+    return std::clamp(scaled,
+                    std::max(0.0f, config.min_progress_floor_m),
+                    std::max(config.min_progress_floor_m,
+                            config.min_progress_m));
 }
 
 MobileBaseController::MobileBaseController(

@@ -2,7 +2,7 @@
 <package format="3">
   <name>perceptive_grasp</name>
   <version>0.1.0</version>
-  <description>Linksee visual grasping pipeline for SO101 arm with RealSense D435i.</description>
+  <description>Linksee perceptive grasping pipeline with selectable stereo camera backends.</description>
   <maintainer email="dev@spacemit.com">Spacemit Robotics</maintainer>
   <license>Apache-2.0</license>
 
@@ -10,7 +10,6 @@
 
   <depend>opencv</depend>
   <depend>yaml-cpp</depend>
-  <depend>librealsense2</depend>
 
   <exec_depend>python3</exec_depend>
 

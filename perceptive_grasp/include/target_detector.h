@@ -32,7 +32,7 @@ struct DetectionTarget {
 };
 
 struct DetectorConfig {
-    std::string config_path;           // VisionService YAML 配置路径
+    std::string config_path = "yolov8_seg.yaml";
     std::vector<int> target_labels;    // 目标类别过滤 (空=全部)
     float min_confidence = 0.5f;
     float min_area = 1000.0f;

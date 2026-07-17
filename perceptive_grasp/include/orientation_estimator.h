@@ -22,12 +22,12 @@ namespace perceptive_grasp {
 struct OrientationConfig {
     // 长宽比阈值: 超过此值才认为物体有明显方向性
     // 低于此值的物体 (如圆形/正方形) 不需要对齐
-    float aspect_ratio_threshold = 1.5f;
+    float aspect_ratio_threshold = 1.2f;
 
     // 相机安装旋转补偿 (弧度)
     // 从图像坐标系角度到基座坐标系角度的偏移
     // 对于前视相机: 图像 X 轴 ≈ 基座 Y 轴 (左右), 图像 Y 轴 ≈ 基座 X 轴 (前后)
-    float camera_yaw_offset = 0.0f;
+    float camera_yaw_offset = 1.57f;
 };
 
 /**

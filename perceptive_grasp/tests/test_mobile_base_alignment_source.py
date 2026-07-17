@@ -55,15 +55,27 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
         self.assertLess(align_index, approach_index)
         self.assertIn("PipelineState::BASE_ALIGNING", body)
 
-    def test_max_base_alignment_attempts_continue_to_arm_planning(self):
+    def test_max_base_alignment_attempts_stop_before_arm_planning(self):
         body = _function_body(self.pipeline, "void GraspPipeline::HandlePlanning")
-        max_attempts_index = body.find("continue with arm planning")
+        max_attempts_index = body.find("Base alignment failed: max attempts")
         plan_index = body.find("planner_->PlanTopGrasp")
-        error_index = body.find("Mobile base alignment failed: max attempts reached")
         self.assertGreaterEqual(max_attempts_index, 0)
         self.assertGreaterEqual(plan_index, 0)
         self.assertLess(max_attempts_index, plan_index)
-        self.assertEqual(error_index, -1)
+
+    def test_alignment_has_progress_and_travel_safety_guards(self):
+        body = _function_body(self.pipeline, "void GraspPipeline::HandlePlanning")
+        self.assertIn("MeasureMobileBaseAlignmentProgress", body)
+        self.assertIn("RequiredMobileBaseAlignmentProgress", body)
+        self.assertIn("required_progress", body)
+        self.assertIn("max_total_travel_m", body)
+        self.assertIn("visual progress", body)
+        self.assertIn("check depth and motion", body)
+
+    def test_planning_prefers_foreground_mask_depth(self):
+        body = _function_body(self.pipeline, "void GraspPipeline::HandlePlanning")
+        self.assertIn("ForegroundDepthFromMask", body)
+        self.assertIn("mask_foreground_q25", body)
 
     def test_base_alignment_moves_base_then_detects_again(self):
         body = _function_body(
@@ -71,12 +83,20 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
         self.assertIn("mobile_base_->Execute", body)
         self.assertIn('SetState(PipelineState::DETECTING', body)
         self.assertIn("stable_count_ = 0", body)
+        self.assertIn('FlushCameraAfterMotion("base motion")', body)
 
     def test_config_and_loader_expose_mobile_base_settings(self):
         self.assertIn("mobile_base:", self.config)
+        self.assertIn("target_x: 0.275", self.config)
+        self.assertIn("x_tolerance:", self.config)
+        self.assertIn("y_tolerance: 0.15", self.config)
         self.assertIn("cfg.mobile_base.enabled", self.main)
         self.assertIn("target_x", self.main)
         self.assertIn("max_align_attempts", self.main)
+        self.assertIn("min_progress_m", self.main)
+        self.assertIn("min_progress_ratio", self.main)
+        self.assertIn("min_progress_floor_m", self.main)
+        self.assertIn("max_total_travel_m", self.main)
 
     def test_build_includes_mobile_base_controller(self):
         self.assertIn("src/mobile_base_controller.cpp", self.cmake)

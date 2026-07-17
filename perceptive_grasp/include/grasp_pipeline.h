@@ -9,8 +9,10 @@
 #ifndef GRASP_PIPELINE_H
 #define GRASP_PIPELINE_H
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <future>
 #include <memory>
@@ -23,11 +25,11 @@
 
 #include <opencv2/core.hpp>
 
-#include "depth_camera.h"
 #include "grasp_executor.h"
 #include "grasp_planner.h"
 #include "mobile_base_controller.h"
 #include "orientation_estimator.h"
+#include "stereo_camera.h"
 #include "target_detector.h"
 #include "voice_command_parser.h"
 
@@ -54,7 +56,7 @@ using PipelineCallback = std::function<void(PipelineState state,
                                             const std::string& message)>;
 
 struct PipelineConfig {
-    DepthCameraConfig camera;
+    StereoCameraConfig camera;
     DetectorConfig detector;
     GraspPlannerConfig planner;
     ExecutorConfig executor;
@@ -63,7 +65,7 @@ struct PipelineConfig {
 
     // Pipeline 行为
     int max_retries = 2;           // 抓空重试次数
-    int detect_stable_frames = 3;  // 连续检测到才执行 (防误检)
+    int detect_stable_frames = 1;  // 连续检测到才执行 (防误检)
     bool auto_loop = false;        // 自动循环抓取
     bool auto_orient = true;       // 自动对齐夹爪方向 (根据物体形状)
     bool step_mode = false;        // 单步模式 (每阶段暂停确认)
@@ -73,18 +75,19 @@ struct PipelineConfig {
 
     // 抓取调试数据保存
     bool save_debug_data = true;
-    std::string debug_output_dir = "debug_grasp_runs";
+    std::string debug_output_dir = "../debug_grasp_runs";
 
     // 图像/mask 层抓取点沿物体短轴的偏移比例
     // 0.0 = 中心, 1.0 = 短轴边缘
-    float grasp_point_x_ratio = 0.0f;
+    float grasp_point_x_ratio = 0.5f;
 };
 
 /**
     * @brief 视觉抓取主 Pipeline
     *
     * 状态机驱动，串联所有模块:
-    *   IDLE → OBSERVING → DETECTING → PLANNING → APPROACHING → GRASPING → LIFTING → PLACING → DONE
+    *   IDLE → OBSERVING → DETECTING → PLANNING → APPROACHING
+    *        → GRASPING → LIFTING → PLACING → DONE
     *
     * 外部触发方式:
     *   1. TriggerGrasp() - 抓取最近/最大的目标
@@ -167,13 +170,22 @@ private:
         bool cancelling = false;
         PipelineState owner = PipelineState::IDLE;
         std::string name;
+        std::chrono::steady_clock::time_point started_at;
+        std::int64_t started_cpu_ms = 0;
         std::future<GraspResult> future;
+    };
+
+    struct StageTiming {
+        int sequence = 0;
+        PipelineState state = PipelineState::IDLE;
+        std::int64_t elapsed_ms = 0;
+        std::string result;
     };
 
     PipelineConfig config_;
 
     // 模块
-    std::unique_ptr<DepthCamera> camera_;
+    std::unique_ptr<StereoCamera> camera_;
     std::unique_ptr<TargetDetector> detector_;
     std::unique_ptr<GraspPlanner> planner_;
     std::unique_ptr<GraspExecutor> executor_;
@@ -186,6 +198,10 @@ private:
     int stable_count_ = 0;
     int missing_count_ = 0;
     int base_align_attempts_ = 0;
+    bool have_previous_base_alignment_point_ = false;
+    std::array<float, 3> previous_base_alignment_point_ = {};
+    MobileBaseAlignmentCommand previous_base_alignment_command_;
+    float base_align_commanded_travel_m_ = 0.0f;
     AsyncAction action_;
 
     // 回调
@@ -204,12 +220,12 @@ private:
     std::chrono::steady_clock::time_point waiting_voice_target_since_;
 
     // 缓存的检测和规划结果
-    DetectionTarget current_target_;
+    DetectionTarget current_target_{};
     std::vector<DetectionTarget> last_candidates_;
     cv::Mat current_color_;
     cv::Mat current_depth_;
-    Pose3D grasp_pose_;
-    Pose3D pre_grasp_pose_;
+    Pose3D grasp_pose_{};
+    Pose3D pre_grasp_pose_{};
     MobileBaseAlignmentCommand base_alignment_command_;
     float grasp_yaw_rad_ = NAN;  // 夹爪旋转角 (NAN=不覆盖)
     std::string task_id_;
@@ -217,7 +233,19 @@ private:
     std::string last_debug_json_path_;
     std::string last_status_message_;
 
+    // One task may visit DETECTING/PLANNING/BASE_ALIGNING multiple times.
+    bool task_timing_active_ = false;
+    bool stage_timing_active_ = false;
+    int stage_sequence_ = 0;
+    std::chrono::steady_clock::time_point task_started_at_;
+    std::chrono::steady_clock::time_point stage_started_at_;
+    std::vector<StageTiming> stage_timings_;
+    std::int64_t initialization_elapsed_ms_ = 0;
+
     void SetState(PipelineState new_state, const std::string& msg = "");
+    void BeginTaskTiming();
+    void PrintTaskSummary(PipelineState terminal_state,
+                        const std::string& message);
     void ResetTaskState();
     bool HasActiveAction() const { return action_.active; }
     bool StartAction(PipelineState owner, const std::string& name,
@@ -230,6 +258,7 @@ private:
     std::string FormatCandidates(size_t max_items = 5) const;
     std::string ResultMessage(const std::string& phase,
                                 GraspResult result) const;
+    bool FlushCameraAfterMotion(const char* reason);
     void SaveGraspDebug(float grasp_px, float grasp_py, uint16_t depth_mm,
                         const float cam_point[3], const float base_point[3],
                         float offset_dir_angle);

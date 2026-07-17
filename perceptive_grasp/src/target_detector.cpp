@@ -15,8 +15,10 @@
 namespace perceptive_grasp {
 
 bool TargetDetector::Init() {
-    // 创建 VisionService 实例
-    vision_ = VisionService::Create(config_.config_path, "", true);
+    // Eagerly create the ORT session during pipeline initialization. Keeping
+    // lazy loading enabled adds model loading to the first detection frame,
+    // which makes the first grasp command noticeably slower.
+    vision_ = VisionService::Create(config_.config_path, "", false);
     if (!vision_) {
         std::cerr << "[TargetDetector] Failed to create VisionService: "
                     << VisionService::LastCreateError() << std::endl;
@@ -41,9 +43,24 @@ bool TargetDetector::Detect(const cv::Mat& image,
     if (!vision_ || image.empty()) return false;
 
     std::vector<VisionServiceResult> results;
-    auto status = InferImageDetections(vision_.get(), image, &results);
+    VisionServiceResponse response;
+    auto status = InferImageDetections(
+        vision_.get(), image, &results, &response);
     if (status != VISION_SERVICE_OK) {
-        std::cerr << "[TargetDetector] Inference failed" << std::endl;
+        std::cerr << "[TargetDetector] Inference failed: status="
+                << static_cast<int>(status)
+                << " image=" << image.cols << "x" << image.rows
+                << " type=" << image.type()
+                << " continuous=" << (image.isContinuous() ? 1 : 0);
+        if (!response.error_message.empty()) {
+            std::cerr << " response=\"" << response.error_message << '"';
+        }
+        const std::string& service_error = vision_->LastError();
+        if (!service_error.empty() &&
+            service_error != response.error_message) {
+            std::cerr << " service=\"" << service_error << '"';
+        }
+        std::cerr << std::endl;
         return false;
     }
 

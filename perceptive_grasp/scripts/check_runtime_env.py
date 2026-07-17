@@ -11,8 +11,10 @@ import glob
 import getpass
 import grp
 import importlib
+import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -28,6 +30,13 @@ def load_yaml(path: str) -> Dict[str, Any]:
         return {}
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+def expand_config_path(path: str) -> str:
+    """Expand user and environment references in a configured path."""
+    if not path:
+        return ""
+    return os.path.expanduser(os.path.expandvars(str(path)))
 
 
 def status(ok: bool, name: str, detail: str = "") -> bool:
@@ -196,8 +205,12 @@ def _same_device(configured: str, detected: str) -> bool:
 def _probe_so101_device(device: str, sdk_root: str) -> bool:
     project_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), os.pardir))
-    tool = os.path.join(project_root, "build", "read_joints")
-    if not os.path.exists(tool):
+    tool_candidates = [os.path.join(project_root, "build", "read_joints")]
+    tool_candidates.extend(sorted(glob.glob(
+        os.path.join(project_root, "build*", "read_joints"))))
+    tool = next((path for path in tool_candidates
+                 if os.path.isfile(path) and os.access(path, os.X_OK)), "")
+    if not tool:
         return False
 
     try:
@@ -207,6 +220,7 @@ def _probe_so101_device(device: str, sdk_root: str) -> bool:
             capture_output=True,
             text=True,
             timeout=8,
+            cwd=project_root,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -487,6 +501,268 @@ def check_realsense_camera() -> bool:
                   " ".join(matches) if matches else "not found")
 
 
+def _check_readable_file(path: str, label: str) -> bool:
+    exists = bool(path) and os.path.isfile(path)
+    readable = exists and os.access(path, os.R_OK)
+    detail = path if readable else f"{path or 'not configured'} not readable"
+    return status(readable, label, detail)
+
+
+def _find_las2_library(sdk_root: str, model_path: str,
+                       calibration_path: str) -> str:
+    roots = []
+    runtime_dir = os.environ.get("LAS2_RUNTIME_DIR", "")
+    if runtime_dir:
+        roots.append(runtime_dir)
+    if sdk_root:
+        roots.append(os.path.join(sdk_root, "output", "staging"))
+    for path in (model_path, calibration_path):
+        if path:
+            roots.append(os.path.dirname(os.path.dirname(
+                os.path.abspath(path))))
+    roots.extend(filter(None, os.environ.get("LD_LIBRARY_PATH", "").split(":")))
+
+    candidates = []
+    for root in roots:
+        candidates.append(os.path.join(root, "lib", "liblas2_usb_stereo.so"))
+        candidates.append(os.path.join(root, "liblas2_usb_stereo.so"))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def _find_application_binaries() -> tuple[str, str]:
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    build_dirs = [os.path.join(project_root, "build")]
+    build_dirs.extend(sorted(glob.glob(os.path.join(project_root, "build*"))))
+    path_launcher = shutil.which("perceptive_grasp")
+    if path_launcher:
+        build_dirs.append(os.path.dirname(os.path.abspath(path_launcher)))
+
+    partial_match = ("", "")
+    for build_dir in dict.fromkeys(build_dirs):
+        launcher = os.path.join(build_dir, "perceptive_grasp")
+        core = os.path.join(build_dir, "perceptive_grasp_core")
+        launcher_exists = os.path.isfile(launcher)
+        core_exists = os.path.isfile(core)
+        if launcher_exists and core_exists:
+            return launcher, core
+        if not any(partial_match) and (launcher_exists or core_exists):
+            partial_match = (launcher if launcher_exists else "",
+                             core if core_exists else "")
+    return partial_match
+
+
+def check_application_binaries() -> bool:
+    launcher, core = _find_application_binaries()
+    launcher_ok = bool(launcher) and os.path.isfile(launcher) \
+        and os.access(launcher, os.X_OK)
+    core_ok = bool(core) and os.path.isfile(core) and os.access(core, os.X_OK)
+    ok = status(
+        launcher_ok,
+        "perceptive_grasp launcher",
+        launcher if launcher_ok else "build or install perceptive_grasp",
+    )
+    ok &= status(
+        core_ok,
+        "perceptive_grasp core",
+        core if core_ok else "perceptive_grasp_core missing or not executable",
+    )
+    return ok
+
+
+def _check_las2_runtime_libraries(library: str,
+                                  application: str = "") -> bool:
+    ldd_target = application or library
+    try:
+        result = subprocess.run(
+            ["ldd", ldd_target],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return status(False, "LAS2 runtime libraries", str(exc))
+
+    output = (result.stdout or "") + (result.stderr or "")
+    application_uses_las2 = not application \
+        or "liblas2_usb_stereo.so" in output
+    missing = [line.strip() for line in output.splitlines()
+               if "not found" in line]
+    if application and not application_uses_las2:
+        return _check_las2_runtime_libraries(library)
+    if missing:
+        lib_dir = os.path.dirname(os.path.abspath(library))
+        runtime_root = os.path.dirname(lib_dir)
+        command = (
+            f'export LD_LIBRARY_PATH="{lib_dir}:'
+            f'{runtime_root}/lib/spacemit_ort:'
+            f'{runtime_root}/lib/opencv:${{LD_LIBRARY_PATH:-}}"'
+        )
+        return status(False, "LAS2 runtime libraries",
+                      "; ".join(missing) + f"; run: {command}")
+
+    detail = "all dependencies resolved"
+    if application and result.returncode == 0:
+        detail += f" via {application}"
+    return status(result.returncode == 0, "LAS2 runtime libraries",
+                  detail if result.returncode == 0 else output.strip())
+
+
+def check_las2_capture_requirements(device: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["v4l2-ctl", "-d", device, "--list-formats-ext"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return status(False, "LAS2 YUYV capture format", str(exc))
+
+    formats = (result.stdout or "") + (result.stderr or "")
+    yuyv_match = re.search(
+        r"\[\d+\]:\s*'YUYV'.*?(?=\n\s*\[\d+\]:|\Z)",
+        formats,
+        flags=re.DOTALL,
+    )
+    yuyv = yuyv_match.group(0) if yuyv_match else ""
+    size_ok = "Size: Discrete 4000x1200" in yuyv
+    fps_values = [float(value) for value in re.findall(
+        r"\(([0-9.]+) fps\)", yuyv)]
+    max_fps = max(fps_values, default=0.0)
+    format_ok = result.returncode == 0 and size_ok and max_fps >= 29.0
+    detail = "YUYV 4000x1200@30 available" if format_ok else (
+        f"requires YUYV 4000x1200@30; advertised max is {max_fps:g} fps"
+    )
+    ok = status(format_ok, "LAS2 YUYV capture format", detail)
+
+    heap = "/dev/dma_heap/system"
+    heap_ok = os.path.exists(heap) and os.access(heap, os.R_OK | os.W_OK)
+    ok &= status(heap_ok, "LAS2 DMA heap",
+                 heap if heap_ok else f"{heap} not accessible")
+    return ok
+
+
+def check_las2_camera(camera: Dict[str, Any], sdk_root: str) -> bool:
+    las2 = camera.get("spacemit_las2", {}) \
+        if isinstance(camera, dict) else {}
+    device = las2.get("video_device", "")
+    model = expand_config_path(las2.get("model_path", ""))
+    calibration = expand_config_path(las2.get("calib_path", ""))
+    core_count = las2.get("core_count", 1)
+    core_affinity = str(las2.get("core_affinity", "8"))
+    try:
+        affinity_ids = [int(value.strip()) for value in core_affinity.split(",")
+                        if value.strip()]
+    except ValueError:
+        affinity_ids = []
+
+    ok = True
+    device_ok = bool(device) and os.path.exists(device) \
+        and os.access(device, os.R_OK | os.W_OK)
+    ok &= status(device_ok, "LAS2 video device",
+                 device if device_ok else f"{device or 'not configured'} not accessible")
+    if device_ok:
+        ok &= check_las2_capture_requirements(device)
+    ok &= _check_readable_file(model, "LAS2 model")
+    calibration_ok = _check_readable_file(calibration, "LAS2 calibration")
+    ok &= calibration_ok
+    if calibration_ok:
+        try:
+            with open(calibration, "r", encoding="utf-8") as file:
+                data = json.load(file)
+            required = {
+                "image_size", "left_camera_matrix", "right_camera_matrix",
+                "left_dist_coeffs", "right_dist_coeffs", "R", "T",
+            }
+            missing = sorted(required.difference(data))
+            ok &= status(not missing, "LAS2 calibration fields",
+                         "complete" if not missing else "missing: " + ", ".join(missing))
+        except (OSError, ValueError, TypeError) as exc:
+            ok &= status(False, "LAS2 calibration JSON", str(exc))
+
+    count_ok = isinstance(core_count, int) and 1 <= core_count <= 16
+    ok &= status(count_ok, "LAS2 core_count", str(core_count))
+    affinity_ok = count_ok and len(affinity_ids) == core_count \
+        and len(set(affinity_ids)) == len(affinity_ids) \
+        and all(0 <= core <= 15 for core in affinity_ids)
+    ok &= status(affinity_ok, "LAS2 core_affinity", core_affinity)
+    library = _find_las2_library(sdk_root, model, calibration)
+    ok &= status(bool(library), "liblas2_usb_stereo.so",
+                 library or "set LAS2_RUNTIME_DIR or LD_LIBRARY_PATH")
+    if library:
+        _, application = _find_application_binaries()
+        ok &= _check_las2_runtime_libraries(
+            library, application)
+    return ok
+
+
+def check_las2_detector_provider(root: Dict[str, Any],
+                                 pipeline_config: str) -> bool:
+    detection = root.get("detection", {}) if isinstance(root, dict) else {}
+    detector_config = detection.get("config_path", "") \
+        if isinstance(detection, dict) else ""
+    if detector_config and not os.path.isabs(detector_config):
+        detector_config = os.path.join(
+            os.path.dirname(os.path.abspath(pipeline_config)),
+            detector_config,
+        )
+
+    if not detector_config or not os.path.isfile(detector_config):
+        return status(False, "LAS2 detector provider",
+                      f"detector config not found: "
+                      f"{detector_config or 'not configured'}")
+
+    try:
+        detector = load_yaml(detector_config)
+        params = detector.get("default_params", {}) \
+            if isinstance(detector, dict) else {}
+        providers = params.get("providers", []) \
+            if isinstance(params, dict) else []
+        provider = providers[0] if providers else "SpaceMITExecutionProvider"
+        detector_threads = int(params.get("num_threads", 4)) \
+            if isinstance(params, dict) else 4
+    except (OSError, ValueError, TypeError) as exc:
+        return status(False, "LAS2 detector provider", str(exc))
+
+    if provider != "SpaceMITExecutionProvider":
+        return status(
+            False,
+            "LAS2 detector provider",
+            f"{provider}; YOLO must use SpaceMITExecutionProvider",
+        )
+
+    camera = root.get("camera", {}) if isinstance(root, dict) else {}
+    las2 = camera.get("spacemit_las2", {}) \
+        if isinstance(camera, dict) else {}
+    affinity = str(las2.get(
+        "core_affinity", "8,9,10,11,12,13,14,15"))
+    try:
+        las2_cores = {
+            int(value.strip()) for value in affinity.split(",")
+            if value.strip()
+        }
+    except ValueError:
+        las2_cores = set(range(8, 16))
+    free_ai_cores = sorted(set(range(8, 16)) - las2_cores)
+    required_cores = max(1, min(detector_threads, 8))
+    compatible = len(free_ai_cores) >= required_cores
+    if compatible:
+        detail = (f"{provider}; free AI cores="
+                  + ",".join(str(core) for core in free_ai_cores))
+    else:
+        detail = (
+            f"{provider} requires {required_cores} free AI cores, "
+            f"but LAS2 affinity {affinity} leaves "
+            f"{len(free_ai_cores)}; reduce LAS2 core_count/affinity"
+        )
+    return status(compatible, "LAS2 detector provider", detail)
+
+
 def _read_text_file(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -593,11 +869,14 @@ def main() -> int:
     args = parser.parse_args()
 
     root = load_yaml(args.config)
+    camera = root.get("camera", {}) if isinstance(root, dict) else {}
+    camera_type = str(camera.get("type", "realsense"))
+    camera_type = {"d435i": "realsense"}.get(camera_type, camera_type)
     manip = root.get("manipulator", {}) if isinstance(root, dict) else {}
     device = manip.get("uart_device", "/dev/ttyACM0")
     mobile_base = root.get("mobile_base", {}) if isinstance(root, dict) else {}
     mobile_base_enabled = bool(mobile_base.get("enabled", False))
-    mobile_base_driver = mobile_base.get("driver", "")
+    mobile_base_driver = mobile_base.get("driver", "drv_uart_esp32")
     mobile_base_is_uart = mobile_base_enabled \
         and mobile_base_driver == "drv_uart_esp32"
     mobile_base_device = mobile_base.get("dev_path", "") \
@@ -607,7 +886,13 @@ def main() -> int:
     fixer = RuntimeFixer(interactive=sys.stdin.isatty() and not args.no_fix,
                          assume_yes=args.yes)
     ok = True
+    supported_camera = camera_type in ("realsense", "spacemit_las2")
+    ok &= status(supported_camera, "camera.type", camera_type)
+    backend_config = camera.get(camera_type) if supported_camera else None
+    ok &= status(isinstance(backend_config, dict),
+                 f"camera.{camera_type} configuration")
     sdk_root = os.environ.get("SDK_ROOT", "") or infer_sdk_root(os.getcwd())
+    ok &= check_application_binaries()
     report_serial_devices(device, mobile_base_device)
     ok &= check_serial_role_configuration(
         device, mobile_base_device, mobile_base_is_uart, sdk_root)
@@ -622,7 +907,11 @@ def main() -> int:
             mobile_base.get("data_dev", "/dev/rpmsg0"),
             fixer)
     ok &= check_video_permissions(fixer)
-    ok &= check_realsense_camera()
+    if camera_type == "spacemit_las2":
+        ok &= check_las2_camera(camera, sdk_root)
+        ok &= check_las2_detector_provider(root, args.config)
+    else:
+        ok &= check_realsense_camera()
     ok &= check_kinematics_backend(sdk_root)
 
     if not args.skip_voice:

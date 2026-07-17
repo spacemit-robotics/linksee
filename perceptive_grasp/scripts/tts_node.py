@@ -147,7 +147,20 @@ def engine_to_preset(engine_name: str) -> str:
     return mapping.get(normalized, normalized.replace(":", "_").replace("-", "_"))
 
 
+DEFAULT_TARGET_ALIASES = {
+    "香蕉": "banana", "苹果": "apple", "红苹果": "apple",
+    "青苹果": "apple", "橙子": "orange", "桔子": "orange",
+    "橘子": "orange", "橙": "orange", "胡萝卜": "carrot",
+    "萝卜": "carrot", "红萝卜": "carrot", "胡罗卜": "carrot",
+    "中罗": "carrot", "走罗": "carrot", "瓶子": "bottle",
+    "水瓶": "bottle", "矿泉水": "bottle", "杯子": "cup",
+    "水杯": "cup", "碗": "bowl", "勺子": "spoon",
+    "叉子": "fork", "剪刀": "scissors",
+}
+
+
 def make_reverse_aliases(aliases: Dict[str, str]) -> Dict[str, str]:
+    aliases = aliases or DEFAULT_TARGET_ALIASES
     reverse = {}
     for spoken, label in aliases.items():
         if label not in reverse:

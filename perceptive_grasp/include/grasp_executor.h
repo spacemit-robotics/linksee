@@ -36,11 +36,14 @@ enum class GraspResult {
 };
 
 struct GripperCheckDiagnostics {
+    std::string phase;
     std::string state = "UNKNOWN";
     int holding_count = 0;
     int load_holding_count = 0;
     int check_count = 0;
     float load_threshold = 0.0f;
+    float empty_closed_position = NAN;
+    float min_object_position = NAN;
     float position = NAN;
     float load = NAN;
 };
@@ -86,24 +89,26 @@ struct TimingConfig {
     // 观察位到位后，等待相机曝光/画面稳定
     int observe_settle_ms = 500;
     // 观察前先闭合夹爪后的等待
-    int observe_gripper_close_wait_ms = 500;
+    int observe_gripper_close_wait_ms = 100;
     // 到预抓取位后，张开夹爪前等待
-    int pre_grasp_settle_ms = 300;
+    int pre_grasp_settle_ms = 150;
     // 张开夹爪后等待
-    int gripper_open_wait_ms = 2000;
+    int gripper_open_wait_ms = 150;
     // 到抓取位后，闭合夹爪前等待
-    int grasp_settle_ms = 500;
+    int grasp_settle_ms = 100;
     // 闭合夹爪后等待
-    int gripper_close_wait_ms = 2000;
+    int gripper_close_wait_ms = 500;
     // 夹爪状态检测次数与间隔
     int grasp_check_count = 10;
     int grasp_check_interval_ms = 50;
+    // 抬起后等待夹爪负载稳定，再执行二次持物检查。
+    int post_lift_settle_ms = 250;
     // 到放置位后，释放夹爪前等待
-    int place_settle_ms = 500;
+    int place_settle_ms = 100;
     // 释放夹爪后等待物体脱落
-    int release_wait_ms = 300;
+    int release_wait_ms = 800;
     // 放置后关闭夹爪等待
-    int home_gripper_close_wait_ms = 500;
+    int home_gripper_close_wait_ms = 100;
 };
 
 struct ExecutorConfig {
@@ -113,32 +118,38 @@ struct ExecutorConfig {
     int baudrate = 1000000;
 
     // 运动学
-    std::string urdf_path;
+    std::string urdf_path = "../urdf/so101.urdf";
     std::string base_link = "base_link";
-    std::string tip_link = "Fixed_Jaw";
+    std::string tip_link = "gripper_frame_link";
 
     // 速度
-    float move_speed = 0.5f;
-    float line_speed = 0.3f;
+    float move_speed = 1.0f;
+    float line_speed = 0.5f;
     float pose_position_tolerance = 0.03f;
 
     // 夹爪
-    float gripper_open = 1.0f;
+    float gripper_open = 0.5f;
     float gripper_effort = 0.8f;
     float place_release_open = 0.5f;
     float gripper_hold_load_threshold = 100.0f;  // Feetech load units
+    float gripper_empty_position_margin = 0.03f;
     int gripper_timeout_ms = 3000;
 
     // 预定义姿态
-    std::vector<float> home_joints = {0.0f, -1.0f, 1.0f, 0.0f, 0.0f};
-    std::vector<float> observe_joints = {0.0f, -0.5f, 0.8f, 0.0f, -0.3f};
-    std::vector<float> place_joints = {1.2f, -0.8f, 0.9f, 0.0f, 0.0f};
+    std::vector<float> home_joints = {
+        1.816f, -1.850f, 1.639f, 1.147f, 0.189f};
+    std::vector<float> observe_joints = {
+        1.759f, 0.050f, -0.217f, 1.606f, 0.015f};
+    std::vector<float> place_joints = {
+        -1.636f, 0.087f, -0.140f, 1.389f, 0.033f};
 
     // 阶段间等待时间
     TimingConfig timing;
 
     // IK 关节约束 (用于多种子采样时筛选合格解)
-    std::vector<JointConstraint> joint_constraints;
+    std::vector<JointConstraint> joint_constraints = {
+        {3, 1.102f, 1.667f},
+    };
 
     // IK 多种子采样参数
     int ik_max_trials = 50;
@@ -255,10 +266,13 @@ private:
     struct grasp_dev* gripper_ = nullptr;
     kin_solver_t* kin_ = nullptr;
     int wait_motion_timeout_ms_ = 15000;
+    float empty_closed_position_ = NAN;
     ExecutorDiagnostics diagnostics_;
 
     void RecordResult(GraspResult result, const std::string& action,
                         const std::string& detail = "");
+    GraspResult CheckGripperHolding(const char* phase, bool after_lift);
+    void CaptureEmptyClosedPosition();
     GraspResult MoveToJoints(const std::vector<float>& joints);
     GraspResult MoveToJointsCollisionSafe(const std::vector<float>& joints);
     GraspResult MoveToPoseWithIKJoints(const Pose3D& pose, float speed);
