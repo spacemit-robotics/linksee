@@ -149,40 +149,64 @@ if(ENABLE_LAS2_CAMERA)
         get_filename_component(_LAS2_ROOT_DIR "${_LAS2_LIB_DIR}" DIRECTORY)
 
         # The delivered library carries RUNPATH entries from its build host.
-        # Patch a private build copy so its OpenCV/ORT dependencies resolve on
-        # the deployed K3 without modifying the original runtime package.
+        # Patch private build copies so transitive OpenCV/ORT dependencies
+        # resolve on the deployed K3 without modifying the runtime package.
         set(_LAS2_LINK_LIBRARY "${LAS2_LIBRARY}")
+        set(_LAS2_INSTALL_LIBRARIES "${LAS2_LIBRARY}")
+        find_file(_LAS2_OPENCV_CALIB3D_LIBRARY
+            NAMES libopencv_calib3d.so.413
+            PATHS "${_LAS2_ROOT_DIR}/lib/opencv"
+            NO_DEFAULT_PATH
+        )
         find_program(PATCHELF_EXECUTABLE patchelf)
-        if(PATCHELF_EXECUTABLE)
+        if(PATCHELF_EXECUTABLE AND _LAS2_OPENCV_CALIB3D_LIBRARY)
             set(_LAS2_PATCH_DIR "${CMAKE_BINARY_DIR}/las2_runtime")
             set(_LAS2_PATCHED_LIBRARY
                 "${_LAS2_PATCH_DIR}/liblas2_usb_stereo.so")
+            set(_LAS2_PATCHED_OPENCV_CALIB3D
+                "${_LAS2_PATCH_DIR}/libopencv_calib3d.so.413")
             string(CONCAT _LAS2_PRIVATE_RPATH
-                "${_LAS2_LIB_DIR}:${_LAS2_ROOT_DIR}/lib/spacemit_ort:"
+                "\$ORIGIN:${_LAS2_LIB_DIR}:"
+                "${_LAS2_ROOT_DIR}/lib/spacemit_ort:"
                 "${_LAS2_ROOT_DIR}/lib/opencv")
             add_custom_command(
-                OUTPUT "${_LAS2_PATCHED_LIBRARY}"
+                OUTPUT
+                    "${_LAS2_PATCHED_LIBRARY}"
+                    "${_LAS2_PATCHED_OPENCV_CALIB3D}"
                 COMMAND "${CMAKE_COMMAND}" -E make_directory
                     "${_LAS2_PATCH_DIR}"
                 COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                     "${LAS2_LIBRARY}" "${_LAS2_PATCHED_LIBRARY}"
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${_LAS2_OPENCV_CALIB3D_LIBRARY}"
+                    "${_LAS2_PATCHED_OPENCV_CALIB3D}"
                 COMMAND "${PATCHELF_EXECUTABLE}" --set-rpath
                     "${_LAS2_PRIVATE_RPATH}" "${_LAS2_PATCHED_LIBRARY}"
-                DEPENDS "${LAS2_LIBRARY}"
+                COMMAND "${PATCHELF_EXECUTABLE}" --set-rpath
+                    "${_LAS2_ROOT_DIR}/lib/opencv"
+                    "${_LAS2_PATCHED_OPENCV_CALIB3D}"
+                DEPENDS
+                    "${LAS2_LIBRARY}"
+                    "${_LAS2_OPENCV_CALIB3D_LIBRARY}"
                 COMMENT "Preparing private spacemit_las2 runtime"
                 VERBATIM
             )
             add_custom_target(spacemit_las2_runtime
-                DEPENDS "${_LAS2_PATCHED_LIBRARY}")
+                DEPENDS
+                    "${_LAS2_PATCHED_LIBRARY}"
+                    "${_LAS2_PATCHED_OPENCV_CALIB3D}")
             set(_LAS2_RUNTIME_TARGET spacemit_las2_runtime)
             set(_LAS2_LINK_LIBRARY "${_LAS2_PATCHED_LIBRARY}")
+            set(_LAS2_INSTALL_LIBRARIES
+                "${_LAS2_PATCHED_LIBRARY}"
+                "${_LAS2_PATCHED_OPENCV_CALIB3D}")
             list(APPEND EXTRA_BUILD_RPATH "${_LAS2_PATCH_DIR}")
             message(STATUS
                 "[Camera] LAS2 private runtime will be prepared during build")
         else()
             message(WARNING
-                "[Camera] patchelf not found; LD_LIBRARY_PATH is required "
-                "for LAS2 private dependencies")
+                "[Camera] patchelf or LAS2 OpenCV calib3d library not found; "
+                "LD_LIBRARY_PATH is required for LAS2 private dependencies")
         endif()
         list(APPEND EXTRA_LIBRARIES "${_LAS2_LINK_LIBRARY}")
 
@@ -440,7 +464,7 @@ install(DIRECTORY urdf/ DESTINATION share/perceptive_grasp/urdf)
 install(FILES resources/eye-to-hand.jpg
     DESTINATION share/perceptive_grasp/resources)
 if(HAVE_LAS2_CAMERA)
-    install(FILES "${_LAS2_LINK_LIBRARY}"
+    install(FILES ${_LAS2_INSTALL_LIBRARIES}
         DESTINATION "${CMAKE_INSTALL_LIBDIR}/perceptive_grasp")
 endif()
 install(PROGRAMS
