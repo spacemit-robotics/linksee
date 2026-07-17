@@ -43,8 +43,8 @@ calibration:
 grasp:
   approach_height: 0.10
   grasp_depth: 0.01
-  gripper_offset: 0.0
-  grasp_point_x_ratio: 0.5
+  gripper_offset: 0.005
+  grasp_point_x_ratio: 1
   gripper_open: 0.6
   gripper_effort: 0.8
   gripper_hold_load_threshold: 100.0
