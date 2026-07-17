@@ -131,7 +131,7 @@ int main(int argc, char* argv[]) {
     cfg.ids[3] = 4;
     cfg.ids[4] = 5;
     cfg.urdf_path = nullptr;  // 不需要 URDF，只读关节角
-    cfg.kin_solver_name = nullptr;
+    cfg.kin_solver_name = "dummy";
 
     std::cout << "[ReadJoints] Connecting to " << device
                 << " @ " << baudrate << " baud..." << std::endl;

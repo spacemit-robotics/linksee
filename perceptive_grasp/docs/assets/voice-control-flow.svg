@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="180" viewBox="0 0 900 180" role="img" aria-labelledby="title desc">
-  <title id="title">Perceptive Grasp 语音控制链路</title>
+  <title id="title">perceptive grasp 语音控制链路</title>
   <desc id="desc">麦克风语音进入本地语音桥，语音桥通过 voice-stdin 控制抓取程序，抓取程序通过 status-stdout 返回状态，语音桥再通过扬声器播报。</desc>
   <defs>
     <marker id="arrow-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
@@ -36,7 +36,7 @@
   <text x="265" y="42" text-anchor="middle" class="hint">语音命令</text>
   <text x="655" y="63" text-anchor="middle" class="hint">voice-stdin</text>
   <text x="655" y="124" text-anchor="middle" class="hint">status-stdout</text>
-  <text x="265" y="153" text-anchor="middle" class="hint">TTS 播报</text>
+  <text x="265" y="153" text-anchor="middle" class="hint">tts 播报</text>
 
   <g transform="translate(122 29)" fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
     <rect x="9" y="3" width="6" height="11" rx="3"/>
@@ -64,9 +64,9 @@
     <rect x="382" y="113" width="46" height="20" rx="10" fill="#eef2ff"/>
     <rect x="437" y="113" width="46" height="20" rx="10" fill="#ecfeff"/>
     <rect x="492" y="113" width="46" height="20" rx="10" fill="#f0fdf4"/>
-    <text x="405" y="127" text-anchor="middle" class="chip">VAD</text>
-    <text x="460" y="127" text-anchor="middle" class="chip">ASR</text>
-    <text x="515" y="127" text-anchor="middle" class="chip">TTS</text>
+    <text x="405" y="127" text-anchor="middle" class="chip">vad</text>
+    <text x="460" y="127" text-anchor="middle" class="chip">asr</text>
+    <text x="515" y="127" text-anchor="middle" class="chip">tts</text>
   </g>
 
   <g transform="translate(780 66)" fill="none" stroke="#059669" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

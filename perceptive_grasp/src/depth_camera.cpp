@@ -13,7 +13,7 @@
 
 namespace perceptive_grasp {
 
-DepthCamera::DepthCamera(const DepthCameraConfig& config) : config_(config) {}
+DepthCamera::DepthCamera(const StereoCameraConfig& config) : config_(config) {}
 
 DepthCamera::~DepthCamera() {
     if (initialized_) {
@@ -26,11 +26,12 @@ DepthCamera::~DepthCamera() {
 
 bool DepthCamera::Init() {
     try {
+        const auto& settings = config_.realsense;
         rs2::config cfg;
-        cfg.enable_stream(RS2_STREAM_COLOR, config_.width, config_.height,
-                            RS2_FORMAT_BGR8, config_.fps);
-        cfg.enable_stream(RS2_STREAM_DEPTH, config_.width, config_.height,
-                            RS2_FORMAT_Z16, config_.fps);
+        cfg.enable_stream(RS2_STREAM_COLOR, settings.width, settings.height,
+                            RS2_FORMAT_BGR8, settings.fps);
+        cfg.enable_stream(RS2_STREAM_DEPTH, settings.width, settings.height,
+                            RS2_FORMAT_Z16, settings.fps);
 
         profile_ = pipeline_.start(cfg);
 
@@ -49,8 +50,8 @@ bool DepthCamera::Init() {
         }
 
         initialized_ = true;
-        std::cout << "[DepthCamera] Initialized: " << config_.width << "x"
-                    << config_.height << "@" << config_.fps << "fps"
+        std::cout << "[DepthCamera] Initialized: " << settings.width << "x"
+                    << settings.height << "@" << settings.fps << "fps"
                     << ", depth_scale=" << depth_scale_ << std::endl;
         return true;
 
@@ -67,11 +68,12 @@ bool DepthCamera::GetFrames(cv::Mat& color_frame, cv::Mat& depth_frame) {
     if (!initialized_) return false;
 
     try {
+        const auto& settings = config_.realsense;
         rs2::frameset frames = pipeline_.wait_for_frames(5000);
 
         // 对齐深度到彩色
         rs2::frameset aligned;
-        if (config_.align_depth) {
+        if (settings.align_depth) {
             aligned = align_.process(frames);
         } else {
             aligned = frames;
@@ -81,26 +83,28 @@ bool DepthCamera::GetFrames(cv::Mat& color_frame, cv::Mat& depth_frame) {
         auto depth = aligned.get_depth_frame();
 
         if (!color || !depth) return false;
+        last_frame_id_ =
+            static_cast<std::int64_t>(color.get_frame_number());
 
         // 深度滤波
         rs2::frame filtered_depth = depth;
-        if (config_.spatial_filter) {
+        if (settings.spatial_filter) {
             filtered_depth = spatial_filter_.process(filtered_depth);
         }
-        if (config_.temporal_filter) {
+        if (settings.temporal_filter) {
             filtered_depth = temporal_filter_.process(filtered_depth);
         }
-        if (config_.hole_filling) {
+        if (settings.hole_filling) {
             filtered_depth = hole_filter_.process(filtered_depth);
         }
 
         // 转换为 OpenCV Mat
-        color_frame = cv::Mat(cv::Size(config_.width, config_.height), CV_8UC3,
+        color_frame = cv::Mat(cv::Size(settings.width, settings.height), CV_8UC3,
                                 const_cast<void*>(color.get_data()));
         color_frame = color_frame.clone();  // 深拷贝，避免帧被回收
 
         auto filtered_depth_frame = filtered_depth.as<rs2::depth_frame>();
-        depth_frame = cv::Mat(cv::Size(config_.width, config_.height), CV_16UC1,
+        depth_frame = cv::Mat(cv::Size(settings.width, settings.height), CV_16UC1,
                                 const_cast<void*>(filtered_depth_frame.get_data()));
         depth_frame = depth_frame.clone();
 

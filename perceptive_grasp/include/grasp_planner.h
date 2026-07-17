@@ -36,19 +36,19 @@ struct GraspPlannerConfig {
 
     // 顶抓参数
     float approach_height = 0.10f;  // 预抓取高度 (米)
-    float grasp_depth = 0.02f;      // 抓取深度 (米)
+    float grasp_depth = 0.01f;      // 抓取深度 (米)
 
     // 夹爪固定爪方向偏移 (米)
     // SO101 左爪固定、右爪运动，抓取点需要沿夹爪方向往固定爪侧偏移
     // 该偏移会根据 grasp_yaw 自动投影到 x/y 方向
     // 正值 = 往固定爪侧偏移
-    float gripper_offset = 0.015f;
+    float gripper_offset = 0.0f;
 
     // 工作空间安全限制
     WorkspaceLimits workspace = {
-        -0.15f, 0.25f,   // x
-        -0.15f, 0.15f,   // y
-        -0.05f, 0.20f    // z
+        0.0f, 0.5f,    // x
+        -0.3f, 0.3f,   // y
+        0.0f, 0.20f    // z
     };
 };
 

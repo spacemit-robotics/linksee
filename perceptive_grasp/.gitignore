@@ -18,6 +18,7 @@ debug_localize_output/
 *.png
 *.jpg
 *.jpeg
+!resources/eye-to-hand.jpg
 
 # Editor
 .vscode/

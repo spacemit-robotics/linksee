@@ -136,8 +136,23 @@ GraspResult GraspExecutor::MoveToObserve() {
                     "motion timeout");
         return GraspResult::TIMEOUT;
     }
+    CaptureEmptyClosedPosition();
     RecordResult(GraspResult::SUCCESS, "move_to_observe");
     return GraspResult::SUCCESS;
+}
+
+void GraspExecutor::CaptureEmptyClosedPosition() {
+    float position = NAN;
+    float load = NAN;
+    grasp_tick(gripper_, 0.05f);
+    if (grasp_get_feedback(gripper_, &position, &load) != GRASP_OK ||
+        std::isnan(position)) {
+        return;
+    }
+
+    empty_closed_position_ = position;
+    std::cout << "[GraspExecutor] empty gripper baseline: position="
+              << empty_closed_position_ << ", load=" << load << std::endl;
 }
 
 GraspResult GraspExecutor::MoveToHome() {
@@ -189,7 +204,11 @@ GraspResult GraspExecutor::MoveToPreGrasp(const Pose3D& pre_grasp_pose,
 GraspResult GraspExecutor::OpenGripperForGrasp() {
     std::this_thread::sleep_for(
         std::chrono::milliseconds(config_.timing.pre_grasp_settle_ms));
-    grasp_set_position(gripper_, config_.gripper_open);
+    if (grasp_set_position(gripper_, config_.gripper_open) != GRASP_OK) {
+        RecordResult(GraspResult::MOVE_FAILED, "open_gripper_for_grasp",
+                    "failed to set grasp opening");
+        return GraspResult::MOVE_FAILED;
+    }
     std::this_thread::sleep_for(
         std::chrono::milliseconds(config_.timing.gripper_open_wait_ms));
     RecordResult(GraspResult::SUCCESS, "open_gripper_for_grasp");
@@ -225,10 +244,20 @@ GraspResult GraspExecutor::MoveToGrasp(const Pose3D& grasp_pose,
 GraspResult GraspExecutor::CloseGripperAndCheck() {
     std::this_thread::sleep_for(
         std::chrono::milliseconds(config_.timing.grasp_settle_ms));
-    grasp_execute(gripper_, GRASP_CMD_GRAB, config_.gripper_effort);
+    if (grasp_execute(gripper_, GRASP_CMD_GRAB,
+                      config_.gripper_effort) != GRASP_OK) {
+        RecordResult(GraspResult::MOVE_FAILED, "close_gripper_and_check",
+                    "failed to start gripper close");
+        return GraspResult::MOVE_FAILED;
+    }
     std::this_thread::sleep_for(
         std::chrono::milliseconds(config_.timing.gripper_close_wait_ms));
 
+    return CheckGripperHolding("after_close", false);
+}
+
+GraspResult GraspExecutor::CheckGripperHolding(const char* phase,
+                                               bool after_lift) {
     grasp_state_t state = GRASP_STATE_ERROR;
     int holding_count = 0;
     int load_holding_count = 0;
@@ -236,7 +265,10 @@ GraspResult GraspExecutor::CloseGripperAndCheck() {
     float load = NAN;
 
     for (int i = 0; i < config_.timing.grasp_check_count; i++) {
-        grasp_tick(gripper_, 0.05f);
+        const float interval_s =
+            static_cast<float>(config_.timing.grasp_check_interval_ms) /
+            1000.0f;
+        grasp_tick(gripper_, interval_s);
         state = grasp_get_state(gripper_);
         if (state == GRASP_STATE_HOLDING) {
             holding_count++;
@@ -257,17 +289,26 @@ GraspResult GraspExecutor::CloseGripperAndCheck() {
             config_.timing.grasp_check_interval_ms));
     }
 
-    const int required_holding = std::max(1, config_.timing.grasp_check_count / 2);
+    const int required_holding =
+        std::max(1, config_.timing.grasp_check_count / 2);
+    diagnostics_.gripper_check.phase = phase;
     diagnostics_.gripper_check.state = GraspStateName(state);
     diagnostics_.gripper_check.holding_count = holding_count;
     diagnostics_.gripper_check.load_holding_count = load_holding_count;
     diagnostics_.gripper_check.check_count = config_.timing.grasp_check_count;
     diagnostics_.gripper_check.load_threshold =
         config_.gripper_hold_load_threshold;
+    diagnostics_.gripper_check.empty_closed_position =
+        empty_closed_position_;
+    const float min_object_position = std::isnan(empty_closed_position_)
+        ? 0.05f
+        : empty_closed_position_ + config_.gripper_empty_position_margin;
+    diagnostics_.gripper_check.min_object_position = min_object_position;
     diagnostics_.gripper_check.position = position;
     diagnostics_.gripper_check.load = load;
 
-    std::cout << "[GraspExecutor] grasp check: state="
+    std::cout << "[GraspExecutor] grasp check: phase=" << phase
+                << ", state="
                 << GraspStateName(state)
                 << ", holding=" << holding_count << "/"
                 << config_.timing.grasp_check_count
@@ -275,28 +316,40 @@ GraspResult GraspExecutor::CloseGripperAndCheck() {
                 << config_.timing.grasp_check_count
                 << ", load_threshold="
                 << config_.gripper_hold_load_threshold
+                << ", min_object_position=" << min_object_position
                 << ", position=" << position
                 << ", load=" << load << std::endl;
 
-    if (state == GRASP_STATE_HOLDING || holding_count >= required_holding) {
-        RecordResult(GraspResult::SUCCESS, "close_gripper_and_check",
-                    "holding state reached");
+    const bool opening_indicates_object =
+        !std::isnan(position) && position > min_object_position;
+    const bool state_or_baseline_confirmed =
+        holding_count >= required_holding ||
+        !std::isnan(empty_closed_position_);
+    const bool holding_confirmed =
+        state_or_baseline_confirmed &&
+        load_holding_count >= required_holding &&
+        opening_indicates_object;
+    if (holding_confirmed) {
+        const char* action = after_lift ? "verify_grasp_after_lift"
+                                        : "close_gripper_and_check";
+        RecordResult(GraspResult::SUCCESS, action,
+                    "baseline-relative opening and load confirmed");
         return GraspResult::SUCCESS;
     }
     if (state == GRASP_STATE_EMPTY ||
         state == GRASP_STATE_IDLE ||
-        (!std::isnan(position) && position <= 0.05f)) {
+        (!std::isnan(position) && position <= min_object_position)) {
         std::cout << "[GraspExecutor] Grasp empty - nothing grabbed" << std::endl;
-        RecordResult(GraspResult::EMPTY, "close_gripper_and_check",
+        RecordResult(GraspResult::EMPTY,
+                    after_lift ? "verify_grasp_after_lift"
+                               : "close_gripper_and_check",
                     "gripper closed without object");
         return GraspResult::EMPTY;
     }
-    if (load_holding_count >= required_holding) {
-        std::cout << "[GraspExecutor] Grasp inferred from sustained load"
-                    << std::endl;
-        RecordResult(GraspResult::SUCCESS, "close_gripper_and_check",
-                    "sustained load above threshold");
-        return GraspResult::SUCCESS;
+    if (after_lift) {
+        RecordResult(GraspResult::EMPTY, "verify_grasp_after_lift",
+                    "holding state or load was not sustained after lift");
+        return GraspResult::EMPTY;
     }
     if (state == GRASP_STATE_MOVING) {
         std::cerr << "[GraspExecutor] Gripper still moving after close check"
@@ -333,8 +386,9 @@ GraspResult GraspExecutor::LiftFromGrasp(const Pose3D& pre_grasp_pose,
                     "pose verification failed");
         return GraspResult::MOVE_FAILED;
     }
-    RecordResult(GraspResult::SUCCESS, "lift_from_grasp");
-    return GraspResult::SUCCESS;
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(config_.timing.post_lift_settle_ms));
+    return CheckGripperHolding("after_lift", true);
 }
 
 GraspResult GraspExecutor::MoveToPlace() {
@@ -354,7 +408,11 @@ GraspResult GraspExecutor::MoveToPlace() {
 }
 
 GraspResult GraspExecutor::ReleaseObject() {
-    grasp_execute(gripper_, GRASP_CMD_RELEASE, config_.place_release_open);
+    if (grasp_set_position(gripper_, config_.place_release_open) != GRASP_OK) {
+        RecordResult(GraspResult::MOVE_FAILED, "release_object",
+                    "failed to set release opening");
+        return GraspResult::MOVE_FAILED;
+    }
     std::this_thread::sleep_for(
         std::chrono::milliseconds(config_.timing.release_wait_ms));
     RecordResult(GraspResult::SUCCESS, "release_object");
@@ -698,7 +756,7 @@ GraspResult GraspExecutor::SolveIK(const Pose3D& pose, std::vector<float>& joint
         const auto ik_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(ik_end - ik_start)
                 .count();
-        std::cout << "[Perf] ik_solve_ms=" << ik_ms
+        std::cout << "[Timing] component=IK elapsed_ms=" << ik_ms
                     << " mode=direct ret=" << ret << std::endl;
     }
     if (ret != MANIP_OK) {
@@ -810,7 +868,7 @@ GraspResult GraspExecutor::SolveIKConstrained(const Pose3D& pose,
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         ik_end - ik_start)
                         .count();
-                std::cout << "[Perf] ik_solve_ms=" << ik_ms
+                std::cout << "[Timing] component=IK elapsed_ms=" << ik_ms
                             << " mode=constrained trials=" << (trial + 1)
                             << " fallback=0 result=success" << std::endl;
             }
@@ -826,7 +884,7 @@ GraspResult GraspExecutor::SolveIKConstrained(const Pose3D& pose,
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         ik_end - ik_start)
                         .count();
-                std::cout << "[Perf] ik_solve_ms=" << ik_ms
+                std::cout << "[Timing] component=IK elapsed_ms=" << ik_ms
                             << " mode=constrained trials=" << max_trials
                             << " fallback=1 result=success" << std::endl;
             }
@@ -841,7 +899,7 @@ GraspResult GraspExecutor::SolveIKConstrained(const Pose3D& pose,
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     ik_end - ik_start)
                     .count();
-            std::cout << "[Perf] ik_solve_ms=" << ik_ms
+            std::cout << "[Timing] component=IK elapsed_ms=" << ik_ms
                         << " mode=constrained trials=" << max_trials
                         << " fallback=0 result=failed" << std::endl;
         }

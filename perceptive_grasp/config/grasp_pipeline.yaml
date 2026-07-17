@@ -1,254 +1,116 @@
-# 视觉抓取 Pipeline 配置
-# Linksee 轮式机器人 + SO101 机械臂 + RealSense D435i (前视)
-#
-# 机器人结构:
-#   - 2轮差速底盘
-#   - D435i 深度相机: 机身顶部, 面朝前下方
-#   - SO101 5-DOF 机械臂: 机身前方
-#   - 腕部 RGB 相机: SO101 手腕处 (当前未使用)
+# perceptive grasp 发布配置
+# 仅保留部署必填项和现场常用调节项，完整说明见 ../docs/grasp_config.md。
 
-# ============ 相机配置 ============
+# 立体相机与目标检测
 camera:
-  # RealSense D435i 配置
-  width: 640
-  height: 480
-  fps: 30
-  # 对齐深度到彩色 (align depth to color)
-  align_depth: true
-  # 深度滤波
-  depth_filter:
-    spatial: true
-    temporal: true
-    hole_filling: true
+  type: "spacemit_las2"  # realsense 或 spacemit_las2
 
-# ============ 检测配置 ============
+  realsense:
+    width: 640
+    height: 480
+    fps: 30
+    motion_flush_frames: 16
+    align_depth: true
+    depth_filter:
+      spatial: true
+      temporal: true
+      hole_filling: true
+
+  spacemit_las2:
+    video_device: "/dev/v4l/by-id/usb-DECXIN_DECXIN_Camera_01.00.00-video-index0"
+    model_path: "~/las2_runtime/models/LAS2_M_256x320.fp16.iofp32.corr_func_nhwc.gelu.onnx"
+    calib_path: "~/las2_runtime/config/matlab_stereo_opencv.json"
+    core_count: 1
+    core_affinity: "8"
+    depth:
+      min_m: 0.05
+      max_m: 2.0
+
 detection:
   config_path: yolov8_seg.yaml
-  # 目标类别过滤 (COCO 类别ID)
-  # 空列表 = 检测所有类别
-  # 常用: 39=bottle, 41=cup, 46=banana, 47=apple, 49=orange, 51=carrot
-  target_labels: []
-  # 最小置信度
+  target_labels: []  # 空列表表示检测全部 coco 类别
   min_confidence: 0.4
-  # 最小面积 (像素^2)，过滤太小的检测
   min_area: 1000
+  stable_frames: 1
 
-# ============ 手眼标定(手动测量值) ============
-# calibration:
-#   # 相机坐标系到机械臂基座的变换矩阵
-#   # Linksee 实际结构: D435i 安装在机身顶部，面朝前下方
-#   # 相机坐标系: X右, Y下, Z前(光轴方向)，原点在realsense相机左眼左上角
-#   # 臂基座坐标系: X前, Y左, Z上，原点在机械臂基座中心
-#   # 因此需要旋转将相机系对齐到臂基座系
-#   # 精确值需要通过手眼标定获得 (scripts/calibrate_hand_eye.py)
-#   T_base_camera:
-#     translation: [0.03, 0.05, 0.295]   # [x, y, z] 米 (相机相对臂基座偏移)
-#     #translation: [0.03, 0.0838, 0.2824]
-#     rotation: [-2.2198, 0.0, -1.5708]  # [roll, pitch, yaw] 弧度
-#     # 旋转说明: 将相机坐标系 (X右Y下Z前) 转换到臂基座坐标系 (X前Y左Z上)
-#     # 推导: R_base_cam = R0 * Rx(-tilt), 其中:
-#     #   R0 = 水平朝前时的基础旋转 (cam_Z->base_X, cam_X->-base_Y, cam_Y->-base_Z)
-#     #   Rx(-tilt) = 相机绕自身X轴下俯 37.2°
-#     # 用 Rz*Ry*Rx 约定反推: roll=-2.2198(-127.2°), pitch=0, yaw=-pi/2(-90°)
-#     # 注意: 这是估算值，精确值需通过标定获得
-# ============ 手眼标定（标定程序计算值）=============
+# 手眼标定结果
 calibration:
   T_base_camera:
-    translation: [0.0557, 0.0641, 0.3010]
-    rotation: [-2.3633, -0.0301, -1.5373]
+    translation: [-0.019765, 0.048938, 0.312118]
+    rotation: [-2.126969, -0.007183, -1.598329]
 
-# ============ 抓取策略 ============
+# 抓取策略
 grasp:
-  # 顶抓模式参数
-  approach_height: 0.10    # 预抓取高度 (目标上方, 米)
-  grasp_depth: 0.01        # 抓取深度 (目标表面以下, 米)
-  gripper_open: 0.5        # 张开程度 [0~1]
-  gripper_effort: 0.8      # 抓取力度 [0~1]
-  # SO101 夹爪抓住判定阈值。日志中的 load 超过该值且夹爪未完全闭合时，认为可能抓住。
-  gripper_hold_load_threshold: 100.0
-  gripper_timeout_ms: 3000
-  # 夹爪固定爪方向偏移 (米)
-  # 3D 层夹爪结构补偿，平移最终抓取位姿到夹爪固定爪方向
-  # SO101 左爪固定、右爪运动，抓取点需要沿夹爪方向往固定爪偏移
-  # 该偏移会根据夹爪旋转角度 (grasp_yaw) 自动投影到 x/y 方向
-  # 正值 = 往固定爪侧偏移
-  # 建议值: 0.01 ~ 0.03 (根据夹爪宽度调整，约为夹爪张开宽度的一半)
+  approach_height: 0.10
+  grasp_depth: 0.01
   gripper_offset: 0.0
-  # 抓取点沿短轴方向偏移比例
-  # 图像/mask 层选抓取像素，会影响取深度的位置
-  # 沿物体短轴方向 (垂直于长轴) 往固定爪侧 (左下方向) 偏移
-  # 0.0 = 物体中心 (不偏移)
-  # 0.5 = 偏移到短轴半径的 50% 处
-  # 1.0 = 偏移到短轴边缘
-  # SO101 左爪固定，偏移方向自动选择往固定爪侧
   grasp_point_x_ratio: 0.5
-  # 安全限制
+  gripper_open: 0.6
+  gripper_effort: 0.8
+  gripper_hold_load_threshold: 100.0
+  gripper_empty_position_margin: 0.03
+  gripper_timeout_ms: 3000
   workspace:
     x_min: 0.0
     x_max: 0.5
     y_min: -0.3
     y_max: 0.3
-    z_min: 0.0           # 桌面以下不去
-    z_max: 0.20            # 最高抓取高度
+    z_min: 0.0
+    z_max: 0.20
 
-# ============ 夹爪方向自动对齐 ============
 orientation:
-  # 是否启用自动对齐 (根据物体形状旋转夹爪)
   enabled: true
-  # 长宽比阈值: 物体长宽比超过此值才认为有明显方向性。
-  # 低于此值的物体 (如苹果、杯子) 不做短轴偏移和方向覆盖。
   aspect_ratio_threshold: 1.2
-  # 相机安装旋转补偿 (弧度)。
-  # 当前主路径使用黄色检测线相对图像水平线的夹角作为 command_yaw，
-  # 因此该参数只在无法计算黄色线方向、回退到长轴 yaw 时使用。
-  camera_yaw_offset: 1.57
 
-# ============ 机械臂配置 ============
+# 机械臂与放置姿态
 manipulator:
-  driver: "so101"
-  # SO101/Feetech 总线串口。换硬件或 USB 插拔顺序变化后，用 ls /dev/ttyACM* 重新确认。
   uart_device: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A7A057974-if00"
-  baudrate: 1000000
   urdf_path: "../urdf/so101.urdf"
-  base_link: "base_link"
-  tip_link: "gripper_frame_link"
-  # 运动速度
-  move_speed: 1          # 关节运动速度倍率 [0~1]
-  line_speed: 0.5          # 直线运动速度倍率 [0~1]
-  pose_position_tolerance: 0.03  # 末端到位检查容差 (米)
-  # 预定义姿态 (关节角, rad)
-  # Linksee 结构: D435i 在机身顶部面朝前方，臂需要收起避免遮挡相机视野
+  move_speed: 1.0
+  line_speed: 0.5
   home_joints: [1.816, -1.850, 1.639, 1.147, 0.189]
-  # observe_joints: 臂完全收起/侧收，确保不遮挡前视 D435i
   observe_joints: [1.759, 0.050, -0.217, 1.606, 0.015]
-  # IK 多种子采样参数
-  ik_max_trials: 50        # 最多尝试次数
-  # Wrist yaw 补偿参数:
-  # command_yaw = 黄色检测线相对图像水平线的夹角
-  # 顶抓近似: command_yaw ≈ joint0 + wrist_yaw_scale * joint5
-  # 因此 joint5_new = (command_yaw - joint0) / wrist_yaw_scale
-  # 若现场观察到角度大小正确但旋转方向相反，改 wrist_yaw_scale 的符号。
-  wrist_yaw_scale: 1.0
-  # IK 关节约束: 多种子采样时筛选满足约束的解
-  # 每项格式: {joint: 关节索引(0-based), min: 最小弧度, max: 最大弧度}
-  # 不满足所有约束的 IK 解会被丢弃
-  joint_constraints:
-    - joint: 3             # 第4关节 (wrist pitch)
-      min: 1.102           # 爪子朝下最小角度
-      max: 1.667           # 爪子朝下最大角度
 
-  # ============ 碰撞避免 ============
-  # Linksee 机身碰撞保护:
-  # 机械臂的 -x 方向朝向机身，当 joint1 (肩关节) 向 -x 方向伸展时
-  # 如果 joint0 (底座旋转) 没有转到两侧，机械臂会撞到机身
-  # 碰撞条件: joint1 < shoulder_threshold AND joint0 在 base_danger_zone 内
-  # 安全策略: 先将 joint0 转出危险区，再执行其他关节运动
-  collision_avoidance:
-    enabled: true
-    # joint0 (底座旋转) 危险区间: 在此范围内时臂可能撞机身
-    base_danger_zone: [-1.480, 1.480]
-    # joint1 (肩关节) 阈值: 低于此值时臂伸向机身方向
-    shoulder_threshold: -0.334
-    # joint0 安全目标: 当需要避让时，将 joint0 移到最近的安全位置
-    # 取 danger_zone 边界外 0.1 rad 的余量
-    base_safe_margin: 0.1
-
-# ============ 放置配置 ============
 place:
-  # 固定放置位置 (关节角, rad)
   place_joints: [-1.636, 0.087, -0.140, 1.389, 0.033]
-  # 放置释放时夹爪张开程度 [0~1]
   release_open: 0.5
 
-# ============ 底盘辅助对齐 ============
+# 底盘辅助对齐
 mobile_base:
   enabled: true
-  driver: "drv_uart_esp32"
-  # Linksee 真实底盘默认通过 UART 串口连接。
   dev_path: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5958002008-if00"
-  baud: 115200
-  # RPMsg 字段仅在 driver 改为 drv_rpmsg_esos 时使用。
-  ctrl_dev: "/dev/rpmsg_ctrl0"
-  data_dev: "/dev/rpmsg0"
-  service_name: "rpmsg:motor_ctrl"
-  wheel_diameter: 0.067
-  wheel_base: 0.183
-  wheel_track: 0.0
-  left_wheel_gain: 1.0
-  max_speed: 0.3
-  max_angular: 3.14
-  reduction_ratio: 56.0
-  ff_factor: 0.3
-  pid_kp: 0.05
-  pid_ki: 0.2
-  pid_kd: 0.01
-  cfg_send_on_startup: true
-  feedback_enable: true
-  # 目标在机械臂 base 坐标下的舒适抓取距离，单位米。
-  target_x: 0.30
-  x_tolerance: 0.05
-  y_tolerance: 0.08
-  # 每次底盘只做短距离动作，动作后重新检测和规划。
+  target_x: 0.275
+  x_tolerance: 0.045
+  y_tolerance: 0.15
   max_step_m: 0.12
   linear_speed: 0.20
   angular_speed: 1.2
-  yaw_gain: 8.0
-  min_cmd_duration_ms: 200
-  max_cmd_duration_ms: 2000
-  settle_ms: 500
-  max_align_attempts: 6
 
-# ============ 抓取调试输出 ============
-debug:
-  # 每次规划成功后保存标注图和 JSON，便于复盘抓取失败原因
-  save_grasp_debug: true
-  # 相对路径按配置文件所在目录解析
-  output_dir: "../debug_grasp_runs"
-
-# ============ 阶段间等待时间 ============
-# 只控制固定等待时间；机械臂运动快慢仍由 manipulator.move_speed / line_speed 控制
-timing:
-  # OBSERVING: 移动到观察位后，等待相机曝光/画面稳定
-  observe_settle_ms: 500
-  # OBSERVING: 移动观察位前先闭合夹爪后的等待
-  observe_gripper_close_wait_ms: 100
-  # GRASPING: 到 pre_grasp 后，张开夹爪前等待
-  pre_grasp_settle_ms: 150
-  # GRASPING: 张开夹爪后等待
-  gripper_open_wait_ms: 150
-  # GRASPING: 到 grasp 位后，闭合夹爪前等待
-  grasp_settle_ms: 100
-  # GRASPING: 闭合夹爪后等待
-  gripper_close_wait_ms: 500
-  # GRASPING: 闭合后夹爪状态检测次数和间隔
-  grasp_check_count: 5
-  grasp_check_interval_ms: 50
-  # PLACING: 到 place_joints 后，释放夹爪前等待
-  place_settle_ms: 100
-  # PLACING: 释放夹爪后等待物体脱落
-  release_wait_ms: 800
-  # HOMING: 放置后关闭夹爪等待
-  home_gripper_close_wait_ms: 100
-
-# ============ 语音接口 ============
+# 语音交互
 voice:
-  # 语音参数配置。是否进入语音模式由启动命令决定。
-  # local_voice_bridge.py 会自动以 --voice-stdin --status-stdout 启动抓取进程。
-  # 文本命令触发词。ASR 输出 "抓香蕉" 后会触发抓取 banana
   trigger_words: ["抓", "拿", "pick", "grab"]
-  # 本地 ASR 输入设备
+  cancel_words: ["停止", "停", "取消", "别抓", "不要抓", "stop", "cancel"]
+  home_words: ["结束", "待命", "休息", "回家", "回home", "回到home", "回初始", "回到初始", "end", "home"]
+  split_command_timeout_ms: 5000
+
   asr:
     device: 1
     rate: 16000
     channels: 1
-  # 本地 TTS 输出设备
+    vad_trigger_threshold: 0.4
+    vad_stop_threshold: 0.3
+    vad_min_speech_duration_ms: 100
+
   tts:
+    engine: "matcha:zh"
     playback_device: 1
-    # ALSA PCM 播放音量，-1 表示不修改系统 mixer
+    playback_rate: 48000
+    channels: 1
+    speed: 1.0
+    volume: 80
     mixer_volume: 80
-  # 取消/停止命令。抓取过程中说这些词会停止当前任务，并回到观察位等待下一条指令
-  cancel_words: ["停止", "停", "取消", "别抓", "不要抓", "stop", "cancel"]
-  # 中文语音目标名到检测类别名的映射。检测类别名需与 YOLO/COCO label 一致
+    speak_all_states: false
+
   target_aliases:
     香蕉: "banana"
     苹果: "apple"
@@ -273,9 +135,3 @@ voice:
     勺子: "spoon"
     叉子: "fork"
     剪刀: "scissors"
-
-# ============ 日志配置 ============
-logging:
-  performance:
-    # 是否打印检测推理耗时、检测阶段总耗时和 IK 求解耗时
-    enabled: false

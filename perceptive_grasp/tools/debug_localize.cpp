@@ -11,7 +11,7 @@
     *   ./debug_localize --config ../config/grasp_pipeline.yaml --target apple
     *
     * 功能:
-    *   1. 打开 RealSense D435i 相机
+    *   1. 根据主配置打开立体相机后端
     *   2. 运行 VisionService 检测
     *   3. 对每个检测目标计算中心点附近 5x5 深度中值
     *   4. 反投影到相机坐标系
@@ -20,26 +20,26 @@
     */
 
 #include <algorithm>
-#include <array>
 #include <chrono>
-#include <cstring>
+#include <cstdlib>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
-#include <librealsense2/rs.hpp>
-#include <librealsense2/rsutil.h>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include "grasp_planner.h"
+#include "stereo_camera.h"
 #include "vision_service.h"
 #include "vision_result_adapter.h"
 
@@ -47,21 +47,22 @@ namespace fs = std::filesystem;
 using perceptive_grasp::GraspPlanner;
 using perceptive_grasp::GraspPlannerConfig;
 using perceptive_grasp::Pose3D;
+using perceptive_grasp::StereoCameraConfig;
 
 static constexpr const char* kDefaultConfigPath = "../config/grasp_pipeline.yaml";
 
-static const cv::Scalar COLORS[] = {
+static const cv::Scalar kColors[] = {
     {255, 0, 0},   {0, 255, 0},   {0, 0, 255},   {255, 255, 0},
     {255, 0, 255}, {0, 255, 255}, {128, 128, 0}, {255, 128, 0},
 };
-static constexpr int NUM_COLORS = sizeof(COLORS) / sizeof(COLORS[0]);
+static constexpr int kNumColors = sizeof(kColors) / sizeof(kColors[0]);
 
 struct AppConfig {
     std::string config_path;
     std::string output_dir = "./debug_localize_output";
     std::string target_name;
     int num_frames = 1;
-    int warmup_frames = 30;
+    int warmup_frames = -1;
 };
 
 static std::vector<std::string> LoadLabels(const std::string& path) {
@@ -102,11 +103,14 @@ static AppConfig ParseArgs(int argc, char* argv[]) {
         if ((arg == "--help") || (arg == "-h")) {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                         << "Options:\n"
-                        << "  --config <yaml>    Pipeline config (default: ../config/grasp_pipeline.yaml)\n"
-                        << "  --output <dir>     Output directory (default: ./debug_localize_output)\n"
+                        << "  --config <yaml>    Pipeline config "
+                           "(default: ../config/grasp_pipeline.yaml)\n"
+                        << "  --output <dir>     Output directory "
+                           "(default: ./debug_localize_output)\n"
                         << "  --frames <N>       Number of frames to capture (default: 1)\n"
                         << "  --target <name>    Filter target class name (e.g. apple)\n"
-                        << "  --warmup <N>       Warmup frames (default: 30)\n";
+                        << "  --warmup <N>       Warmup frames "
+                           "(default: backend specific)\n";
             std::exit(0);
         } else if (arg == "--config" && i + 1 < argc) {
             cfg.config_path = argv[++i];
@@ -123,11 +127,99 @@ static AppConfig ParseArgs(int argc, char* argv[]) {
     return cfg;
 }
 
+static void ResolveConfigPath(const fs::path& config_dir,
+                              std::string* path) {
+    if (path == nullptr || path->empty()) return;
+
+    std::string expanded = *path;
+    const char* home = std::getenv("HOME");
+    if (home != nullptr) {
+        if (expanded == "~") {
+            expanded = home;
+        } else if (expanded.rfind("~/", 0) == 0) {
+            expanded = (fs::path(home) / expanded.substr(2)).string();
+        } else if (expanded.rfind("$HOME/", 0) == 0) {
+            expanded = (fs::path(home) / expanded.substr(6)).string();
+        }
+    }
+
+    fs::path resolved(expanded);
+    if (!resolved.is_absolute()) resolved = config_dir / resolved;
+    *path = fs::weakly_canonical(resolved).string();
+}
+
+static StereoCameraConfig LoadCameraConfig(
+    const std::string& pipeline_config) {
+    StereoCameraConfig config;
+    const YAML::Node root = YAML::LoadFile(pipeline_config);
+    const YAML::Node camera = root["camera"];
+    if (!camera || !camera.IsMap()) {
+        throw std::runtime_error("camera configuration is required");
+    }
+
+    config.type = camera["type"].as<std::string>(config.type);
+    if (config.type == "realsense" || config.type == "d435i") {
+        if (const YAML::Node realsense = camera["realsense"]) {
+            auto& settings = config.realsense;
+            settings.width = realsense["width"].as<int>(settings.width);
+            settings.height = realsense["height"].as<int>(settings.height);
+            settings.fps = realsense["fps"].as<int>(settings.fps);
+            settings.motion_flush_frames =
+                realsense["motion_flush_frames"].as<int>(
+                    settings.motion_flush_frames);
+            settings.align_depth = realsense["align_depth"].as<bool>(
+                settings.align_depth);
+            if (const YAML::Node filters = realsense["depth_filter"]) {
+                settings.spatial_filter = filters["spatial"].as<bool>(
+                    settings.spatial_filter);
+                settings.temporal_filter = filters["temporal"].as<bool>(
+                    settings.temporal_filter);
+                settings.hole_filling = filters["hole_filling"].as<bool>(
+                    settings.hole_filling);
+            }
+        }
+    } else if (config.type == "spacemit_las2") {
+        const YAML::Node las2 = camera["spacemit_las2"];
+        if (!las2 || !las2.IsMap()) {
+            throw std::runtime_error(
+                "camera.spacemit_las2 configuration is required");
+        }
+        auto& settings = config.spacemit_las2;
+        settings.video_device = las2["video_device"].as<std::string>(
+            settings.video_device);
+        settings.model_path = las2["model_path"].as<std::string>(
+            settings.model_path);
+        settings.calib_path = las2["calib_path"].as<std::string>(
+            settings.calib_path);
+        settings.core_count = las2["core_count"].as<int>(
+            settings.core_count);
+        settings.core_affinity = las2["core_affinity"].as<std::string>(
+            settings.core_affinity);
+        if (const YAML::Node depth = las2["depth"]) {
+            settings.min_depth_m = depth["min_m"].as<float>(
+                settings.min_depth_m);
+            settings.max_depth_m = depth["max_m"].as<float>(
+                settings.max_depth_m);
+        }
+    } else {
+        throw std::runtime_error("unsupported camera.type: " + config.type);
+    }
+
+    fs::path config_dir = fs::path(pipeline_config).parent_path();
+    if (config_dir.empty()) config_dir = ".";
+    ResolveConfigPath(config_dir, &config.spacemit_las2.model_path);
+    ResolveConfigPath(config_dir, &config.spacemit_las2.calib_path);
+    return config;
+}
+
 static std::string ResolveDetectConfig(const std::string& pipeline_config) {
-    YAML::Node root = YAML::LoadFile(pipeline_config);
-    auto detect_cfg = root["detection"]["config_path"].as<std::string>();
-    if (fs::path(detect_cfg).is_absolute()) return detect_cfg;
-    return fs::weakly_canonical(fs::path(pipeline_config).parent_path() / detect_cfg).string();
+    const YAML::Node root = YAML::LoadFile(pipeline_config);
+    std::string detect_config =
+        root["detection"]["config_path"].as<std::string>();
+    fs::path config_dir = fs::path(pipeline_config).parent_path();
+    if (config_dir.empty()) config_dir = ".";
+    ResolveConfigPath(config_dir, &detect_config);
+    return detect_config;
 }
 
 static GraspPlannerConfig LoadPlannerConfig(const std::string& pipeline_config) {
@@ -162,13 +254,57 @@ int main(int argc, char* argv[]) {
         std::cerr << "[debug_localize] Error: --config is required" << std::endl;
         return 1;
     }
+    if (app.num_frames < 1 || app.warmup_frames < -1) {
+        std::cerr << "[debug_localize] --frames must be positive; --warmup "
+                     "must be -1 or non-negative"
+                  << std::endl;
+        return 1;
+    }
 
     fs::create_directories(app.output_dir);
-    std::cout << "[debug_localize] Output: " << fs::absolute(app.output_dir) << std::endl;
+    std::cout << "[debug_localize] Output: " << fs::absolute(app.output_dir)
+              << std::endl;
 
-    std::string detect_config = ResolveDetectConfig(app.config_path);
-    auto planner_cfg = LoadPlannerConfig(app.config_path);
-    GraspPlanner planner(planner_cfg);
+    StereoCameraConfig camera_config;
+    std::string detect_config;
+    GraspPlannerConfig planner_config;
+    try {
+        camera_config = LoadCameraConfig(app.config_path);
+        detect_config = ResolveDetectConfig(app.config_path);
+        planner_config = LoadPlannerConfig(app.config_path);
+    } catch (const std::exception& e) {
+        std::cerr << "[debug_localize] Config error: " << e.what()
+                  << std::endl;
+        return 1;
+    }
+
+    if (app.warmup_frames < 0) {
+        app.warmup_frames =
+            camera_config.type == "spacemit_las2" ? 1 : 30;
+    }
+
+    std::cout << "[debug_localize] Initializing camera backend: "
+              << camera_config.type << std::endl;
+    auto camera = perceptive_grasp::CreateStereoCamera(camera_config);
+    if (!camera || !camera->Init()) {
+        std::cerr << "[debug_localize] Failed to initialize camera backend: "
+                  << camera_config.type << std::endl;
+        return 1;
+    }
+
+    cv::Mat color;
+    cv::Mat depth;
+    std::cout << "[debug_localize] Warming up (" << app.warmup_frames
+              << " frames)..." << std::endl;
+    for (int i = 0; i < app.warmup_frames; ++i) {
+        if (!camera->GetFrames(color, depth)) {
+            std::cerr << "[debug_localize] Failed to acquire warmup frame "
+                      << (i + 1) << std::endl;
+            return 1;
+        }
+    }
+
+    GraspPlanner planner(planner_config);
 
     auto vision = VisionService::Create(detect_config, "", false);
     if (!vision) {
@@ -183,32 +319,16 @@ int main(int argc, char* argv[]) {
         labels = LoadLabels(label_path);
     }
 
-    rs2::pipeline pipe;
-    rs2::config rs_cfg;
-    rs_cfg.enable_stream(RS2_STREAM_COLOR, 640, 480, RS2_FORMAT_BGR8, 30);
-    rs_cfg.enable_stream(RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16, 30);
-
-    rs2::pipeline_profile profile = pipe.start(rs_cfg);
-    auto depth_sensor = profile.get_device().first<rs2::depth_sensor>();
-    float depth_scale = depth_sensor.get_depth_scale();
-    auto color_stream = profile.get_stream(RS2_STREAM_COLOR).as<rs2::video_stream_profile>();
-    auto intr = color_stream.get_intrinsics();
-    rs2::align align(RS2_STREAM_COLOR);
-
-    for (int i = 0; i < app.warmup_frames; ++i) pipe.wait_for_frames();
-
-    std::cout << "[debug_localize] Capturing " << app.num_frames << " frame(s)..." << std::endl;
+    std::cout << "[debug_localize] Capturing " << app.num_frames
+              << " frame(s)..." << std::endl;
 
     for (int frame_idx = 1; frame_idx <= app.num_frames; ++frame_idx) {
-        rs2::frameset frames = pipe.wait_for_frames();
-        rs2::frameset aligned = align.process(frames);
-        auto color_frame = aligned.get_color_frame();
-        auto depth_frame = aligned.get_depth_frame();
-
-        cv::Mat color(cv::Size(640, 480), CV_8UC3,
-                        (void*)color_frame.get_data(), cv::Mat::AUTO_STEP);
-        cv::Mat depth(cv::Size(640, 480), CV_16UC1,
-                        (void*)depth_frame.get_data(), cv::Mat::AUTO_STEP);
+        if (!camera->GetFrames(color, depth) || color.empty() ||
+            depth.empty()) {
+            std::cerr << "[debug_localize] Failed to acquire frame "
+                      << frame_idx << std::endl;
+            return 1;
+        }
         cv::Mat annotated = color.clone();
 
         std::vector<VisionServiceResult> results;
@@ -232,47 +352,67 @@ int main(int argc, char* argv[]) {
         int kept = 0;
         for (size_t i = 0; i < results.size(); ++i) {
             const auto& r = results[i];
-            std::string label = (r.label >= 0 && r.label < (int)labels.size())
+            std::string label =
+                (r.label >= 0 &&
+                 r.label < static_cast<int>(labels.size()))
                 ? labels[r.label]
                 : ("class_" + std::to_string(r.label));
             if (!app.target_name.empty() && label != app.target_name) {
                 continue;
             }
 
-            int cx = (int)((r.x1 + r.x2) / 2);
-            int cy = (int)((r.y1 + r.y2) / 2);
+            const int cx = static_cast<int>((r.x1 + r.x2) / 2);
+            const int cy = static_cast<int>((r.y1 + r.y2) / 2);
             auto depth_mm_opt = MedianDepth5x5(depth, cx, cy);
             if (!depth_mm_opt.has_value()) {
-                out << label << ": invalid depth around (" << cx << ", " << cy << ")\n";
+                out << label << ": invalid depth around (" << cx << ", "
+                    << cy << ")\n";
                 continue;
             }
 
-            float depth_m = (*depth_mm_opt) * depth_scale;
-            float pixel[2] = {static_cast<float>(cx), static_cast<float>(cy)};
+            const float depth_m = *depth_mm_opt * 0.001f;
             float cam_point[3] = {0.0f, 0.0f, 0.0f};
-            rs2_deproject_pixel_to_point(cam_point, &intr, pixel, depth_m);
+            if (!camera->Deproject(cx, cy, *depth_mm_opt, cam_point)) {
+                out << label << ": deprojection failed at (" << cx << ", "
+                    << cy << ")\n";
+                continue;
+            }
 
             float base_point[3] = {0.0f, 0.0f, 0.0f};
             planner.CameraToBase(cam_point, base_point);
 
             Pose3D grasp_pose{}, pre_grasp_pose{};
-            bool in_workspace = planner.PlanTopGrasp(base_point, grasp_pose, pre_grasp_pose);
+            const bool in_workspace = planner.PlanTopGrasp(
+                base_point, grasp_pose, pre_grasp_pose);
 
-            cv::Scalar clr = COLORS[r.label % NUM_COLORS];
-            cv::rectangle(annotated, cv::Point((int)r.x1, (int)r.y1), cv::Point((int)r.x2, (int)r.y2), clr, 2);
-            cv::circle(annotated, cv::Point(cx, cy), 4, clr, -1);
+            const int color_index = std::max(0, r.label) % kNumColors;
+            const cv::Scalar color = kColors[color_index];
+            cv::rectangle(annotated,
+                          cv::Point(static_cast<int>(r.x1),
+                                    static_cast<int>(r.y1)),
+                          cv::Point(static_cast<int>(r.x2),
+                                    static_cast<int>(r.y2)),
+                          color, 2);
+            cv::circle(annotated, cv::Point(cx, cy), 4, color, -1);
 
             std::ostringstream text;
-            text << label << " z=" << std::fixed << std::setprecision(3) << depth_m << "m";
-            cv::putText(annotated, text.str(), cv::Point((int)r.x1, std::max(20, (int)r.y1 - 5)),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5, clr, 2);
+            text << label << " z=" << std::fixed << std::setprecision(3)
+                 << depth_m << "m";
+            cv::putText(
+                annotated, text.str(),
+                cv::Point(static_cast<int>(r.x1),
+                          std::max(20, static_cast<int>(r.y1) - 5)),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 2);
 
             out << "Detection " << kept + 1 << ": " << label
-                << " score=" << std::fixed << std::setprecision(3) << r.score << "\n"
+                << " score=" << std::fixed << std::setprecision(3)
+                << r.score << "\n"
                 << "  pixel_center: [" << cx << ", " << cy << "]\n"
                 << "  median_depth_mm_5x5: " << *depth_mm_opt << "\n"
-                << "  camera_point_m: [" << cam_point[0] << ", " << cam_point[1] << ", " << cam_point[2] << "]\n"
-                << "  base_point_m:   [" << base_point[0] << ", " << base_point[1] << ", " << base_point[2] << "]\n"
+                << "  camera_point_m: [" << cam_point[0] << ", "
+                << cam_point[1] << ", " << cam_point[2] << "]\n"
+                << "  base_point_m:   [" << base_point[0] << ", "
+                << base_point[1] << ", " << base_point[2] << "]\n"
                 << "  in_workspace: " << (in_workspace ? "yes" : "no") << "\n";
             if (in_workspace) {
                 out << "  pre_grasp_m:    ["
@@ -294,7 +434,6 @@ int main(int argc, char* argv[]) {
                     << " | detections: " << kept << std::endl;
     }
 
-    pipe.stop();
     std::cout << "[debug_localize] Done." << std::endl;
     return 0;
 }

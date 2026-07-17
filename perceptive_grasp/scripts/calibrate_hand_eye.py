@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
+
+# Copyright 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 手眼标定脚本 (Eye-to-Hand)
 
 Linksee 结构:
-  - 相机 (RealSense D435i) 固定在机身顶部，不随机械臂运动 → Eye-to-Hand 问题
+  - 立体相机固定在机身顶部，不随机械臂运动 → Eye-to-Hand 问题
   - 机械臂 (SO101 5-DOF) 在机身前方
   - ChArUco 标定板或 ArUco 标记固定在机械臂末端（夹爪上）
 
 原理:
   Eye-to-Hand: 相机固定不动，标定板随机械臂运动。
-  已知: 末端在基座系的位姿 T_base_gripper (FK 算出), 标定板在相机系的位姿 T_cam_marker (ChArUco/ArUco 检测)
+  已知: 末端在基座系的位姿 T_base_gripper (FK 算出),
+        标定板在相机系的位姿 T_cam_marker (ChArUco/ArUco 检测)
   求解: T_base_camera (相机在基座系的位姿)
   约束: T_base_gripper[i] * T_gripper_marker = T_base_camera * T_cam_marker[i]
 
 使用流程:
   1. 打印一个 ChArUco 标定板（推荐）或 ArUco 标记, 固定到夹爪末端
-  2. 连接 D435i 和 SO101
+  2. 连接配置的立体相机和 SO101
   3. 手动掰动机械臂到不同姿态, 每次按回车采集一组数据
   4. 采集 >= 8 组后, 按 q 计算标定结果
   5. 将结果写入 grasp_pipeline.yaml
@@ -50,6 +55,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import yaml
 from scipy.spatial.transform import Rotation
 
 try:
@@ -68,6 +74,7 @@ SO101_NUM_JOINTS = 5
 URDF_DOF = 6          # URDF 有 6 个 DOF (含 gripper)
 TIP_LINK = "gripper_frame_link"
 DEFAULT_DATASET_ROOT = SCRIPT_DIR / ".." / "config" / "hand_eye_datasets"
+DEFAULT_PIPELINE_CONFIG = SCRIPT_DIR / ".." / "config" / "grasp_pipeline.yaml"
 ARUCO_DICTS = {
     "4x4_50": cv2.aruco.DICT_4X4_50,
     "4x4_100": cv2.aruco.DICT_4X4_100,
@@ -76,6 +83,11 @@ ARUCO_DICTS = {
     "6x6_50": cv2.aruco.DICT_6X6_50,
     "6x6_100": cv2.aruco.DICT_6X6_100,
 }
+
+
+def expand_config_path(path):
+    """Expand user and environment references in a configured path."""
+    return os.path.expanduser(os.path.expandvars(str(path)))
 
 
 # ============================================================
@@ -282,35 +294,233 @@ def _apply_to_grasp_config(config_path, t_vec, rpy):
 # ============================================================
 # 相机
 # ============================================================
+class RealSenseCalibrationCamera:
+    """RealSense color stream used by hand-eye calibration."""
+
+    def __init__(self, width=640, height=480, fps=30):
+        if rs is None:
+            raise RuntimeError("pyrealsense2 未安装: pip install -r requirements.txt")
+
+        self.pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        profile = self.pipeline.start(config)
+
+        for _ in range(30):
+            self.pipeline.wait_for_frames()
+
+        intr = profile.get_stream(
+            rs.stream.color).as_video_stream_profile().get_intrinsics()
+        self.camera_matrix = np.array([
+            [intr.fx, 0, intr.ppx],
+            [0, intr.fy, intr.ppy],
+            [0, 0, 1],
+        ], dtype=np.float64)
+        self.dist_coeffs = np.array(intr.coeffs, dtype=np.float64)
+        self.metadata = {
+            "model": "RealSense D435i",
+            "backend": "realsense",
+            "width": int(intr.width),
+            "height": int(intr.height),
+            "fps": int(fps),
+        }
+
+    def capture(self):
+        frames = self.pipeline.wait_for_frames()
+        color = frames.get_color_frame()
+        if not color:
+            raise RuntimeError("RealSense 未返回彩色帧")
+        return np.asanyarray(color.get_data())
+
+    def stop(self):
+        self.pipeline.stop()
+
+
+class Las2CalibrationCamera:
+    """Rectified logical-left RGB stream matching the LAS2 optical frame."""
+
+    def __init__(self, video_device, calib_path, fps=30):
+        self.video_device = str(video_device)
+        self.calib_path = str(calib_path)
+        calibration = _json_load(self.calib_path)
+
+        try:
+            width, height = [int(v) for v in calibration["image_size"]]
+            left_matrix = np.asarray(
+                calibration["left_camera_matrix"], dtype=np.float64)
+            right_matrix = np.asarray(
+                calibration["right_camera_matrix"], dtype=np.float64)
+            left_dist = np.asarray(
+                calibration["left_dist_coeffs"], dtype=np.float64)
+            right_dist = np.asarray(
+                calibration["right_dist_coeffs"], dtype=np.float64)
+            rotation = np.asarray(calibration["R"], dtype=np.float64)
+            translation = np.asarray(
+                calibration["T"], dtype=np.float64).reshape(3, 1)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"LAS2 标定文件字段无效: {exc}") from exc
+
+        if width <= 0 or height <= 0:
+            raise RuntimeError("LAS2 标定文件 image_size 无效")
+        image_size = (width, height)
+        rect_left, _, proj_left, _, _, _, _ = cv2.stereoRectify(
+            left_matrix, left_dist, right_matrix, right_dist,
+            image_size, rotation, translation,
+            flags=cv2.CALIB_ZERO_DISPARITY, alpha=0,
+            newImageSize=image_size)
+        self.map_x, self.map_y = cv2.initUndistortRectifyMap(
+            left_matrix, left_dist, rect_left, proj_left,
+            image_size, cv2.CV_32FC1)
+        self.camera_matrix = proj_left[:3, :3].copy()
+        self.dist_coeffs = np.zeros(5, dtype=np.float64)
+        self.eye_width = width
+        self.eye_height = height
+
+        self.capture_device = cv2.VideoCapture(
+            self.video_device, cv2.CAP_V4L2)
+        if not self.capture_device.isOpened():
+            raise RuntimeError(f"无法打开 LAS2 视频设备: {self.video_device}")
+
+        self.capture_device.set(
+            cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.capture_device.set(cv2.CAP_PROP_FRAME_WIDTH, width * 2 + 160)
+        self.capture_device.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.capture_device.set(cv2.CAP_PROP_FPS, fps)
+        self.capture_device.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        frame = None
+        for _ in range(10):
+            ok, frame = self.capture_device.read()
+            if not ok:
+                self.stop()
+                raise RuntimeError("LAS2 无法读取 MJPEG 彩色帧")
+        try:
+            self._validate_raw_frame(frame)
+        except Exception:
+            self.stop()
+            raise
+
+        actual_fps = self.capture_device.get(cv2.CAP_PROP_FPS)
+        self.metadata = {
+            "model": "spacemit_las2 logical-left camera",
+            "backend": "spacemit_las2",
+            "video_device": self.video_device,
+            "calib_path": self.calib_path,
+            "capture_format": "MJPG",
+            "capture_width": int(frame.shape[1]),
+            "capture_height": int(frame.shape[0]),
+            "width": width,
+            "height": height,
+            "fps": float(actual_fps if actual_fps > 0 else fps),
+            "rectified": True,
+        }
+
+    def _validate_raw_frame(self, frame):
+        if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+            raise RuntimeError("LAS2 返回的彩色帧无效")
+        required_width = self.eye_width * 2 + 160
+        if (frame.shape[0] != self.eye_height or
+                frame.shape[1] != required_width):
+            raise RuntimeError(
+                f"LAS2 原始帧尺寸无效: {frame.shape[1]}x{frame.shape[0]}, "
+                f"期望 {required_width}x{self.eye_height}")
+
+    def capture(self):
+        ok, frame = self.capture_device.read()
+        if not ok:
+            raise RuntimeError("LAS2 彩色帧读取失败")
+        self._validate_raw_frame(frame)
+
+        # LAS2 raw layout is 160-column prefix + two 1920x1200 views.
+        # The SDK swaps physical order, so the second view is logical-left.
+        prefix = frame.shape[1] - self.eye_width * 2
+        left_start = prefix + self.eye_width
+        logical_left = frame[
+            :self.eye_height, left_start:left_start + self.eye_width]
+        return cv2.remap(
+            logical_left, self.map_x, self.map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT)
+
+    def stop(self):
+        if getattr(self, "capture_device", None) is not None:
+            self.capture_device.release()
+            self.capture_device = None
+
+
 def init_realsense(width=640, height=480, fps=30):
     """初始化 RealSense D435i, 返回 (pipeline, camera_matrix, dist_coeffs)"""
-    if rs is None:
-        raise RuntimeError("pyrealsense2 未安装: pip install -r requirements.txt")
+    camera = RealSenseCalibrationCamera(width, height, fps)
+    return camera, camera.camera_matrix, camera.dist_coeffs
 
-    pipeline = rs.pipeline()
-    config = rs.config()
-    config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-    profile = pipeline.start(config)
 
-    # 等待自动曝光稳定
-    for _ in range(30):
-        pipeline.wait_for_frames()
+def _read_pipeline_camera_config(config_path):
+    config_path = Path(config_path)
+    try:
+        with open(config_path, "r", encoding="utf-8") as stream:
+            root = yaml.safe_load(stream) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(f"无法读取抓取配置 {config_path}: {exc}") from exc
 
-    intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-    camera_matrix = np.array([
-        [intr.fx, 0, intr.ppx],
-        [0, intr.fy, intr.ppy],
-        [0, 0, 1],
-    ], dtype=np.float64)
-    dist_coeffs = np.array(intr.coeffs, dtype=np.float64)
+    camera_config = root.get("camera", {})
+    if not isinstance(camera_config, dict):
+        raise RuntimeError(f"{config_path} 中的 camera 配置无效")
+    return camera_config
 
-    return pipeline, camera_matrix, dist_coeffs
+
+def _read_manipulator_device(config_path):
+    """Read the stable manipulator serial path from the pipeline config."""
+    config_path = Path(config_path)
+    try:
+        with open(config_path, "r", encoding="utf-8") as stream:
+            root = yaml.safe_load(stream) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(f"无法读取抓取配置 {config_path}: {exc}") from exc
+
+    manipulator_config = root.get("manipulator", {})
+    if not isinstance(manipulator_config, dict):
+        raise RuntimeError(f"{config_path} 中的 manipulator 配置无效")
+    return expand_config_path(
+        manipulator_config.get("uart_device", "/dev/ttyACM0"))
+
+
+def _resolve_camera_type(camera_config, camera_override="auto"):
+    camera_type = (camera_override if camera_override != "auto" else
+                   camera_config.get("type", "realsense"))
+    if camera_type == "d435i":
+        return "realsense"
+    if camera_type not in ("realsense", "spacemit_las2"):
+        raise RuntimeError(f"不支持的相机后端: {camera_type}")
+    return camera_type
+
+
+def _create_pipeline_camera(camera_config, camera_type,
+                            las2_video_device=None, las2_calib_path=None):
+    backend_config = camera_config.get(camera_type)
+    if not isinstance(backend_config, dict):
+        raise RuntimeError(
+            f"缺少 camera.{camera_type} 相机配置")
+
+    if camera_type in ("realsense", "d435i"):
+        camera = RealSenseCalibrationCamera(
+            int(backend_config.get("width", 640)),
+            int(backend_config.get("height", 480)),
+            int(backend_config.get("fps", 30)))
+        return camera
+
+    video_device = las2_video_device or backend_config.get("video_device")
+    calib_path = las2_calib_path or backend_config.get("calib_path")
+    if not video_device or not calib_path:
+        raise RuntimeError(
+            "spacemit_las2 标定需要 "
+            "camera.spacemit_las2.video_device 和 calib_path")
+    return Las2CalibrationCamera(
+        video_device, expand_config_path(calib_path))
 
 
 def capture_frame(pipeline):
     """采集一帧彩色图"""
-    frames = pipeline.wait_for_frames()
-    return np.asanyarray(frames.get_color_frame().get_data())
+    return pipeline.capture()
 
 
 # ============================================================
@@ -357,6 +567,37 @@ def _format_detect_info(info):
     if info.get("board_type"):
         parts.append(f"board_type={info['board_type']}")
     return ", ".join(parts) if parts else "no diagnostic info"
+
+
+def _print_charuco_detection_hint(info):
+    """Print an actionable ChArUco hint from single or multi-frame stats."""
+    markers = info.get("max_markers", info.get("num_markers", 0)) or 0
+    corners = info.get(
+        "max_charuco_corners", info.get("num_charuco_corners", 0)) or 0
+    valid_frames = info.get("valid_frames")
+    num_frames = info.get("num_frames")
+
+    if markers <= 0:
+        print(
+            "    提示: 画面中没有识别到 marker，"
+            "请将整块标定板靠近、居中并正对相机。"
+        )
+    elif corners < 4:
+        print(f"    提示: 最多只看到 {markers} 个 marker / {corners} 个 ChArUco 角点。")
+        print("          请保证整块标定板在画面内，减小倾斜并向相机靠近。")
+        if markers >= 6 and corners == 0:
+            print("          若标定板已完整清晰，再检查行列数和 ArUco 字典。")
+    elif (valid_frames is not None and num_frames and
+          valid_frames < max(3, num_frames // 2)):
+        print(
+            f"    提示: 标定板一度可见，但只有 "
+            f"{valid_frames}/{num_frames} 帧稳定识别。"
+        )
+        print(
+            "          请松手后等机械臂停稳，保持标定板完整、清晰再采集。"
+        )
+    else:
+        print("    提示: 请减小倾斜，确保标定板完整且画面稳定。")
 
 
 def detect_charuco(image, camera_matrix, dist_coeffs,
@@ -489,7 +730,8 @@ def detect_aruco(image, camera_matrix, dist_coeffs, marker_length,
 
     # OpenCV 4.7+ 移除了 cv2.aruco.estimatePoseSingleMarkers,
     # 用官方推荐的 solvePnP + SOLVEPNP_IPPE_SQUARE 等价替代。
-    # 物点角点顺序必须与 detectMarkers 输出一致: 左上→右上→右下→左下 (顺时针)。
+    # 物点角点顺序必须与 detectMarkers 输出一致：
+    # 左上→右上→右下→左下（顺时针）。
     half = marker_length / 2.0
     obj_points = np.array([
         [-half,  half, 0.0],
@@ -568,7 +810,11 @@ def detect_aruco_averaged(pipeline, camera_matrix, dist_coeffs, marker_length,
         time.sleep(0.05)
 
     if len(rvecs_all) < num_frames // 2:
-        failed_vis = vis if vis is not None else image if image is not None else capture_frame(pipeline)
+        failed_vis = (
+            vis if vis is not None
+            else image if image is not None
+            else capture_frame(pipeline)
+        )
         info = {
             "detected": False,
             "valid_frames": len(rvecs_all),
@@ -658,7 +904,11 @@ def detect_board_averaged(pipeline, camera_matrix, dist_coeffs, args,
         time.sleep(0.05)
 
     if len(rvecs_all) < num_frames // 2:
-        failed_vis = vis if vis is not None else image if image is not None else capture_frame(pipeline)
+        failed_vis = (
+            vis if vis is not None
+            else image if image is not None
+            else capture_frame(pipeline)
+        )
         info = {
             "detected": False,
             "board_type": args.board_type,
@@ -754,8 +1004,14 @@ class URDFForwardKinematics:
             if parent is None or child is None:
                 continue
             origin = j.find('origin')
-            xyz = [float(v) for v in origin.get('xyz', '0 0 0').split()] if origin is not None else [0,0,0]
-            rpy = [float(v) for v in origin.get('rpy', '0 0 0').split()] if origin is not None else [0,0,0]
+            xyz = (
+                [float(v) for v in origin.get('xyz', '0 0 0').split()]
+                if origin is not None else [0, 0, 0]
+            )
+            rpy = (
+                [float(v) for v in origin.get('rpy', '0 0 0').split()]
+                if origin is not None else [0, 0, 0]
+            )
             parent_map[child] = (name, parent)
             joints_by_name[name] = {
                 'type': jtype, 'xyz': xyz, 'rpy': rpy,
@@ -1140,11 +1396,17 @@ def evaluate(results, R_g2b, t_g2b, R_t2c, t_t2c):
             best = name
             best_rot = mr
 
-    # 质量警告: 旋转误差偏高 = 标定姿态旋转多样性不足 (通常是腕滚转 joint5 没转)
+    # 旋转误差偏高通常表示标定姿态旋转多样性不足。
     if best_rot > 5.0:
         print(f"\n  ⚠ 警告: 最佳方法旋转误差 {best_rot:.1f}° 偏高 (理想 <2°)。")
-        print("    多半是采集时腕部 (joint4/joint5) 姿态变化太小, 标记朝向不够多样。")
-        print("    建议重新采集: 每组大幅转动腕滚转, 让标记正面/侧面/俯仰都覆盖到。")
+        print(
+            "    多半是采集时腕部 (joint4/joint5) 姿态变化太小，"
+            "标记朝向不够多样。"
+        )
+        print(
+            "    建议重新采集：每组大幅转动腕滚转，"
+            "让标记正面、侧面和俯仰方向都覆盖到。"
+        )
     return best, details
 
 
@@ -1166,6 +1428,9 @@ def check_capture_quality(T_bg, T_cm, info, accepted_T_bg, args):
         if distance > args.max_distance:
             reject_reasons.append(
                 f"marker too far: {distance:.3f}m > {args.max_distance:.3f}m")
+        elif distance > 0.30:
+            warnings.append(
+                f"marker distance {distance:.3f}m; 0.20~0.30m is recommended")
     if reproj is not None and reproj > args.max_reproj_error:
         reject_reasons.append(
             f"reprojection error too high: {reproj:.2f}px > {args.max_reproj_error:.2f}px")
@@ -1280,13 +1545,24 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python3 calibrate_hand_eye.py                           # 默认参数
+  python3 calibrate_hand_eye.py --config config/grasp_pipeline.yaml
   python3 calibrate_hand_eye.py --charuco-square-length 0.02 --num-poses 15
   python3 calibrate_hand_eye.py --device /dev/ttyACM1     # 指定串口
   python3 calibrate_hand_eye.py --manual-joints            # 手动输入关节角
 """)
+    ap.add_argument("--config", type=str,
+                    default=str(DEFAULT_PIPELINE_CONFIG),
+                    help="抓取配置，用于自动选择相机后端")
+    ap.add_argument("--camera-type",
+                    choices=["auto", "realsense", "spacemit_las2"],
+                    default="auto",
+                    help="相机后端，默认 auto（读取 --config）")
+    ap.add_argument("--las2-video-device", type=str, default=None,
+                    help="覆盖 camera.spacemit_las2.video_device")
+    ap.add_argument("--las2-calib-path", type=str, default=None,
+                    help="覆盖 camera.spacemit_las2.calib_path")
     ap.add_argument("--board-type", choices=["charuco", "aruco"], default="charuco",
-                    help="标定板类型: charuco(推荐) 或 aruco(兼容旧单码), 默认 charuco")
+                    help="标定板类型: charuco(推荐) 或 aruco(单码), 默认 charuco")
     ap.add_argument("--aruco-dict", type=str, default="4x4_50",
                     choices=sorted(ARUCO_DICTS.keys()),
                     help="ArUco 字典, 默认 4x4_50")
@@ -1302,24 +1578,29 @@ def main():
                     help="ChArUco 内部 ArUco marker 边长 (米), 默认 0.018")
     ap.add_argument("--num-poses", type=int, default=12,
                     help="采集姿态数, 默认 12 (最少 3, 建议 >=10)")
-    ap.add_argument("--device", type=str, default="/dev/ttyACM0")
+    ap.add_argument("--capture-settle-ms", type=int, default=500,
+                    help="按回车后等待机械臂和画面稳定的时间，默认 500ms")
+    ap.add_argument(
+        "--device", type=str, default=None,
+        help="机械臂串口，默认读取 --config 中的 manipulator.uart_device")
     ap.add_argument("--baudrate", type=int, default=1000000)
     ap.add_argument("--manual-joints", action="store_true",
                     help="手动输入关节角 (不连接机械臂)")
     ap.add_argument("--output", type=str, default=None,
                     help="输出路径, 默认 config/hand_eye_result.json")
     ap.add_argument("--save-images", type=str, default=None,
-                    help="兼容旧参数: 额外保存采集图像的目录")
+                    help="额外保存采集图像的目录")
     ap.add_argument("--dataset-dir", type=str, default=None,
-                    help="数据集目录。采集模式下可指定输出目录；--solve-only 下表示输入目录")
+                    help=("数据集目录；采集模式为输出目录，"
+                          "求解模式为输入目录"))
     ap.add_argument("--solve-only", action="store_true",
                     help="只从 --dataset-dir 读取已有数据集并重新求解")
     ap.add_argument("--apply-config", type=str, default=None,
-                    help="将最佳 T_base_camera 写回指定 grasp_pipeline.yaml (会自动备份)")
+                    help="将最佳 T_base_camera 写回配置文件并自动备份")
     ap.add_argument("--min-poses", type=int, default=10,
                     help="正式求解建议的最少有效姿态数, 默认 10")
     ap.add_argument("--min-relative-rotation-deg", type=float, default=15.0,
-                    help="新姿态与历史姿态至少需要形成的最大相对旋转, 默认 15°")
+                    help="姿态间至少需要达到的最大相对旋转, 默认 15°")
     ap.add_argument("--max-reproj-error", type=float, default=2.0,
                     help="单次标定板平均重投影误差上限(px), 默认 2.0")
     ap.add_argument("--min-marker-size-px", type=float, default=40.0,
@@ -1378,9 +1659,21 @@ def main():
             print(f"  备份文件: {backup}")
         return
 
+    try:
+        camera_config = _read_pipeline_camera_config(args.config)
+        camera_type = _resolve_camera_type(camera_config, args.camera_type)
+        if args.device is None:
+            args.device = _read_manipulator_device(args.config)
+    except Exception as exc:
+        sys.exit(f"错误: {exc}")
+
+    camera_name = ("spacemit_las2 logical-left camera"
+                   if camera_type == "spacemit_las2"
+                   else "RealSense D435i")
     print("=" * 60)
     print("  手眼标定 (Eye-to-Hand)")
-    print(f"  相机: D435i (固定)  标定板: {args.board_type} (贴在夹爪)")
+    print(f"  相机: {camera_name} (固定)  "
+          f"标定板: {args.board_type} (贴在夹爪)")
     print("=" * 60)
     if args.board_type == "charuco":
         print(f"  ChArUco: {args.charuco_squares_x}x{args.charuco_squares_y}, "
@@ -1417,14 +1710,22 @@ def main():
         print("\n[2/4] 手动输入模式")
 
     # ---- 3. 相机 ----
-    print("\n[3/4] 初始化 D435i ...")
+    print(f"\n[3/4] 初始化 {camera_name} ...")
     try:
-        pipeline, cam_mtx, cam_dist = init_realsense()
-        print(f"  OK: fx={cam_mtx[0,0]:.1f}, fy={cam_mtx[1,1]:.1f}")
-    except Exception as e:
+        camera = _create_pipeline_camera(
+            camera_config, camera_type,
+            args.las2_video_device, args.las2_calib_path)
+    except Exception as exc:
         if arm:
             close_so101(arm)
-        sys.exit(f"  错误: {e}")
+        sys.exit(f"  错误: {exc}")
+    pipeline = camera
+    cam_mtx = camera.camera_matrix
+    cam_dist = camera.dist_coeffs
+    print(f"  OK: {camera.metadata['width']}x{camera.metadata['height']} "
+          f"fx={cam_mtx[0,0]:.1f}, fy={cam_mtx[1,1]:.1f}")
+    if camera.metadata.get("backend") == "spacemit_las2":
+        print("  LAS2: 使用校正后逻辑左目 MJPEG，不启动深度推理")
 
     if args.save_images:
         os.makedirs(args.save_images, exist_ok=True)
@@ -1434,7 +1735,10 @@ def main():
     (dataset_dir / "images").mkdir(exist_ok=True)
     (dataset_dir / "samples").mkdir(exist_ok=True)
     if list((dataset_dir / "samples").glob("pose_*.json")):
-        sys.exit(f"错误: 数据集目录已有样本, 为避免混入旧数据请换一个目录: {dataset_dir}")
+        sys.exit(
+            "错误: 数据集目录已有样本，为避免混入其他数据请换一个目录: "
+            f"{dataset_dir}"
+        )
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "mode": "eye_to_hand_marker_on_gripper",
@@ -1448,12 +1752,7 @@ def main():
             "square_length_m": args.charuco_square_length,
             "marker_length_m": args.charuco_marker_length,
         },
-        "camera": {
-            "model": "RealSense D435i",
-            "width": 640,
-            "height": 480,
-            "fps": 30,
-        },
+        "camera": camera.metadata,
         "camera_matrix": cam_mtx.tolist(),
         "dist_coeffs": cam_dist.tolist(),
         "urdf_path": str(URDF_PATH),
@@ -1480,7 +1779,7 @@ def main():
     print("  3. 按回车采集 | 输入 s 预览 | 输入 q 结束")
     print()
     print("★ 标定质量要求:")
-    print("  - 标定板距相机 15~30cm (图像中 marker ≥40px)")
+    print("  - 标定板建议距相机 20~30cm (图像中 marker ≥40px)")
     print("  - 标定板尽量在图像中心区域")
     print("  - 每次至少变化 2 个关节, 旋转 >20°")
     print("  - 覆盖: 左/中/右 × 高/低 × 不同腕部角度")
@@ -1508,16 +1807,19 @@ def main():
             path = "/tmp/calibrate_preview.png"
             cv2.imwrite(path, vis)
             if T_cm is not None:
-                print(f"  ✓ 检测到标定板  位置: [{T_cm[0,3]:.4f}, {T_cm[1,3]:.4f}, {T_cm[2,3]:.4f}]")
+                print(
+                    "  ✓ 检测到标定板  位置: "
+                    f"[{T_cm[0,3]:.4f}, {T_cm[1,3]:.4f}, "
+                    f"{T_cm[2,3]:.4f}]"
+                )
                 if info.get("reprojection_error_px") is not None:
                     print(f"    reproj={info['reprojection_error_px']:.2f}px, "
                           f"size={info['marker_size_px']:.1f}px")
             else:
                 print("  ✗ 未检测到标定板")
                 print(f"    诊断: {_format_detect_info(info)}")
-                if args.board_type == "charuco" and info.get("num_markers", 0) > 0:
-                    print("    提示: 已检测到 ArUco marker，但没有匹配成 ChArUco 板。")
-                    print("          优先检查 --charuco-squares-x/--charuco-squares-y 是否和打印板一致。")
+                if args.board_type == "charuco":
+                    _print_charuco_detection_hint(info)
             print(f"  图像: {path}")
             continue
 
@@ -1540,6 +1842,9 @@ def main():
                 print("  ✗ 格式错误")
                 continue
 
+        if args.capture_settle_ms > 0:
+            time.sleep(args.capture_settle_ms / 1000.0)
+
         # FK
         T_bg = compute_fk(fk_solver, joints)
 
@@ -1549,9 +1854,8 @@ def main():
         if T_cm is None:
             print("  ✗ 未检测到标定板, 调整姿态使标定板朝向相机")
             print(f"    诊断: {_format_detect_info(detect_info)}")
-            if args.board_type == "charuco" and detect_info.get("max_markers", 0) > 0:
-                print("    提示: 已检测到 ArUco marker，但没有匹配成 ChArUco 板。")
-                print("          优先检查 --charuco-squares-x/--charuco-squares-y 是否和打印板一致。")
+            if args.board_type == "charuco":
+                _print_charuco_detection_hint(detect_info)
             continue
 
         ok, quality_info = check_capture_quality(
@@ -1562,7 +1866,10 @@ def main():
             print("  ✗ 样本质量不足，未收录:")
             for reason in quality_info["reject_reasons"]:
                 print(f"    - {reason}")
-            print("    可用 --no-quality-gate 临时允许低质量样本。")
+            print(
+                "    请调整距离、角度或姿态后重试；"
+                "--no-quality-gate 仅用于调试。"
+            )
             continue
 
         R_g2b.append(T_bg[:3, :3])
@@ -1593,7 +1900,8 @@ def main():
         print(f"    末端(基座系): [{T_bg[0,3]:.4f}, {T_bg[1,3]:.4f}, {T_bg[2,3]:.4f}]")
         print(f"    标定板(相机系): [{T_cm[0,3]:.4f}, {T_cm[1,3]:.4f}, {T_cm[2,3]:.4f}]")
         print(f"    质量: dist={marker_dist*100:.1f}cm, "
-              f"reproj={reproj:.2f}px, size={marker_size:.1f}px")
+              f"reproj={reproj:.2f}px, size={marker_size:.1f}px, "
+              f"frames={quality_info['detected_frames']}/{quality_info['num_frames']}")
         for warning in quality_info.get("warnings", []):
             print(f"    WARN: {warning}")
 

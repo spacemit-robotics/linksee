@@ -24,6 +24,14 @@ import check_runtime_env  # noqa: E402
 
 
 class RuntimeEnvDiagnosticsTest(unittest.TestCase):
+    def test_config_path_expands_user_home(self):
+        with mock.patch.dict(os.environ, {"HOME": "/home/annyi"}):
+            resolved = check_runtime_env.expand_config_path(
+                "~/las2_runtime/config/stereo.json")
+
+        self.assertEqual(
+            resolved, "/home/annyi/las2_runtime/config/stereo.json")
+
     def test_group_status_fails_when_group_is_configured_but_not_active(self):
         def fake_getgrgid(gid):
             names = {20: "dialout", 29: "audio", 1000: "annyi"}
@@ -168,6 +176,40 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         self.assertIn("RealSense D435i", output.getvalue())
         self.assertIn("not found", output.getvalue())
 
+    def test_so101_probe_finds_read_joints_in_named_build_directory(self):
+        tool = str(ROOT / "build_las2" / "read_joints")
+        result = SimpleNamespace(
+            returncode=0,
+            stdout="[ReadJoints] Current joints (rad): [1, 2, 3, 4, 5]",
+            stderr="",
+        )
+        with mock.patch.object(check_runtime_env.glob, "glob",
+                               return_value=[tool]), \
+                mock.patch.object(check_runtime_env.os.path, "isfile",
+                                  side_effect=lambda path: path == tool), \
+                mock.patch.object(check_runtime_env.os, "access",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env.subprocess, "run",
+                                  return_value=result) as run:
+            ok = check_runtime_env._probe_so101_device(
+                "/dev/ttyACM0", str(ROOT))
+
+        self.assertTrue(ok)
+        self.assertEqual(run.call_args.args[0][0], tool)
+        self.assertEqual(run.call_args.kwargs["cwd"], str(ROOT))
+
+    def test_las2_runtime_check_finds_core_in_named_build_directory(self):
+        build_dir = str(ROOT / "build_release")
+        executable = os.path.join(build_dir, "perceptive_grasp_core")
+        with mock.patch.object(check_runtime_env.glob, "glob",
+                               return_value=[build_dir]), \
+                mock.patch.object(check_runtime_env.os.path, "isfile",
+                                  side_effect=lambda path: path == executable), \
+                mock.patch.object(check_runtime_env.os, "access",
+                                  return_value=True):
+            self.assertEqual(
+                check_runtime_env._find_las2_application(), executable)
+
     def test_realsense_check_passes_when_d435i_video_device_exists(self):
         def fake_props(device):
             if device == "/dev/video3":
@@ -189,6 +231,230 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("/dev/video3", output.getvalue())
         self.assertIn("RealSense D435i", output.getvalue())
+
+    def test_las2_check_accepts_complete_runtime(self):
+        camera = {
+            "type": "spacemit_las2",
+            "spacemit_las2": {
+                "video_device": "/dev/video1",
+                "model_path": "/opt/las2/models/model.onnx",
+                "calib_path": "/opt/las2/config/stereo.json",
+                "core_count": 1,
+                "core_affinity": "8",
+            },
+        }
+        calibration = (
+            '{"image_size":[1920,1200],"left_camera_matrix":[], '
+            '"right_camera_matrix":[],"left_dist_coeffs":[], '
+            '"right_dist_coeffs":[],"R":[],"T":[]}'
+        )
+
+        def fake_isfile(path):
+            return path in {
+                "/opt/las2/models/model.onnx",
+                "/opt/las2/config/stereo.json",
+                "/opt/las2/lib/liblas2_usb_stereo.so",
+            }
+
+        with mock.patch.object(check_runtime_env.os.path, "exists",
+                               return_value=True), \
+                mock.patch.object(check_runtime_env.os.path, "isfile",
+                                  side_effect=fake_isfile), \
+                mock.patch.object(check_runtime_env.os, "access",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env,
+                                  "check_las2_capture_requirements",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env.subprocess, "run",
+                                  return_value=SimpleNamespace(
+                                      returncode=0, stdout="", stderr="")), \
+                mock.patch("builtins.open", return_value=io.StringIO(calibration)):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_las2_camera(camera, "/tmp/sdk")
+
+        self.assertTrue(ok)
+        self.assertIn("LAS2 video device", output.getvalue())
+        self.assertIn("LAS2 calibration fields", output.getvalue())
+        self.assertIn("liblas2_usb_stereo.so", output.getvalue())
+        self.assertIn("LAS2 runtime libraries", output.getvalue())
+
+    def test_las2_runtime_check_reports_missing_opencv(self):
+        result = SimpleNamespace(
+            returncode=0,
+            stdout="libopencv_calib3d.so.413 => not found\n",
+            stderr="",
+        )
+        with mock.patch.object(check_runtime_env.subprocess, "run",
+                               return_value=result):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env._check_las2_runtime_libraries(
+                    "/opt/las2/lib/liblas2_usb_stereo.so")
+
+        self.assertFalse(ok)
+        self.assertIn("libopencv_calib3d.so.413 => not found",
+                      output.getvalue())
+        self.assertIn("export LD_LIBRARY_PATH=", output.getvalue())
+
+    def test_las2_runtime_check_accepts_patched_application(self):
+        result = SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "liblas2_usb_stereo.so => /tmp/build/las2_runtime/"
+                "liblas2_usb_stereo.so\n"
+                "libopencv_calib3d.so.413 => /opt/las2/lib/opencv/"
+                "libopencv_calib3d.so.413\n"
+            ),
+            stderr="",
+        )
+        with mock.patch.object(check_runtime_env.subprocess, "run",
+                               return_value=result):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env._check_las2_runtime_libraries(
+                    "/opt/las2/lib/liblas2_usb_stereo.so",
+                    "/tmp/build/perceptive_grasp")
+
+        self.assertTrue(ok)
+        self.assertIn("via /tmp/build/perceptive_grasp", output.getvalue())
+
+    def test_las2_capture_check_rejects_one_fps_yuyv(self):
+        formats = """
+            [0]: 'MJPG'
+                Size: Discrete 4000x1200
+                    Interval: Discrete 0.033s (30.000 fps)
+            [1]: 'YUYV'
+                Size: Discrete 4000x1200
+                    Interval: Discrete 1.000s (1.000 fps)
+        """
+        result = SimpleNamespace(returncode=0, stdout=formats, stderr="")
+        with mock.patch.object(check_runtime_env.subprocess, "run",
+                               return_value=result), \
+                mock.patch.object(check_runtime_env.os.path, "exists",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env.os, "access",
+                                  return_value=True):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_las2_capture_requirements(
+                    "/dev/video1")
+
+        self.assertFalse(ok)
+        self.assertIn("advertised max is 1 fps", output.getvalue())
+
+    def test_las2_detector_rejects_spacemit_provider_without_free_cores(self):
+        root = {
+            "camera": {"spacemit_las2": {
+                "core_count": 8,
+                "core_affinity": "8,9,10,11,12,13,14,15",
+            }},
+            "detection": {"config_path": "yolov8_seg.yaml"},
+        }
+        detector = {
+            "default_params": {
+                "providers": ["SpaceMITExecutionProvider"],
+            },
+        }
+        with mock.patch.object(check_runtime_env.os.path, "isfile",
+                               return_value=True), \
+                mock.patch.object(check_runtime_env, "load_yaml",
+                                  return_value=detector):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_las2_detector_provider(
+                    root, "/opt/grasp/config/grasp_pipeline.yaml")
+
+        self.assertFalse(ok)
+        self.assertIn("reduce LAS2 core_count/affinity", output.getvalue())
+
+    def test_las2_detector_accepts_spacemit_provider_with_four_free_cores(self):
+        root = {
+            "camera": {"spacemit_las2": {
+                "core_count": 4,
+                "core_affinity": "8,9,10,11",
+            }},
+            "detection": {"config_path": "yolov8_seg.yaml"},
+        }
+        detector = {
+            "default_params": {
+                "num_threads": 4,
+                "providers": ["SpaceMITExecutionProvider"],
+            },
+        }
+        with mock.patch.object(check_runtime_env.os.path, "isfile",
+                               return_value=True), \
+                mock.patch.object(check_runtime_env, "load_yaml",
+                                  return_value=detector):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_las2_detector_provider(
+                    root, "/opt/grasp/config/grasp_pipeline.yaml")
+
+        self.assertTrue(ok)
+        self.assertIn("12,13,14,15", output.getvalue())
+
+    def test_las2_detector_rejects_cpu_provider(self):
+        root = {"detection": {"config_path": "yolov8_seg.yaml"}}
+        detector = {
+            "default_params": {
+                "providers": ["CPUExecutionProvider"],
+            },
+        }
+        with mock.patch.object(check_runtime_env.os.path, "isfile",
+                               return_value=True), \
+                mock.patch.object(check_runtime_env, "load_yaml",
+                                  return_value=detector):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_las2_detector_provider(
+                    root, "/opt/grasp/config/grasp_pipeline.yaml")
+
+        self.assertFalse(ok)
+        self.assertIn("YOLO must use SpaceMITExecutionProvider",
+                      output.getvalue())
+
+    def test_main_selects_las2_camera_check(self):
+        config = {
+            "camera": {
+                "type": "spacemit_las2",
+                "spacemit_las2": {},
+            },
+            "manipulator": {"uart_device": "/dev/ttyACM1"},
+            "mobile_base": {"enabled": False},
+        }
+        with mock.patch.object(check_runtime_env, "load_yaml",
+                               return_value=config), \
+                mock.patch.object(check_runtime_env, "report_serial_devices"), \
+                mock.patch.object(check_runtime_env,
+                                  "check_serial_role_configuration",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "check_tty",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "check_video_permissions",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env, "check_las2_camera",
+                                  return_value=True) as check_las2, \
+                mock.patch.object(check_runtime_env,
+                                  "check_las2_detector_provider",
+                                  return_value=True) as check_provider, \
+                mock.patch.object(check_runtime_env, "check_realsense_camera",
+                                  return_value=True) as check_realsense, \
+                mock.patch.object(check_runtime_env, "check_kinematics_backend",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env.os, "getcwd",
+                                  return_value=str(ROOT)), \
+                mock.patch.object(check_runtime_env.sys, "argv", [
+                    "check_runtime_env.py", "--config", "cfg.yaml",
+                    "--skip-voice",
+                ]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = check_runtime_env.main()
+
+        self.assertEqual(rc, 0)
+        check_las2.assert_called_once_with(config["camera"], mock.ANY)
+        check_provider.assert_called_once_with(config, "cfg.yaml")
+        check_realsense.assert_not_called()
 
     def test_kinematics_check_reports_missing_pinocchio_backend(self):
         cache_text = (
@@ -346,10 +612,10 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
 
     def test_main_checks_mobile_base_serial_device(self):
         config = {
+            "camera": {"type": "realsense", "realsense": {}},
             "manipulator": {"uart_device": "/dev/ttyACM2"},
             "mobile_base": {
                 "enabled": True,
-                "driver": "drv_uart_esp32",
                 "dev_path": "/dev/ttyACM1",
             },
         }
@@ -357,13 +623,16 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         with mock.patch.object(check_runtime_env, "load_yaml",
                                return_value=config), \
                 mock.patch.object(check_runtime_env, "report_serial_devices"), \
+                mock.patch.object(check_runtime_env,
+                                  "check_serial_role_configuration",
+                                  return_value=True), \
                 mock.patch.object(check_runtime_env, "check_tty",
                                   return_value=True) as check_tty, \
                 mock.patch.object(check_runtime_env, "check_realsense_camera",
                                   return_value=True), \
                 mock.patch.object(check_runtime_env,
                                   "check_chassis_driver_registered",
-                                  return_value=True), \
+                                  return_value=True) as check_driver, \
                 mock.patch.object(check_runtime_env, "check_video_permissions",
                                   return_value=True), \
                 mock.patch.object(check_runtime_env, "check_kinematics_backend",
@@ -385,9 +654,11 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         checked_devices = [call.args[0] for call in check_tty.call_args_list]
         self.assertIn("/dev/ttyACM2", checked_devices)
         self.assertIn("/dev/ttyACM1", checked_devices)
+        check_driver.assert_called_once_with(mock.ANY, "drv_uart_esp32")
 
     def test_main_checks_rpmsg_base_without_serial_base_suggestion(self):
         config = {
+            "camera": {"type": "realsense", "realsense": {}},
             "manipulator": {"uart_device": "/dev/ttyACM2"},
             "mobile_base": {
                 "enabled": True,

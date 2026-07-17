@@ -22,7 +22,7 @@ class MainRuntimeShutdownTest(unittest.TestCase):
 
     def test_voice_stdin_exit_forces_process_after_cleanup(self):
         match = re.search(
-            r"g_pipeline->Run\(\);(?P<body>.*?)return 0;",
+            r"g_pipeline->Run\(\);(?P<body>.*?)return exit_code;",
             self.source,
             re.DOTALL,
         )
@@ -31,7 +31,7 @@ class MainRuntimeShutdownTest(unittest.TestCase):
         body = match.group("body")
         self.assertIn("voice_stdin", body)
         self.assertIn("CleanupRuntime(false)", body)
-        self.assertIn("std::_Exit(0)", body)
+        self.assertIn("std::_Exit(exit_code)", body)
 
     def test_cleanup_runtime_does_not_stop_pipeline_twice(self):
         match = re.search(
@@ -44,6 +44,13 @@ class MainRuntimeShutdownTest(unittest.TestCase):
         self.assertIsNotNone(match, "missing CleanupRuntime")
         self.assertNotIn("g_pipeline->Stop()", match.group("body"))
 
+    def test_failed_task_returns_nonzero_exit_code(self):
+        self.assertIn(
+            "g_pipeline->GetState() == PipelineState::ERROR",
+            self.source,
+        )
+        self.assertIn("std::_Exit(exit_code)", self.source)
+
     def test_signal_handler_exits_without_blocking_cleanup(self):
         match = re.search(
             r"static void SignalHandler\(int sig\) \{(?P<body>.*?)\n\}",
@@ -55,6 +62,19 @@ class MainRuntimeShutdownTest(unittest.TestCase):
         body = match.group("body")
         self.assertNotIn("CleanupRuntime()", body)
         self.assertIn("std::_Exit", body)
+
+    def test_status_event_uses_one_low_level_write(self):
+        match = re.search(
+            r"static void WriteStatusEvent\(PipelineState state, "
+            r"const std::string& msg\) \{(?P<body>.*?)\n\}",
+            self.source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(match, "missing atomic status writer")
+        body = match.group("body")
+        self.assertIn('"VOICE_STATUS\\t" + MakeStatusEvent', body)
+        self.assertIn("write(STDOUT_FILENO, line.data(), line.size())", body)
 
 
 if __name__ == "__main__":

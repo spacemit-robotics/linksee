@@ -27,7 +27,9 @@ from tts_node import (
 
 
 STATUS_PREFIX = "VOICE_STATUS\t"
-VOICE_BRIDGE_VERSION = "2026-07-02-asr-format-probe-v6"
+READY_LOG_LINE = "[Pipeline] IDLE | Ready"
+READY_STATUS_EVENT = "state=IDLE;message=Ready"
+VOICE_BRIDGE_VERSION = "2026-07-16-atomic-status-v7"
 CAPTURE_RATE_CANDIDATES = (48000, 44100, 32000, 16000, 8000)
 WAITING_PROMPT = "请继续说要抓取的物体。"
 
@@ -49,9 +51,11 @@ def build_grasp_command(binary: str, config: str,
 
 def extract_status_event(line: str) -> Optional[str]:
     """Return a status event from a prefixed stdout line."""
-    if not line.startswith(STATUS_PREFIX):
+    prefix_offset = line.find(STATUS_PREFIX)
+    if prefix_offset < 0:
         return None
-    return line[len(STATUS_PREFIX):].strip()
+    event = line[prefix_offset + len(STATUS_PREFIX):].strip()
+    return event if event.startswith("state=") else None
 
 
 def parse_status_fields(event: str) -> Dict[str, str]:
@@ -142,6 +146,8 @@ def _read_grasp_stdout(proc, text_queue, running, reverse_aliases,
             break
         line = line.rstrip()
         event = extract_status_event(line)
+        if event is None and line == READY_LOG_LINE:
+            event = READY_STATUS_EVENT
         if event is None:
             print(line, flush=True)
             continue

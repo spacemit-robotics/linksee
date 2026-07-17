@@ -11,6 +11,8 @@
     *   ./perceptive_grasp --config config/grasp_pipeline.yaml --loop
     */
 
+#include <algorithm>
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -158,9 +161,19 @@ static std::string MakeStatusEvent(PipelineState state,
     return oss.str();
 }
 
+static void WriteStatusEvent(PipelineState state, const std::string& msg) {
+    const std::string line =
+        "VOICE_STATUS\t" + MakeStatusEvent(state, msg) + "\n";
+    ssize_t written;
+    do {
+        written = write(STDOUT_FILENO, line.data(), line.size());
+    } while (written < 0 && errno == EINTR);
+}
+
 static void SignalHandler(int sig) {
     const char msg[] = "\n[Main] Signal received, exiting...\n";
-    (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    const ssize_t written = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)written;
     std::_Exit(128 + sig);
 }
 
@@ -189,6 +202,29 @@ static void PrintUsage(const char* prog) {
                 << " --config config/grasp_pipeline.yaml --target banana --step\n";
 }
 
+static void ResolveConfigPath(const fs::path& config_dir,
+                              std::string* path) {
+    if (path == nullptr || path->empty()) return;
+
+    std::string expanded = *path;
+    const char* home = std::getenv("HOME");
+    if (home != nullptr) {
+        if (expanded == "~") {
+            expanded = home;
+        } else if (expanded.rfind("~/", 0) == 0) {
+            expanded = (fs::path(home) / expanded.substr(2)).string();
+        } else if (expanded.rfind("$HOME/", 0) == 0) {
+            expanded = (fs::path(home) / expanded.substr(6)).string();
+        }
+    }
+
+    fs::path resolved(expanded);
+    if (!resolved.is_absolute()) {
+        resolved = config_dir / resolved;
+    }
+    *path = fs::weakly_canonical(resolved).string();
+}
+
 static PipelineConfig LoadConfig(const std::string& config_path) {
     PipelineConfig cfg;
 
@@ -196,22 +232,71 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
 
     // Camera
     if (auto cam = root["camera"]) {
-        cfg.camera.width = cam["width"].as<int>(640);
-        cfg.camera.height = cam["height"].as<int>(480);
-        cfg.camera.fps = cam["fps"].as<int>(30);
-        cfg.camera.align_depth = cam["align_depth"].as<bool>(true);
-        if (auto df = cam["depth_filter"]) {
-            cfg.camera.spatial_filter = df["spatial"].as<bool>(true);
-            cfg.camera.temporal_filter = df["temporal"].as<bool>(true);
-            cfg.camera.hole_filling = df["hole_filling"].as<bool>(true);
+        cfg.camera.type = cam["type"].as<std::string>(cfg.camera.type);
+        if (cfg.camera.type == "realsense" ||
+            cfg.camera.type == "d435i") {
+            auto& settings = cfg.camera.realsense;
+            if (auto realsense = cam["realsense"]) {
+                settings.width = realsense["width"].as<int>(settings.width);
+                settings.height = realsense["height"].as<int>(settings.height);
+                settings.fps = realsense["fps"].as<int>(settings.fps);
+                settings.motion_flush_frames = std::max(
+                    0, realsense["motion_flush_frames"].as<int>(
+                           settings.motion_flush_frames));
+                settings.align_depth =
+                    realsense["align_depth"].as<bool>(settings.align_depth);
+                if (auto depth_filter = realsense["depth_filter"]) {
+                    settings.spatial_filter =
+                        depth_filter["spatial"].as<bool>(
+                            settings.spatial_filter);
+                    settings.temporal_filter =
+                        depth_filter["temporal"].as<bool>(
+                            settings.temporal_filter);
+                    settings.hole_filling =
+                        depth_filter["hole_filling"].as<bool>(
+                            settings.hole_filling);
+                }
+            }
+        } else if (cfg.camera.type == "spacemit_las2") {
+            auto las2 = cam["spacemit_las2"];
+            if (!las2 || !las2.IsMap()) {
+                throw std::runtime_error(
+                    "camera.spacemit_las2 configuration is required");
+            }
+            auto& settings = cfg.camera.spacemit_las2;
+            settings.video_device = las2["video_device"].as<std::string>(
+                settings.video_device);
+            settings.model_path = las2["model_path"].as<std::string>(
+                settings.model_path);
+            settings.calib_path = las2["calib_path"].as<std::string>(
+                settings.calib_path);
+            settings.core_count =
+                las2["core_count"].as<int>(settings.core_count);
+            settings.core_affinity = las2["core_affinity"].as<std::string>(
+                settings.core_affinity);
+            if (auto depth = las2["depth"]) {
+                settings.min_depth_m =
+                    depth["min_m"].as<float>(settings.min_depth_m);
+                settings.max_depth_m =
+                    depth["max_m"].as<float>(settings.max_depth_m);
+            }
+        } else {
+            throw std::runtime_error("unsupported camera.type: " +
+                                     cfg.camera.type);
         }
     }
 
     // Detection
     if (auto det = root["detection"]) {
-        cfg.detector.config_path = det["config_path"].as<std::string>("");
-        cfg.detector.min_confidence = det["min_confidence"].as<float>(0.5f);
-        cfg.detector.min_area = det["min_area"].as<float>(1000.0f);
+        cfg.detector.config_path = det["config_path"].as<std::string>(
+            cfg.detector.config_path);
+        cfg.detector.min_confidence = det["min_confidence"].as<float>(
+            cfg.detector.min_confidence);
+        cfg.detector.min_area = det["min_area"].as<float>(
+            cfg.detector.min_area);
+        cfg.detect_stable_frames =
+            std::max(1, det["stable_frames"].as<int>(
+                            cfg.detect_stable_frames));
         if (auto labels = det["target_labels"]) {
             for (size_t i = 0; i < labels.size(); i++) {
                 cfg.detector.target_labels.push_back(labels[i].as<int>());
@@ -235,43 +320,59 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
 
     // Grasp strategy
     if (auto g = root["grasp"]) {
-        cfg.planner.approach_height = g["approach_height"].as<float>(0.10f);
-        cfg.planner.grasp_depth = g["grasp_depth"].as<float>(0.02f);
-        cfg.planner.gripper_offset = g["gripper_offset"].as<float>(0.015f);
-        cfg.grasp_point_x_ratio = g["grasp_point_x_ratio"].as<float>(0.0f);
-        cfg.executor.gripper_open = g["gripper_open"].as<float>(1.0f);
-        cfg.executor.gripper_effort = g["gripper_effort"].as<float>(0.8f);
+        cfg.planner.approach_height = g["approach_height"].as<float>(
+            cfg.planner.approach_height);
+        cfg.planner.grasp_depth = g["grasp_depth"].as<float>(
+            cfg.planner.grasp_depth);
+        cfg.planner.gripper_offset = g["gripper_offset"].as<float>(
+            cfg.planner.gripper_offset);
+        cfg.grasp_point_x_ratio = g["grasp_point_x_ratio"].as<float>(
+            cfg.grasp_point_x_ratio);
+        cfg.executor.gripper_open = g["gripper_open"].as<float>(
+            cfg.executor.gripper_open);
+        cfg.executor.gripper_effort = g["gripper_effort"].as<float>(
+            cfg.executor.gripper_effort);
         cfg.executor.gripper_hold_load_threshold =
             g["gripper_hold_load_threshold"].as<float>(
                 cfg.executor.gripper_hold_load_threshold);
+        cfg.executor.gripper_empty_position_margin =
+            g["gripper_empty_position_margin"].as<float>(
+                cfg.executor.gripper_empty_position_margin);
         cfg.executor.gripper_timeout_ms =
             g["gripper_timeout_ms"].as<int>(
                 cfg.executor.gripper_timeout_ms);
         if (auto ws = g["workspace"]) {
-            cfg.planner.workspace.x_min = ws["x_min"].as<float>(-0.15f);
-            cfg.planner.workspace.x_max = ws["x_max"].as<float>(0.25f);
-            cfg.planner.workspace.y_min = ws["y_min"].as<float>(-0.15f);
-            cfg.planner.workspace.y_max = ws["y_max"].as<float>(0.15f);
-            cfg.planner.workspace.z_min = ws["z_min"].as<float>(-0.05f);
-            cfg.planner.workspace.z_max = ws["z_max"].as<float>(0.20f);
+            auto& workspace = cfg.planner.workspace;
+            workspace.x_min = ws["x_min"].as<float>(workspace.x_min);
+            workspace.x_max = ws["x_max"].as<float>(workspace.x_max);
+            workspace.y_min = ws["y_min"].as<float>(workspace.y_min);
+            workspace.y_max = ws["y_max"].as<float>(workspace.y_max);
+            workspace.z_min = ws["z_min"].as<float>(workspace.z_min);
+            workspace.z_max = ws["z_max"].as<float>(workspace.z_max);
         }
     }
 
     // Orientation (自动夹爪方向对齐)
     if (auto ori = root["orientation"]) {
-        cfg.auto_orient = ori["enabled"].as<bool>(true);
+        cfg.auto_orient = ori["enabled"].as<bool>(cfg.auto_orient);
         cfg.orientation.aspect_ratio_threshold =
-            ori["aspect_ratio_threshold"].as<float>(1.5f);
+            ori["aspect_ratio_threshold"].as<float>(
+                cfg.orientation.aspect_ratio_threshold);
         cfg.orientation.camera_yaw_offset =
-            ori["camera_yaw_offset"].as<float>(0.0f);
+            ori["camera_yaw_offset"].as<float>(
+                cfg.orientation.camera_yaw_offset);
     }
 
     // Manipulator
     if (auto m = root["manipulator"]) {
-        cfg.executor.manip_driver = m["driver"].as<std::string>("so101");
-        cfg.executor.uart_device = m["uart_device"].as<std::string>("/dev/ttyACM0");
-        cfg.executor.baudrate = m["baudrate"].as<int>(1000000);
-        cfg.executor.urdf_path = m["urdf_path"].as<std::string>("");
+        cfg.executor.manip_driver = m["driver"].as<std::string>(
+            cfg.executor.manip_driver);
+        cfg.executor.uart_device = m["uart_device"].as<std::string>(
+            cfg.executor.uart_device);
+        cfg.executor.baudrate = m["baudrate"].as<int>(
+            cfg.executor.baudrate);
+        cfg.executor.urdf_path = m["urdf_path"].as<std::string>(
+            cfg.executor.urdf_path);
 
         // 解析 URDF 相对路径: 相对于配置文件所在目录
         if (!cfg.executor.urdf_path.empty() &&
@@ -283,10 +384,14 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             }
         }
 
-        cfg.executor.base_link = m["base_link"].as<std::string>("base_link");
-        cfg.executor.tip_link = m["tip_link"].as<std::string>("Fixed_Jaw");
-        cfg.executor.move_speed = m["move_speed"].as<float>(0.5f);
-        cfg.executor.line_speed = m["line_speed"].as<float>(0.3f);
+        cfg.executor.base_link = m["base_link"].as<std::string>(
+            cfg.executor.base_link);
+        cfg.executor.tip_link = m["tip_link"].as<std::string>(
+            cfg.executor.tip_link);
+        cfg.executor.move_speed = m["move_speed"].as<float>(
+            cfg.executor.move_speed);
+        cfg.executor.line_speed = m["line_speed"].as<float>(
+            cfg.executor.line_speed);
         cfg.executor.pose_position_tolerance =
             m["pose_position_tolerance"].as<float>(
                 cfg.executor.pose_position_tolerance);
@@ -395,6 +500,9 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             base["x_tolerance"].as<float>(cfg.mobile_base.x_tolerance);
         cfg.mobile_base.y_tolerance =
             base["y_tolerance"].as<float>(cfg.mobile_base.y_tolerance);
+        cfg.mobile_base.y_hysteresis =
+            base["y_hysteresis"].as<float>(
+                cfg.mobile_base.y_hysteresis);
         cfg.mobile_base.max_step_m =
             base["max_step_m"].as<float>(cfg.mobile_base.max_step_m);
         cfg.mobile_base.linear_speed =
@@ -406,6 +514,9 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         cfg.mobile_base.min_cmd_duration_ms =
             base["min_cmd_duration_ms"].as<int>(
                 cfg.mobile_base.min_cmd_duration_ms);
+        cfg.mobile_base.min_rotation_duration_ms =
+            base["min_rotation_duration_ms"].as<int>(
+                cfg.mobile_base.min_rotation_duration_ms);
         cfg.mobile_base.max_cmd_duration_ms =
             base["max_cmd_duration_ms"].as<int>(
                 cfg.mobile_base.max_cmd_duration_ms);
@@ -414,6 +525,18 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         cfg.mobile_base.max_align_attempts =
             base["max_align_attempts"].as<int>(
                 cfg.mobile_base.max_align_attempts);
+        cfg.mobile_base.min_progress_m =
+            base["min_progress_m"].as<float>(
+                cfg.mobile_base.min_progress_m);
+        cfg.mobile_base.min_progress_ratio =
+            base["min_progress_ratio"].as<float>(
+                cfg.mobile_base.min_progress_ratio);
+        cfg.mobile_base.min_progress_floor_m =
+            base["min_progress_floor_m"].as<float>(
+                cfg.mobile_base.min_progress_floor_m);
+        cfg.mobile_base.max_total_travel_m =
+            base["max_total_travel_m"].as<float>(
+                cfg.mobile_base.max_total_travel_m);
     }
 
     // Timing between pipeline/executor stages
@@ -432,11 +555,14 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             timing["grasp_settle_ms"].as<int>(t.grasp_settle_ms);
         t.gripper_close_wait_ms =
             timing["gripper_close_wait_ms"].as<int>(t.gripper_close_wait_ms);
-        t.grasp_check_count =
-            timing["grasp_check_count"].as<int>(t.grasp_check_count);
-        t.grasp_check_interval_ms =
-            timing["grasp_check_interval_ms"].as<int>(
-                t.grasp_check_interval_ms);
+        t.grasp_check_count = std::max(
+            1, timing["grasp_check_count"].as<int>(t.grasp_check_count));
+        t.grasp_check_interval_ms = std::max(
+            1, timing["grasp_check_interval_ms"].as<int>(
+                   t.grasp_check_interval_ms));
+        t.post_lift_settle_ms = std::max(
+            0, timing["post_lift_settle_ms"].as<int>(
+                   t.post_lift_settle_ms));
         t.place_settle_ms =
             timing["place_settle_ms"].as<int>(t.place_settle_ms);
         t.release_wait_ms =
@@ -505,6 +631,11 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             for (size_t i = 0; i < words.size(); i++)
                 cfg.voice.cancel_words.push_back(words[i].as<std::string>());
         }
+        if (auto words = voice["home_words"]) {
+            cfg.voice.home_words.clear();
+            for (size_t i = 0; i < words.size(); i++)
+                cfg.voice.home_words.push_back(words[i].as<std::string>());
+        }
         if (auto aliases = voice["target_aliases"]) {
             cfg.voice.target_aliases.clear();
             for (auto it = aliases.begin(); it != aliases.end(); ++it) {
@@ -531,6 +662,21 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         }
     }
     cfg.executor.performance_log_enabled = cfg.performance_log_enabled;
+
+    const auto validate_normalized = [](const char* name, float value) {
+        if (value < 0.0f || value > 1.0f) {
+            throw std::runtime_error(std::string(name) +
+                                     " must be in [0, 1]");
+        }
+    };
+    validate_normalized("grasp.gripper_open", cfg.executor.gripper_open);
+    validate_normalized("grasp.gripper_effort", cfg.executor.gripper_effort);
+    validate_normalized("place.release_open",
+                        cfg.executor.place_release_open);
+    if (cfg.executor.gripper_empty_position_margin < 0.0f) {
+        throw std::runtime_error(
+            "grasp.gripper_empty_position_margin must be non-negative");
+    }
 
     return cfg;
 }
@@ -638,15 +784,11 @@ int main(int argc, char* argv[]) {
     fs::path config_dir = fs::path(config_path).parent_path();
     if (config_dir.empty()) config_dir = ".";
 
-    auto resolve_path = [&](std::string& p) {
-        if (!p.empty() && !fs::path(p).is_absolute()) {
-            fs::path resolved = fs::weakly_canonical(config_dir / p);
-            p = resolved.string();
-        }
-    };
-    resolve_path(cfg.executor.urdf_path);
-    resolve_path(cfg.detector.config_path);
-    resolve_path(cfg.debug_output_dir);
+    ResolveConfigPath(config_dir, &cfg.executor.urdf_path);
+    ResolveConfigPath(config_dir, &cfg.detector.config_path);
+    ResolveConfigPath(config_dir, &cfg.debug_output_dir);
+    ResolveConfigPath(config_dir, &cfg.camera.spacemit_las2.model_path);
+    ResolveConfigPath(config_dir, &cfg.camera.spacemit_las2.calib_path);
 
     // 创建并初始化 Pipeline
     g_pipeline = std::make_unique<GraspPipeline>(cfg);
@@ -697,13 +839,14 @@ int main(int argc, char* argv[]) {
         });
     }
 
-    // 状态回调：可接 ROS2 TTS topic，也可输出到本地 stdout 供非 ROS TTS 桥读取。
+    // 状态回调可接 ROS2 TTS topic，也可输出到 stdout 供本地语音桥读取。
     g_pipeline->SetCallback([status_stdout](PipelineState state,
                                             const std::string& msg) {
         if (msg.empty()) return;
         if (status_stdout) {
-            std::cout << "VOICE_STATUS\t" << MakeStatusEvent(state, msg)
-                        << std::endl;
+            // A single write keeps third-party worker logs from splitting the
+            // machine-readable status event between its prefix and payload.
+            WriteStatusEvent(state, msg);
         }
 #ifdef ENABLE_ROS2_VOICE
         if (g_voice_listener) {
@@ -741,15 +884,27 @@ int main(int argc, char* argv[]) {
 
     // 主循环
     g_pipeline->Run();
+    const int exit_code = g_pipeline->GetState() == PipelineState::ERROR
+        ? 1
+        : 0;
 
     if (voice_stdin) {
         CleanupRuntime(false);
         std::cout << std::flush;
         std::cerr << std::flush;
-        std::_Exit(0);
+        std::_Exit(exit_code);
     }
 
     CleanupRuntime();
 
-    return 0;
+    if (cfg.camera.type == "spacemit_las2") {
+        // All application resources have already been released above. The
+        // LAS2/OpenCL runtime can block in process-wide static
+        // destructors, so bypass only that third-party teardown path.
+        std::cout << std::flush;
+        std::cerr << std::flush;
+        std::_Exit(exit_code);
+    }
+
+    return exit_code;
 }

@@ -61,6 +61,26 @@ class LocalVoiceBridgeTest(unittest.TestCase):
         )
         self.assertIsNone(local_voice_bridge.extract_status_event("[Pipeline] log"))
 
+    def test_extract_status_event_accepts_interleaved_prefix(self):
+        line = (
+            "[CHASSIS-UART-DIFF] RX thread started"
+            f"{local_voice_bridge.STATUS_PREFIX}"
+            "state=IDLE;message=Ready"
+        )
+
+        self.assertEqual(
+            local_voice_bridge.extract_status_event(line),
+            "state=IDLE;message=Ready",
+        )
+
+    def test_extract_status_event_rejects_corrupted_payload(self):
+        line = (
+            f"{local_voice_bridge.STATUS_PREFIX}"
+            "[CHASSIS-UART-DIFF] RX thread started"
+        )
+
+        self.assertIsNone(local_voice_bridge.extract_status_event(line))
+
     def test_default_asr_channels_match_mono_usb_microphone(self):
         self.assertEqual(local_voice_bridge.default_asr_channels({}), 1)
 
@@ -218,10 +238,17 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
 
         self.assertEqual(
             set(config["voice"]["asr"].keys()),
-            {"device", "rate", "channels"},
+            {
+                "device",
+                "rate",
+                "channels",
+                "vad_trigger_threshold",
+                "vad_stop_threshold",
+                "vad_min_speech_duration_ms",
+            },
         )
-        self.assertEqual(config["voice"]["asr"]["rate"], 16000)
         self.assertEqual(config["voice"]["asr"]["device"], 1)
+        self.assertEqual(config["voice"]["asr"]["rate"], 16000)
         self.assertEqual(config["voice"]["asr"]["channels"], 1)
 
     def test_pipeline_config_enables_local_tts_on_usb_audio_output(self):
@@ -231,7 +258,16 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
 
         self.assertEqual(
             set(config["voice"]["tts"].keys()),
-            {"playback_device", "mixer_volume"},
+            {
+                "engine",
+                "playback_device",
+                "playback_rate",
+                "channels",
+                "speed",
+                "volume",
+                "mixer_volume",
+                "speak_all_states",
+            },
         )
         self.assertEqual(config["voice"]["tts"]["playback_device"], 1)
         self.assertGreaterEqual(config["voice"]["tts"]["mixer_volume"], -1)
@@ -246,12 +282,16 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
             set(config["voice"].keys()),
             {
                 "trigger_words",
+                "cancel_words",
+                "home_words",
+                "split_command_timeout_ms",
                 "asr",
                 "tts",
-                "cancel_words",
                 "target_aliases",
             },
         )
+        main_source = (ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
+        self.assertIn('voice["home_words"]', main_source)
 
     def test_tts_mixer_volume_targets_playback_hw_card(self):
         devices = [
@@ -446,6 +486,39 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         self.assertIn("[VoiceBridge] Queue TTS: 收到，准备抓取香蕉。",
                       output.getvalue())
         self.assertEqual(text_queue.get_nowait(), "收到，准备抓取香蕉。")
+
+    def test_ready_log_is_used_when_ready_status_is_missing(self):
+        class FakeStdout:
+            def __init__(self):
+                self.lines = [
+                    f"{local_voice_bridge.READY_LOG_LINE}\n",
+                    "",
+                ]
+
+            def readline(self):
+                return self.lines.pop(0)
+
+        class FakeProc:
+            stdout = FakeStdout()
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+        text_queue = queue.Queue()
+        status_queue = queue.Queue()
+        running = local_voice_bridge.make_running_event()
+
+        local_voice_bridge._read_grasp_stdout(
+            FakeProc(), text_queue, running, {}, False, status_queue)
+
+        self.assertEqual(
+            status_queue.get_nowait(),
+            local_voice_bridge.READY_STATUS_EVENT,
+        )
+        self.assertEqual(text_queue.get_nowait(), "系统已就绪。")
 
     def test_cancel_status_is_spoken_without_torque_release(self):
         event = "state=IDLE;message=Cancelling; keeping observe pose"

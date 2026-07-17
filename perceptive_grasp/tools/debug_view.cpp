@@ -12,8 +12,8 @@
     *   ./debug_view --config ../config/grasp_pipeline.yaml --no-detect
     *
     * 功能:
-    *   1. 打开 RealSense D435i 相机
-    *   2. 抓取 RGB + Depth 帧
+    *   1. 根据主配置打开立体相机后端
+    *   2. 抓取对齐的彩色图和深度图
     *   3. (可选) 运行 VisionService 检测并绘制 bbox
     *   4. 保存图像到指定目录
     *
@@ -24,20 +24,26 @@
     *   <output>/frame_001_result.txt    - 检测结果文本
     */
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
-#include <librealsense2/rs.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <yaml-cpp/yaml.h>
+
+#include "stereo_camera.h"
 
 #ifndef NO_VISION_SERVICE
 #include "vision_service.h"
@@ -47,6 +53,107 @@
 namespace fs = std::filesystem;
 
 static constexpr const char* kDefaultConfigPath = "../config/grasp_pipeline.yaml";
+
+struct DebugViewConfig {
+    perceptive_grasp::StereoCameraConfig camera;
+    std::string detection_config_path = "yolov8_seg.yaml";
+};
+
+static void ResolveConfigPath(const fs::path& config_dir,
+                              std::string* path) {
+    if (path == nullptr || path->empty()) return;
+
+    std::string expanded = *path;
+    const char* home = std::getenv("HOME");
+    if (home != nullptr) {
+        if (expanded == "~") {
+            expanded = home;
+        } else if (expanded.rfind("~/", 0) == 0) {
+            expanded = (fs::path(home) / expanded.substr(2)).string();
+        } else if (expanded.rfind("$HOME/", 0) == 0) {
+            expanded = (fs::path(home) / expanded.substr(6)).string();
+        }
+    }
+
+    fs::path resolved(expanded);
+    if (!resolved.is_absolute()) resolved = config_dir / resolved;
+    *path = fs::weakly_canonical(resolved).string();
+}
+
+static DebugViewConfig LoadDebugViewConfig(const std::string& config_path) {
+    DebugViewConfig config;
+    const YAML::Node root = YAML::LoadFile(config_path);
+    const YAML::Node camera = root["camera"];
+    if (!camera || !camera.IsMap()) {
+        throw std::runtime_error("camera configuration is required");
+    }
+
+    config.camera.type = camera["type"].as<std::string>(config.camera.type);
+    if (config.camera.type == "realsense" ||
+        config.camera.type == "d435i") {
+        const YAML::Node realsense = camera["realsense"];
+        if (realsense) {
+            auto& settings = config.camera.realsense;
+            settings.width = realsense["width"].as<int>(settings.width);
+            settings.height = realsense["height"].as<int>(settings.height);
+            settings.fps = realsense["fps"].as<int>(settings.fps);
+            settings.motion_flush_frames =
+                realsense["motion_flush_frames"].as<int>(
+                    settings.motion_flush_frames);
+            settings.align_depth = realsense["align_depth"].as<bool>(
+                settings.align_depth);
+            if (const YAML::Node filters = realsense["depth_filter"]) {
+                settings.spatial_filter = filters["spatial"].as<bool>(
+                    settings.spatial_filter);
+                settings.temporal_filter = filters["temporal"].as<bool>(
+                    settings.temporal_filter);
+                settings.hole_filling = filters["hole_filling"].as<bool>(
+                    settings.hole_filling);
+            }
+        }
+    } else if (config.camera.type == "spacemit_las2") {
+        const YAML::Node las2 = camera["spacemit_las2"];
+        if (!las2 || !las2.IsMap()) {
+            throw std::runtime_error(
+                "camera.spacemit_las2 configuration is required");
+        }
+        auto& settings = config.camera.spacemit_las2;
+        settings.video_device = las2["video_device"].as<std::string>(
+            settings.video_device);
+        settings.model_path = las2["model_path"].as<std::string>(
+            settings.model_path);
+        settings.calib_path = las2["calib_path"].as<std::string>(
+            settings.calib_path);
+        settings.core_count = las2["core_count"].as<int>(
+            settings.core_count);
+        settings.core_affinity = las2["core_affinity"].as<std::string>(
+            settings.core_affinity);
+        if (const YAML::Node depth = las2["depth"]) {
+            settings.min_depth_m = depth["min_m"].as<float>(
+                settings.min_depth_m);
+            settings.max_depth_m = depth["max_m"].as<float>(
+                settings.max_depth_m);
+        }
+    } else {
+        throw std::runtime_error("unsupported camera.type: " +
+                                 config.camera.type);
+    }
+
+    if (const YAML::Node detection = root["detection"]) {
+        config.detection_config_path =
+            detection["config_path"].as<std::string>(
+                config.detection_config_path);
+    }
+
+    fs::path config_dir = fs::path(config_path).parent_path();
+    if (config_dir.empty()) config_dir = ".";
+    ResolveConfigPath(config_dir,
+                      &config.camera.spacemit_las2.model_path);
+    ResolveConfigPath(config_dir,
+                      &config.camera.spacemit_las2.calib_path);
+    ResolveConfigPath(config_dir, &config.detection_config_path);
+    return config;
+}
 
 // ============ 颜色表 (用于绘制不同类别) ============
 static const cv::Scalar COLORS[] = {
@@ -91,22 +198,26 @@ int main(int argc, char* argv[]) {
     std::string output_dir = "debug_view_output";
     int num_frames = 1;
     bool do_detect = true;
-    int warmup_frames = 30;
+    int warmup_frames = -1;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                         << "Options:\n"
-                        << "  --config <yaml>    Pipeline config (default: ../config/grasp_pipeline.yaml)\n"
-                        << "  --output <dir>     Output directory (default: ./debug_output)\n"
+                        << "  --config <yaml>    Pipeline config "
+                           "(default: ../config/grasp_pipeline.yaml)\n"
+                        << "  --output <dir>     Output directory "
+                           "(default: ./debug_view_output)\n"
                         << "  --frames <N>       Number of frames to capture (default: 1)\n"
                         << "  --no-detect        Skip detection, only save raw images\n"
-                        << "  --warmup <N>       Warmup frames for auto-exposure (default: 30)\n"
+                        << "  --warmup <N>       Override backend warmup frame count\n"
                         << "  --help             Show this help\n"
                         << "\nExamples:\n"
                         << "  " << argv[0] << " --config ../config/grasp_pipeline.yaml\n"
-                        << "  " << argv[0] << " --config ../config/grasp_pipeline.yaml --frames 5 --output /tmp/debug\n"
+                        << "  " << argv[0]
+                        << " --config ../config/grasp_pipeline.yaml "
+                           "--frames 5 --output /tmp/debug\n"
                         << "  " << argv[0] << " --no-detect --frames 3\n";
             return 0;
         } else if (arg == "--config" && i + 1 < argc) {
@@ -122,35 +233,51 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    DebugViewConfig config;
+    try {
+        config = LoadDebugViewConfig(config_path);
+    } catch (const std::exception& e) {
+        std::cerr << "[debug_view] Config error: " << e.what() << std::endl;
+        return 1;
+    }
+
+    if (num_frames < 1 || warmup_frames < -1) {
+        std::cerr << "[debug_view] --frames must be positive; --warmup "
+                     "must be -1 or non-negative"
+                  << std::endl;
+        return 1;
+    }
+    if (warmup_frames < 0) {
+        warmup_frames =
+            config.camera.type == "spacemit_las2" ? 1 : 30;
+    }
+
     // 创建输出目录
     fs::create_directories(output_dir);
     std::cout << "[debug_view] Output: " << fs::absolute(output_dir).string() << std::endl;
 
     // ============ 初始化相机 ============
-    std::cout << "[debug_view] Initializing RealSense D435i..." << std::endl;
-
-    rs2::pipeline pipe;
-    rs2::config rs_cfg;
-    rs_cfg.enable_stream(RS2_STREAM_COLOR, 640, 480, RS2_FORMAT_BGR8, 30);
-    rs_cfg.enable_stream(RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16, 30);
-
-    rs2::pipeline_profile profile;
-    try {
-        profile = pipe.start(rs_cfg);
-    } catch (const rs2::error& e) {
-        std::cerr << "[debug_view] RealSense error: " << e.what() << std::endl;
-        std::cerr << "[debug_view] 请确认 D435i 已连接 (lsusb | grep Intel)" << std::endl;
+    std::cout << "[debug_view] Initializing camera backend: "
+              << config.camera.type << std::endl;
+    auto camera = perceptive_grasp::CreateStereoCamera(config.camera);
+    if (!camera || !camera->Init()) {
+        std::cerr << "[debug_view] Failed to initialize camera backend: "
+                  << config.camera.type << std::endl;
         return 1;
     }
 
-    auto depth_sensor = profile.get_device().first<rs2::depth_sensor>();
-    float depth_scale = depth_sensor.get_depth_scale();
-    std::cout << "[debug_view] Camera ready, depth_scale=" << depth_scale << std::endl;
+    std::cout << "[debug_view] Camera ready" << std::endl;
 
     // 等待自动曝光稳定
     std::cout << "[debug_view] Warming up (" << warmup_frames << " frames)..." << std::endl;
+    cv::Mat color;
+    cv::Mat depth;
     for (int i = 0; i < warmup_frames; i++) {
-        pipe.wait_for_frames();
+        if (!camera->GetFrames(color, depth)) {
+            std::cerr << "[debug_view] Failed to acquire warmup frame "
+                      << (i + 1) << std::endl;
+            return 1;
+        }
     }
 
     // ============ 初始化检测器 (可选) ============
@@ -159,61 +286,22 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> labels;
 
     if (do_detect) {
-        if (config_path.empty()) {
-            std::cerr << "[debug_view] Warning: --config not specified, skipping detection\n";
+        std::cout << "[debug_view] Detection config: "
+                  << config.detection_config_path << std::endl;
+        vision = VisionService::Create(
+            config.detection_config_path, "", false);
+        if (!vision) {
+            std::cerr << "[debug_view] VisionService create failed: "
+                      << VisionService::LastCreateError() << std::endl;
             do_detect = false;
         } else {
-            // 从 grasp_pipeline.yaml 读取检测配置路径
-            try {
-                // 简单解析 YAML 获取 detection.config_path
-                std::ifstream f(config_path);
-                std::string line;
-                std::string detect_config;
-                while (std::getline(f, line)) {
-                    // 找 config_path: xxx
-                    auto pos = line.find("config_path:");
-                    if (pos != std::string::npos) {
-                        detect_config = line.substr(pos + 12);
-                        // trim
-                        while (!detect_config.empty() && detect_config[0] == ' ')
-                            detect_config.erase(0, 1);
-                        // 去除引号
-                        if (detect_config.size() >= 2 && detect_config[0] == '"')
-                            detect_config = detect_config.substr(1, detect_config.size() - 2);
-                        break;
-                    }
-                }
-
-                if (detect_config.empty()) {
-                    std::cerr << "[debug_view] Cannot find detection.config_path in config\n";
-                    do_detect = false;
-                } else {
-                    // 解析相对路径
-                    if (!fs::path(detect_config).is_absolute()) {
-                        fs::path config_dir = fs::path(config_path).parent_path();
-                        detect_config = fs::weakly_canonical(config_dir / detect_config).string();
-                    }
-
-                    std::cout << "[debug_view] Detection config: " << detect_config << std::endl;
-                    vision = VisionService::Create(detect_config, "", false);
-                    if (!vision) {
-                        std::cerr << "[debug_view] VisionService create failed: "
-                                    << VisionService::LastCreateError() << std::endl;
-                        do_detect = false;
-                    } else {
-                        // 加载 labels
-                        std::string label_path = vision->GetConfigPathValue("label_file_path");
-                        if (!label_path.empty()) {
-                            labels = LoadLabels(label_path);
-                        }
-                        std::cout << "[debug_view] VisionService ready, "
-                                    << labels.size() << " labels loaded" << std::endl;
-                    }
-                }
-            } catch (const std::exception& e) {
-                std::cerr << "[debug_view] Config parse error: " << e.what() << std::endl;
-                do_detect = false;
+            const std::string label_path =
+                vision->GetConfigPathValue("label_file_path");
+            if (!label_path.empty()) {
+                labels = LoadLabels(label_path);
             }
+            std::cout << "[debug_view] VisionService ready, "
+                      << labels.size() << " labels loaded" << std::endl;
         }
     }
 #else
@@ -224,23 +312,15 @@ int main(int argc, char* argv[]) {
 #endif
 
     // ============ 抓取并处理帧 ============
-    rs2::align align(RS2_STREAM_COLOR);
-
     std::cout << "[debug_view] Capturing " << num_frames << " frame(s)...\n" << std::endl;
 
     for (int frame_idx = 1; frame_idx <= num_frames; frame_idx++) {
-        // 获取对齐帧
-        rs2::frameset frames = pipe.wait_for_frames();
-        rs2::frameset aligned = align.process(frames);
-
-        auto color_frame = aligned.get_color_frame();
-        auto depth_frame = aligned.get_depth_frame();
-
-        // 转 OpenCV Mat
-        cv::Mat color(cv::Size(640, 480), CV_8UC3,
-                        (void*)color_frame.get_data(), cv::Mat::AUTO_STEP);
-        cv::Mat depth(cv::Size(640, 480), CV_16UC1,
-                        (void*)depth_frame.get_data(), cv::Mat::AUTO_STEP);
+        if (!camera->GetFrames(color, depth) || color.empty() ||
+            depth.empty()) {
+            std::cerr << "[debug_view] Failed to acquire frame "
+                      << frame_idx << std::endl;
+            return 1;
+        }
 
         // 文件名前缀
         std::ostringstream prefix;
@@ -354,10 +434,14 @@ int main(int argc, char* argv[]) {
                     oss << label_text << " " << std::fixed << std::setprecision(2) << r.score;
 
                     // 中心点深度
-                    int cx = (int)((r.x1 + r.x2) / 2);
-                    int cy = (int)((r.y1 + r.y2) / 2);
+                    int cx = std::clamp(
+                        static_cast<int>((r.x1 + r.x2) / 2),
+                        0, depth.cols - 1);
+                    int cy = std::clamp(
+                        static_cast<int>((r.y1 + r.y2) / 2),
+                        0, depth.rows - 1);
                     uint16_t depth_val = depth.at<uint16_t>(cy, cx);
-                    float depth_m = depth_val * depth_scale;
+                    float depth_m = depth_val * 0.001f;
 
                     oss << " " << std::setprecision(3) << depth_m << "m";
 
@@ -391,8 +475,10 @@ int main(int argc, char* argv[]) {
 
                 std::cout << "[Frame " << frame_idx << "] Detect: " << pfx + "_detect.png"
                             << " (" << results.size() << " objects, "
-                            << std::fixed << std::setprecision(1) << infer_ms << " ms)" << std::endl;
-                std::cout << "[Frame " << frame_idx << "] Result: " << pfx + "_result.txt" << std::endl;
+                            << std::fixed << std::setprecision(1) << infer_ms
+                            << " ms)" << std::endl;
+                std::cout << "[Frame " << frame_idx << "] Result: "
+                          << pfx + "_result.txt" << std::endl;
             } else {
                 std::cerr << "[Frame " << frame_idx << "] Detection failed (status="
                             << status << ")" << std::endl;
@@ -403,8 +489,9 @@ int main(int argc, char* argv[]) {
         std::cout << std::endl;
     }
 
-    pipe.stop();
-    std::cout << "[debug_view] Done. Files saved to: " << fs::absolute(output_dir).string() << std::endl;
+    camera.reset();
+    std::cout << "[debug_view] Done. Files saved to: "
+              << fs::absolute(output_dir).string() << std::endl;
 
     return 0;
 }
