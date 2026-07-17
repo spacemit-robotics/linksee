@@ -1,10 +1,10 @@
 /*
- * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
- * SPDX-License-Identifier: Apache-2.0
- *
- * @file las2_stereo_camera.cpp
- * @brief spacemit_las2 stereo camera backend.
- */
+* Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+* SPDX-License-Identifier: Apache-2.0
+*
+* @file las2_stereo_camera.cpp
+* @brief spacemit_las2 stereo camera backend.
+*/
 
 #include "las2_stereo_camera.h"
 
@@ -51,18 +51,18 @@ public:
         if (settings.video_device.empty() || settings.model_path.empty() ||
             settings.calib_path.empty()) {
             std::cerr << "[Las2StereoCamera] video_device, model_path and "
-                         "calib_path are required"
-                      << std::endl;
+                        "calib_path are required"
+                    << std::endl;
             return false;
         }
         if (!IsSupportedCoreCount(settings.core_count)) {
             std::cerr << "[Las2StereoCamera] core_count must be in [1, 16]"
-                      << std::endl;
+                    << std::endl;
             return false;
         }
         if (settings.core_affinity.empty()) {
             std::cerr << "[Las2StereoCamera] core_affinity is required"
-                      << std::endl;
+                    << std::endl;
             return false;
         }
         if (!(settings.min_depth_m >= 0.0f) ||
@@ -73,28 +73,28 @@ public:
 
         std::string error;
         if (!LoadRectifiedLeftIntrinsics(settings.calib_path,
-                                         rectified_intrinsics_, error)) {
+                                        rectified_intrinsics_, error)) {
             std::cerr << "[Las2StereoCamera] " << error << std::endl;
             return false;
         }
 
         if (!camera_->initialize(settings.video_device.c_str(),
-                                 settings.calib_path.c_str(),
-                                 settings.core_count,
-                                 settings.core_affinity.c_str(),
-                                 settings.model_path.c_str())) {
+                                settings.calib_path.c_str(),
+                                settings.core_count,
+                                settings.core_affinity.c_str(),
+                                settings.model_path.c_str())) {
             std::cerr << "[Las2StereoCamera] initialize failed: "
-                      << camera_->last_error() << std::endl;
+                    << camera_->last_error() << std::endl;
             return false;
         }
 
         initialized_ = true;
         std::cout << "[Las2StereoCamera] Initialized: dev="
-                  << settings.video_device
-                  << " cores=" << settings.core_count
-                  << " affinity=" << settings.core_affinity
-                  << " calibration=" << rectified_intrinsics_.width << "x"
-                  << rectified_intrinsics_.height << std::endl;
+                << settings.video_device
+                << " cores=" << settings.core_count
+                << " affinity=" << settings.core_affinity
+                << " calibration=" << rectified_intrinsics_.width << "x"
+                << rectified_intrinsics_.height << std::endl;
         return true;
     }
 
@@ -107,7 +107,7 @@ public:
         las2::Frame frame;
         if (!camera_->get_frame(frame, 5000)) {
             std::cerr << "[Las2StereoCamera] get_frame failed: "
-                      << camera_->last_error() << std::endl;
+                    << camera_->last_error() << std::endl;
             return false;
         }
         if (!ValidateFrame(frame)) {
@@ -125,16 +125,16 @@ public:
                 return false;
             }
             std::cout << "[Las2StereoCamera] Output: " << frame.rgb.width
-                      << "x" << frame.rgb.height << " fx="
-                      << output_intrinsics_.fx << " fy="
-                      << output_intrinsics_.fy << " cx="
-                      << output_intrinsics_.cx << " cy="
-                      << output_intrinsics_.cy << std::endl;
+                    << "x" << frame.rgb.height << " fx="
+                    << output_intrinsics_.fx << " fy="
+                    << output_intrinsics_.fy << " cx="
+                    << output_intrinsics_.cx << " cy="
+                    << output_intrinsics_.cy << std::endl;
         }
 
         const cv::Mat rgb(frame.rgb.height, frame.rgb.width, CV_8UC3,
-                          const_cast<std::uint8_t*>(frame.rgb.data),
-                          static_cast<size_t>(frame.rgb.stride));
+                        const_cast<std::uint8_t*>(frame.rgb.data),
+                        static_cast<size_t>(frame.rgb.stride));
         cv::cvtColor(rgb, color_frame, cv::COLOR_RGB2BGR);
 
         depth_frame.create(frame.depth.height, frame.depth.width, CV_16UC1);
@@ -161,7 +161,7 @@ public:
     std::int64_t LastFrameId() const override { return last_frame_id_; }
 
     bool Deproject(int pixel_x, int pixel_y, std::uint16_t depth_mm,
-                   float point_3d[3]) const override {
+                float point_3d[3]) const override {
         if (!initialized_ || depth_mm == 0 ||
             output_intrinsics_.width <= 0 ||
             pixel_x < 0 || pixel_x >= output_intrinsics_.width ||
@@ -187,7 +187,7 @@ private:
             frame.depth.stride <
                 frame.depth.width * static_cast<int>(sizeof(float))) {
             std::cerr << "[Las2StereoCamera] unregistered color/depth frame"
-                      << std::endl;
+                    << std::endl;
             return false;
         }
         return true;

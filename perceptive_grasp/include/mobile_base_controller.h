@@ -6,8 +6,8 @@
  * @brief Chassis-assisted target alignment interfaces.
  */
 
-#ifndef PERCEPTIVE_GRASP_MOBILE_BASE_CONTROLLER_H_
-#define PERCEPTIVE_GRASP_MOBILE_BASE_CONTROLLER_H_
+#ifndef MOBILE_BASE_CONTROLLER_H
+#define MOBILE_BASE_CONTROLLER_H
 
 #include <string>
 
@@ -127,4 +127,4 @@ private:
 
 }  // namespace perceptive_grasp
 
-#endif  // PERCEPTIVE_GRASP_MOBILE_BASE_CONTROLLER_H_
+#endif  // MOBILE_BASE_CONTROLLER_H

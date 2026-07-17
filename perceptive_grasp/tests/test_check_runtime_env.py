@@ -198,17 +198,37 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][0], tool)
         self.assertEqual(run.call_args.kwargs["cwd"], str(ROOT))
 
-    def test_las2_runtime_check_finds_core_in_named_build_directory(self):
+    def test_application_check_finds_launcher_and_core_in_named_build_directory(self):
         build_dir = str(ROOT / "build_release")
-        executable = os.path.join(build_dir, "perceptive_grasp_core")
+        launcher = os.path.join(build_dir, "perceptive_grasp")
+        core = os.path.join(build_dir, "perceptive_grasp_core")
         with mock.patch.object(check_runtime_env.glob, "glob",
                                return_value=[build_dir]), \
                 mock.patch.object(check_runtime_env.os.path, "isfile",
-                                  side_effect=lambda path: path == executable), \
+                                  side_effect=lambda path: path in {launcher, core}), \
+                mock.patch.object(check_runtime_env.os, "access",
+                                  return_value=True), \
+                mock.patch.object(check_runtime_env.shutil, "which",
+                                  return_value=None):
+            self.assertEqual(
+                check_runtime_env._find_application_binaries(),
+                (launcher, core))
+
+    def test_application_check_rejects_missing_core(self):
+        launcher = str(ROOT / "build" / "perceptive_grasp")
+        with mock.patch.object(check_runtime_env,
+                               "_find_application_binaries",
+                               return_value=(launcher, "")), \
+                mock.patch.object(check_runtime_env.os.path, "isfile",
+                                  side_effect=lambda path: path == launcher), \
                 mock.patch.object(check_runtime_env.os, "access",
                                   return_value=True):
-            self.assertEqual(
-                check_runtime_env._find_las2_application(), executable)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_application_binaries()
+
+        self.assertFalse(ok)
+        self.assertIn("perceptive_grasp core", output.getvalue())
 
     def test_realsense_check_passes_when_d435i_video_device_exists(self):
         def fake_props(device):
@@ -425,6 +445,9 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         }
         with mock.patch.object(check_runtime_env, "load_yaml",
                                return_value=config), \
+                mock.patch.object(check_runtime_env,
+                                  "check_application_binaries",
+                                  return_value=True), \
                 mock.patch.object(check_runtime_env, "report_serial_devices"), \
                 mock.patch.object(check_runtime_env,
                                   "check_serial_role_configuration",
@@ -622,6 +645,9 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
 
         with mock.patch.object(check_runtime_env, "load_yaml",
                                return_value=config), \
+                mock.patch.object(check_runtime_env,
+                                  "check_application_binaries",
+                                  return_value=True), \
                 mock.patch.object(check_runtime_env, "report_serial_devices"), \
                 mock.patch.object(check_runtime_env,
                                   "check_serial_role_configuration",
@@ -670,6 +696,9 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
 
         with mock.patch.object(check_runtime_env, "load_yaml",
                                return_value=config), \
+                mock.patch.object(check_runtime_env,
+                                  "check_application_binaries",
+                                  return_value=True), \
                 mock.patch.object(check_runtime_env, "report_serial_devices") as report, \
                 mock.patch.object(check_runtime_env,
                                   "check_serial_role_configuration",

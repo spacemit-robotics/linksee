@@ -14,6 +14,7 @@ import importlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -531,16 +532,44 @@ def _find_las2_library(sdk_root: str, model_path: str,
     return ""
 
 
-def _find_las2_application() -> str:
+def _find_application_binaries() -> tuple[str, str]:
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     build_dirs = [os.path.join(project_root, "build")]
     build_dirs.extend(sorted(glob.glob(os.path.join(project_root, "build*"))))
+    path_launcher = shutil.which("perceptive_grasp")
+    if path_launcher:
+        build_dirs.append(os.path.dirname(os.path.abspath(path_launcher)))
+
+    partial_match = ("", "")
     for build_dir in dict.fromkeys(build_dirs):
-        for executable in ("perceptive_grasp_core", "perceptive_grasp"):
-            candidate = os.path.join(build_dir, executable)
-            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-                return candidate
-    return ""
+        launcher = os.path.join(build_dir, "perceptive_grasp")
+        core = os.path.join(build_dir, "perceptive_grasp_core")
+        launcher_exists = os.path.isfile(launcher)
+        core_exists = os.path.isfile(core)
+        if launcher_exists and core_exists:
+            return launcher, core
+        if not any(partial_match) and (launcher_exists or core_exists):
+            partial_match = (launcher if launcher_exists else "",
+                             core if core_exists else "")
+    return partial_match
+
+
+def check_application_binaries() -> bool:
+    launcher, core = _find_application_binaries()
+    launcher_ok = bool(launcher) and os.path.isfile(launcher) \
+        and os.access(launcher, os.X_OK)
+    core_ok = bool(core) and os.path.isfile(core) and os.access(core, os.X_OK)
+    ok = status(
+        launcher_ok,
+        "perceptive_grasp launcher",
+        launcher if launcher_ok else "build or install perceptive_grasp",
+    )
+    ok &= status(
+        core_ok,
+        "perceptive_grasp core",
+        core if core_ok else "perceptive_grasp_core missing or not executable",
+    )
+    return ok
 
 
 def _check_las2_runtime_libraries(library: str,
@@ -666,8 +695,9 @@ def check_las2_camera(camera: Dict[str, Any], sdk_root: str) -> bool:
     ok &= status(bool(library), "liblas2_usb_stereo.so",
                  library or "set LAS2_RUNTIME_DIR or LD_LIBRARY_PATH")
     if library:
+        _, application = _find_application_binaries()
         ok &= _check_las2_runtime_libraries(
-            library, _find_las2_application())
+            library, application)
     return ok
 
 
@@ -862,6 +892,7 @@ def main() -> int:
     ok &= status(isinstance(backend_config, dict),
                  f"camera.{camera_type} configuration")
     sdk_root = os.environ.get("SDK_ROOT", "") or infer_sdk_root(os.getcwd())
+    ok &= check_application_binaries()
     report_serial_devices(device, mobile_base_device)
     ok &= check_serial_role_configuration(
         device, mobile_base_device, mobile_base_is_uart, sdk_root)

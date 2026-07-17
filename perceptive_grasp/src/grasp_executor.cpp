@@ -152,7 +152,7 @@ void GraspExecutor::CaptureEmptyClosedPosition() {
 
     empty_closed_position_ = position;
     std::cout << "[GraspExecutor] empty gripper baseline: position="
-              << empty_closed_position_ << ", load=" << load << std::endl;
+            << empty_closed_position_ << ", load=" << load << std::endl;
 }
 
 GraspResult GraspExecutor::MoveToHome() {
@@ -245,7 +245,7 @@ GraspResult GraspExecutor::CloseGripperAndCheck() {
     std::this_thread::sleep_for(
         std::chrono::milliseconds(config_.timing.grasp_settle_ms));
     if (grasp_execute(gripper_, GRASP_CMD_GRAB,
-                      config_.gripper_effort) != GRASP_OK) {
+                    config_.gripper_effort) != GRASP_OK) {
         RecordResult(GraspResult::MOVE_FAILED, "close_gripper_and_check",
                     "failed to start gripper close");
         return GraspResult::MOVE_FAILED;
@@ -257,7 +257,7 @@ GraspResult GraspExecutor::CloseGripperAndCheck() {
 }
 
 GraspResult GraspExecutor::CheckGripperHolding(const char* phase,
-                                               bool after_lift) {
+                                            bool after_lift) {
     grasp_state_t state = GRASP_STATE_ERROR;
     int holding_count = 0;
     int load_holding_count = 0;
@@ -342,7 +342,7 @@ GraspResult GraspExecutor::CheckGripperHolding(const char* phase,
         std::cout << "[GraspExecutor] Grasp empty - nothing grabbed" << std::endl;
         RecordResult(GraspResult::EMPTY,
                     after_lift ? "verify_grasp_after_lift"
-                               : "close_gripper_and_check",
+                            : "close_gripper_and_check",
                     "gripper closed without object");
         return GraspResult::EMPTY;
     }

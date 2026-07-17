@@ -1,13 +1,13 @@
 /*
- * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
- * SPDX-License-Identifier: Apache-2.0
- *
- * @file stereo_camera.h
- * @brief Stereo camera abstraction for the grasp pipeline.
- */
+* Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+* SPDX-License-Identifier: Apache-2.0
+*
+* @file stereo_camera.h
+* @brief Stereo camera abstraction for the grasp pipeline.
+*/
 
-#ifndef PERCEPTIVE_GRASP_STEREO_CAMERA_H_
-#define PERCEPTIVE_GRASP_STEREO_CAMERA_H_
+#ifndef STEREO_CAMERA_H
+#define STEREO_CAMERA_H
 
 #include <cstdint>
 #include <memory>
@@ -51,11 +51,11 @@ struct StereoCameraConfig {
 };
 
 /**
- * @brief Interface for registered color and metric-depth frames.
- *
- * GetFrames() returns BGR color and CV_16UC1 depth images in the same pixel
- * coordinate system. Depth values are expressed in millimeters.
- */
+* @brief Interface for registered color and metric-depth frames.
+*
+* GetFrames() returns BGR color and CV_16UC1 depth images in the same pixel
+* coordinate system. Depth values are expressed in millimeters.
+*/
 class StereoCamera {
 public:
     virtual ~StereoCamera() = default;
@@ -71,7 +71,7 @@ public:
 
     /** Convert one depth pixel into camera-frame coordinates in meters. */
     virtual bool Deproject(int pixel_x, int pixel_y, uint16_t depth_mm,
-                           float point_3d[3]) const = 0;
+                        float point_3d[3]) const = 0;
 };
 
 /** Create the camera backend selected by config.type. */
@@ -80,4 +80,4 @@ std::unique_ptr<StereoCamera> CreateStereoCamera(
 
 }  // namespace perceptive_grasp
 
-#endif  // PERCEPTIVE_GRASP_STEREO_CAMERA_H_
+#endif  // STEREO_CAMERA_H

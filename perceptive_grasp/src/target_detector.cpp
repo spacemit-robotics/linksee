@@ -48,10 +48,10 @@ bool TargetDetector::Detect(const cv::Mat& image,
         vision_.get(), image, &results, &response);
     if (status != VISION_SERVICE_OK) {
         std::cerr << "[TargetDetector] Inference failed: status="
-                  << static_cast<int>(status)
-                  << " image=" << image.cols << "x" << image.rows
-                  << " type=" << image.type()
-                  << " continuous=" << (image.isContinuous() ? 1 : 0);
+                << static_cast<int>(status)
+                << " image=" << image.cols << "x" << image.rows
+                << " type=" << image.type()
+                << " continuous=" << (image.isContinuous() ? 1 : 0);
         if (!response.error_message.empty()) {
             std::cerr << " response=\"" << response.error_message << '"';
         }

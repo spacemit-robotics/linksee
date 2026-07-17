@@ -19,6 +19,9 @@ python3 scripts/check_runtime_env.py \
   --config config/grasp_pipeline.yaml
 ```
 
+检查结果中的 `perceptive_grasp launcher` 对应结构化日志启动器，
+`perceptive_grasp core` 对应实际运行抓取 pipeline 的 c++ 程序，二者都必须可执行。
+
 硬件、权限、运行库和模型均可用时，最后一行显示：
 
 ```text

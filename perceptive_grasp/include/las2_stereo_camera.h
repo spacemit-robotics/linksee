@@ -6,8 +6,8 @@
  * @brief spacemit_las2 stereo camera backend.
  */
 
-#ifndef PERCEPTIVE_GRASP_LAS2_STEREO_CAMERA_H_
-#define PERCEPTIVE_GRASP_LAS2_STEREO_CAMERA_H_
+#ifndef LAS2_STEREO_CAMERA_H
+#define LAS2_STEREO_CAMERA_H
 
 #include <memory>
 
@@ -21,4 +21,4 @@ std::unique_ptr<StereoCamera> CreateLas2StereoCamera(
 
 }  // namespace perceptive_grasp
 
-#endif  // PERCEPTIVE_GRASP_LAS2_STEREO_CAMERA_H_
+#endif  // LAS2_STEREO_CAMERA_H

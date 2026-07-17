@@ -140,7 +140,7 @@ bool MedianDepthAtPixel(const cv::Mat& depth, int cx, int cy, int roi_size,
 }
 
 bool ForegroundDepthFromMask(const cv::Mat& depth, const cv::Mat& input_mask,
-                             uint16_t& depth_mm, size_t& sample_count) {
+                            uint16_t& depth_mm, size_t& sample_count) {
     sample_count = 0;
     if (depth.empty() || depth.type() != CV_16UC1 || input_mask.empty()) {
         return false;
@@ -149,7 +149,7 @@ bool ForegroundDepthFromMask(const cv::Mat& depth, const cv::Mat& input_mask,
     cv::Mat mask;
     if (input_mask.size() != depth.size()) {
         cv::resize(input_mask, mask, depth.size(), 0.0, 0.0,
-                   cv::INTER_NEAREST);
+                cv::INTER_NEAREST);
     } else {
         mask = input_mask.clone();
     }
@@ -252,7 +252,7 @@ std::int64_t ProcessCpuMillis() {
         return 0;
     }
     return static_cast<std::int64_t>(value.tv_sec) * 1000 +
-           static_cast<std::int64_t>(value.tv_nsec) / 1000000;
+        static_cast<std::int64_t>(value.tv_nsec) / 1000000;
 }
 
 }  // namespace
@@ -279,17 +279,17 @@ GraspPipeline::~GraspPipeline() {
 bool GraspPipeline::Init() {
     const auto pipeline_start = std::chrono::steady_clock::now();
     const auto log_init_time = [this](const char* module,
-                                      const auto& started_at,
-                                      std::int64_t started_cpu_ms) {
+                                    const auto& started_at,
+                                    std::int64_t started_cpu_ms) {
         if (!config_.performance_log_enabled) return;
         const auto elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - started_at)
                 .count();
         std::cout << "[Init] END module=" << module
-                  << " elapsed_ms=" << elapsed_ms
-                  << " cpu_ms=" << ProcessCpuMillis() - started_cpu_ms
-                  << " result=SUCCESS" << std::endl;
+                << " elapsed_ms=" << elapsed_ms
+                << " cpu_ms=" << ProcessCpuMillis() - started_cpu_ms
+                << " result=SUCCESS" << std::endl;
     };
     const auto log_init_failure = [&pipeline_start](const char* module) {
         const auto elapsed_ms =
@@ -297,9 +297,9 @@ bool GraspPipeline::Init() {
                 std::chrono::steady_clock::now() - pipeline_start)
                 .count();
         std::cerr << "[Init] END module=" << module
-                  << " result=FAILED" << std::endl;
+                << " result=FAILED" << std::endl;
         std::cerr << "[Init] SUMMARY result=FAILED"
-                  << " elapsed_ms=" << elapsed_ms << std::endl;
+                << " elapsed_ms=" << elapsed_ms << std::endl;
     };
 
     std::cout << "\n[Init] START pipeline" << std::endl;
@@ -336,7 +336,7 @@ bool GraspPipeline::Init() {
         return false;
     }
     log_init_time("camera_warmup", camera_warmup_start,
-                  camera_warmup_cpu_start);
+                camera_warmup_cpu_start);
 
     // 初始化目标检测器
     std::cout << "[Init] START module=detector" << std::endl;
@@ -367,9 +367,9 @@ bool GraspPipeline::Init() {
         return false;
     }
     log_init_time("detector_warmup", detector_warmup_start,
-                  detector_warmup_cpu_start);
+                detector_warmup_cpu_start);
     std::cout << "[Init] Stereo camera and detector warmup complete"
-              << std::endl;
+            << std::endl;
 
     // 初始化抓取规划器
     planner_ = std::make_unique<GraspPlanner>(config_.planner);
@@ -406,9 +406,9 @@ bool GraspPipeline::Init() {
             std::chrono::steady_clock::now() - pipeline_start)
             .count();
     std::cout << "[Init] SUMMARY result=SUCCESS"
-              << " elapsed_ms=" << initialization_elapsed_ms_
-              << " cpu_ms=" << ProcessCpuMillis() - camera_cpu_start
-              << std::endl;
+            << " elapsed_ms=" << initialization_elapsed_ms_
+            << " cpu_ms=" << ProcessCpuMillis() - camera_cpu_start
+            << std::endl;
     SetState(PipelineState::IDLE, "Ready");
     return true;
 }
@@ -669,7 +669,7 @@ bool GraspPipeline::StartAction(PipelineState owner, const std::string& name,
     });
     std::ostringstream action_log;
     action_log << "[Action] START stage=" << PipelineStateName(owner)
-               << " name=" << name;
+            << " name=" << name;
     WriteStructuredLine(action_log.str());
     return true;
 }
@@ -691,11 +691,11 @@ std::optional<GraspResult> GraspPipeline::PollAction(
             .count();
     std::ostringstream action_log;
     action_log << "[Action] END stage=" << PipelineStateName(action_.owner)
-               << " name=" << action_.name
-               << " elapsed_ms=" << action_ms;
+            << " name=" << action_.name
+            << " elapsed_ms=" << action_ms;
     if (config_.performance_log_enabled) {
         action_log << " cpu_ms="
-                   << ProcessCpuMillis() - action_.started_cpu_ms;
+                << ProcessCpuMillis() - action_.started_cpu_ms;
     }
     action_log << " result=" << GraspResultName(result);
     WriteStructuredLine(action_log.str());
@@ -735,7 +735,7 @@ std::string GraspPipeline::FormatCandidates(size_t max_items) const {
 }
 
 std::string GraspPipeline::ResultMessage(const std::string& phase,
-                                         GraspResult result) const {
+                                        GraspResult result) const {
     ExecutorDiagnostics diag;
     if (executor_) diag = executor_->GetDiagnostics();
 
@@ -783,7 +783,7 @@ bool GraspPipeline::FlushCameraAfterMotion(const char* reason) {
         for (int attempt = 0; attempt < kMaxRefreshAttempts; ++attempt) {
             if (!camera_->GetFrames(color, depth)) {
                 std::cerr << "[Pipeline] Failed to refresh LAS2 frame after "
-                          << reason << std::endl;
+                        << reason << std::endl;
                 return false;
             }
             const std::int64_t current_frame_id = camera_->LastFrameId();
@@ -805,8 +805,8 @@ bool GraspPipeline::FlushCameraAfterMotion(const char* reason) {
             std::this_thread::sleep_for(std::chrono::milliseconds(40));
         }
         std::cerr << "[Pipeline] LAS2 frame did not advance after "
-                  << reason << ": frame_id=" << previous_frame_id
-                  << std::endl;
+                << reason << ": frame_id=" << previous_frame_id
+                << std::endl;
         return false;
     }
 
@@ -1348,17 +1348,17 @@ void GraspPipeline::HandleDetecting() {
                 detector_end - detection_stage_start)
                 .count();
         std::cout << "[Timing] stage=DETECTING"
-                  << " elapsed_ms=" << stage_ms
-                  << " cpu_ms="
-                  << detector_cpu_end - detection_stage_cpu_start
-                  << " camera_ms=" << capture_ms
-                  << " camera_cpu_ms="
-                  << capture_cpu_end - detection_stage_cpu_start
-                  << " detector_ms=" << detector_ms
-                  << " detector_cpu_ms="
-                  << detector_cpu_end - capture_cpu_end
-                  << " result=" << (found ? "FOUND" : "NOT_FOUND")
-                  << std::endl;
+                << " elapsed_ms=" << stage_ms
+                << " cpu_ms="
+                << detector_cpu_end - detection_stage_cpu_start
+                << " camera_ms=" << capture_ms
+                << " camera_cpu_ms="
+                << capture_cpu_end - detection_stage_cpu_start
+                << " detector_ms=" << detector_ms
+                << " detector_cpu_ms="
+                << detector_cpu_end - capture_cpu_end
+                << " result=" << (found ? "FOUND" : "NOT_FOUND")
+                << std::endl;
     }
 
     if (!found) {
@@ -1450,7 +1450,7 @@ void GraspPipeline::HandlePlanning() {
                     << depth_mm << "mm samples=" << mask_depth_samples
                     << std::endl;
     } else if (!MedianDepthAtPixel(
-                   current_depth_, cx, cy, roi_size, depth_mm)) {
+                current_depth_, cx, cy, roi_size, depth_mm)) {
         const int fallback_cx = ClampPixel(
             static_cast<int>(std::lround(current_target_.center.x)),
             current_depth_.cols);
@@ -1646,11 +1646,11 @@ void GraspPipeline::HandlePlanning() {
                 planning_end - planning_start)
                 .count();
         std::cout << "[Timing] stage=PLANNING"
-                  << " elapsed_ms=" << planning_ms
-                  << " cpu_ms="
-                  << ProcessCpuMillis() - planning_cpu_start
-                  << " stable_count=" << stable_count_
-                  << " result=GRASP_READY" << std::endl;
+                << " elapsed_ms=" << planning_ms
+                << " cpu_ms="
+                << ProcessCpuMillis() - planning_cpu_start
+                << " stable_count=" << stable_count_
+                << " result=GRASP_READY" << std::endl;
     }
 
     SetState(PipelineState::APPROACHING, "Moving to pre-grasp...");
@@ -1872,7 +1872,7 @@ void GraspPipeline::BeginTaskTiming() {
 }
 
 void GraspPipeline::PrintTaskSummary(PipelineState terminal_state,
-                                     const std::string& message) {
+                                    const std::string& message) {
     const auto total_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - task_started_at_)
@@ -1883,18 +1883,18 @@ void GraspPipeline::PrintTaskSummary(PipelineState terminal_state,
 
     std::cout << "\n========== PIPELINE SUMMARY ==========" << std::endl;
     std::cout << "result=" << result
-              << " target=" << (target_label_.empty() ? "auto" : target_label_)
-              << " initialization_ms=" << initialization_elapsed_ms_
-              << " task_ms=" << total_ms
-              << " end_to_end_ms=" << initialization_elapsed_ms_ + total_ms
-              << " base_align_attempts=" << base_align_attempts_
-              << std::endl;
+            << " target=" << (target_label_.empty() ? "auto" : target_label_)
+            << " initialization_ms=" << initialization_elapsed_ms_
+            << " task_ms=" << total_ms
+            << " end_to_end_ms=" << initialization_elapsed_ms_ + total_ms
+            << " base_align_attempts=" << base_align_attempts_
+            << std::endl;
     for (const auto& timing : stage_timings_) {
         std::cout << "  [" << std::setw(2) << std::setfill('0')
-                  << timing.sequence << std::setfill(' ') << "] "
-                  << PipelineStateName(timing.state)
-                  << " elapsed_ms=" << timing.elapsed_ms
-                  << " result=" << timing.result << std::endl;
+                << timing.sequence << std::setfill(' ') << "] "
+                << PipelineStateName(timing.state)
+                << " elapsed_ms=" << timing.elapsed_ms
+                << " result=" << timing.result << std::endl;
     }
     if (!message.empty()) {
         std::cout << "message=" << message << std::endl;
@@ -1906,7 +1906,7 @@ void GraspPipeline::PrintTaskSummary(PipelineState terminal_state,
 }
 
 void GraspPipeline::SetState(PipelineState new_state,
-                             const std::string& msg) {
+                            const std::string& msg) {
     const PipelineState previous_state = state_.load();
     if (!msg.empty()) {
         last_status_message_ = msg;
@@ -1926,9 +1926,9 @@ void GraspPipeline::SetState(PipelineState new_state,
         });
         std::ostringstream stage_log;
         stage_log << "[Stage " << stage_sequence_ << "] END   "
-                  << PipelineStateName(previous_state)
-                  << " elapsed_ms=" << elapsed_ms
-                  << " result=" << result;
+                << PipelineStateName(previous_state)
+                << " elapsed_ms=" << elapsed_ms
+                << " result=" << result;
         WriteStructuredLine(stage_log.str());
         stage_timing_active_ = false;
     }
@@ -1942,7 +1942,7 @@ void GraspPipeline::SetState(PipelineState new_state,
         stage_timing_active_ = true;
         std::ostringstream stage_log;
         stage_log << "\n[Stage " << stage_sequence_ << "] START "
-                  << PipelineStateName(new_state);
+                << PipelineStateName(new_state);
         if (!msg.empty()) {
             stage_log << " | " << msg;
         }
@@ -1950,7 +1950,7 @@ void GraspPipeline::SetState(PipelineState new_state,
     } else if (!task_timing_active_ && !msg.empty()) {
         std::ostringstream pipeline_log;
         pipeline_log << "[Pipeline] " << PipelineStateName(new_state)
-                     << " | " << msg;
+                    << " | " << msg;
         WriteStructuredLine(pipeline_log.str());
     }
 
@@ -1961,7 +1961,7 @@ void GraspPipeline::SetState(PipelineState new_state,
     if (task_timing_active_ &&
         (IsTerminalState(new_state) || new_state == PipelineState::IDLE)) {
         PrintTaskSummary(new_state,
-                         msg.empty() ? last_status_message_ : msg);
+                        msg.empty() ? last_status_message_ : msg);
     }
 
     // 通知回调

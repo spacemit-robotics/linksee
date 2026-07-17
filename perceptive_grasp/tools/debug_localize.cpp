@@ -104,13 +104,13 @@ static AppConfig ParseArgs(int argc, char* argv[]) {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                         << "Options:\n"
                         << "  --config <yaml>    Pipeline config "
-                           "(default: ../config/grasp_pipeline.yaml)\n"
+                        "(default: ../config/grasp_pipeline.yaml)\n"
                         << "  --output <dir>     Output directory "
-                           "(default: ./debug_localize_output)\n"
+                        "(default: ./debug_localize_output)\n"
                         << "  --frames <N>       Number of frames to capture (default: 1)\n"
                         << "  --target <name>    Filter target class name (e.g. apple)\n"
                         << "  --warmup <N>       Warmup frames "
-                           "(default: backend specific)\n";
+                        "(default: backend specific)\n";
             std::exit(0);
         } else if (arg == "--config" && i + 1 < argc) {
             cfg.config_path = argv[++i];
@@ -128,7 +128,7 @@ static AppConfig ParseArgs(int argc, char* argv[]) {
 }
 
 static void ResolveConfigPath(const fs::path& config_dir,
-                              std::string* path) {
+                            std::string* path) {
     if (path == nullptr || path->empty()) return;
 
     std::string expanded = *path;
@@ -256,14 +256,14 @@ int main(int argc, char* argv[]) {
     }
     if (app.num_frames < 1 || app.warmup_frames < -1) {
         std::cerr << "[debug_localize] --frames must be positive; --warmup "
-                     "must be -1 or non-negative"
-                  << std::endl;
+                    "must be -1 or non-negative"
+                << std::endl;
         return 1;
     }
 
     fs::create_directories(app.output_dir);
     std::cout << "[debug_localize] Output: " << fs::absolute(app.output_dir)
-              << std::endl;
+            << std::endl;
 
     StereoCameraConfig camera_config;
     std::string detect_config;
@@ -274,32 +274,31 @@ int main(int argc, char* argv[]) {
         planner_config = LoadPlannerConfig(app.config_path);
     } catch (const std::exception& e) {
         std::cerr << "[debug_localize] Config error: " << e.what()
-                  << std::endl;
+                << std::endl;
         return 1;
     }
 
     if (app.warmup_frames < 0) {
-        app.warmup_frames =
-            camera_config.type == "spacemit_las2" ? 1 : 30;
+        app.warmup_frames = camera_config.type == "spacemit_las2" ? 1 : 30;
     }
 
     std::cout << "[debug_localize] Initializing camera backend: "
-              << camera_config.type << std::endl;
+            << camera_config.type << std::endl;
     auto camera = perceptive_grasp::CreateStereoCamera(camera_config);
     if (!camera || !camera->Init()) {
         std::cerr << "[debug_localize] Failed to initialize camera backend: "
-                  << camera_config.type << std::endl;
+                << camera_config.type << std::endl;
         return 1;
     }
 
     cv::Mat color;
     cv::Mat depth;
     std::cout << "[debug_localize] Warming up (" << app.warmup_frames
-              << " frames)..." << std::endl;
+            << " frames)..." << std::endl;
     for (int i = 0; i < app.warmup_frames; ++i) {
         if (!camera->GetFrames(color, depth)) {
             std::cerr << "[debug_localize] Failed to acquire warmup frame "
-                      << (i + 1) << std::endl;
+                    << (i + 1) << std::endl;
             return 1;
         }
     }
@@ -320,13 +319,13 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "[debug_localize] Capturing " << app.num_frames
-              << " frame(s)..." << std::endl;
+            << " frame(s)..." << std::endl;
 
     for (int frame_idx = 1; frame_idx <= app.num_frames; ++frame_idx) {
         if (!camera->GetFrames(color, depth) || color.empty() ||
             depth.empty()) {
             std::cerr << "[debug_localize] Failed to acquire frame "
-                      << frame_idx << std::endl;
+                    << frame_idx << std::endl;
             return 1;
         }
         cv::Mat annotated = color.clone();
@@ -354,7 +353,7 @@ int main(int argc, char* argv[]) {
             const auto& r = results[i];
             std::string label =
                 (r.label >= 0 &&
-                 r.label < static_cast<int>(labels.size()))
+                r.label < static_cast<int>(labels.size()))
                 ? labels[r.label]
                 : ("class_" + std::to_string(r.label));
             if (!app.target_name.empty() && label != app.target_name) {
@@ -388,20 +387,20 @@ int main(int argc, char* argv[]) {
             const int color_index = std::max(0, r.label) % kNumColors;
             const cv::Scalar color = kColors[color_index];
             cv::rectangle(annotated,
-                          cv::Point(static_cast<int>(r.x1),
+                        cv::Point(static_cast<int>(r.x1),
                                     static_cast<int>(r.y1)),
-                          cv::Point(static_cast<int>(r.x2),
+                        cv::Point(static_cast<int>(r.x2),
                                     static_cast<int>(r.y2)),
-                          color, 2);
+                        color, 2);
             cv::circle(annotated, cv::Point(cx, cy), 4, color, -1);
 
             std::ostringstream text;
             text << label << " z=" << std::fixed << std::setprecision(3)
-                 << depth_m << "m";
+                << depth_m << "m";
             cv::putText(
                 annotated, text.str(),
                 cv::Point(static_cast<int>(r.x1),
-                          std::max(20, static_cast<int>(r.y1) - 5)),
+                        std::max(20, static_cast<int>(r.y1) - 5)),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 2);
 
             out << "Detection " << kept + 1 << ": " << label

@@ -203,7 +203,7 @@ static void PrintUsage(const char* prog) {
 }
 
 static void ResolveConfigPath(const fs::path& config_dir,
-                              std::string* path) {
+                            std::string* path) {
     if (path == nullptr || path->empty()) return;
 
     std::string expanded = *path;
@@ -242,7 +242,7 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
                 settings.fps = realsense["fps"].as<int>(settings.fps);
                 settings.motion_flush_frames = std::max(
                     0, realsense["motion_flush_frames"].as<int>(
-                           settings.motion_flush_frames));
+                        settings.motion_flush_frames));
                 settings.align_depth =
                     realsense["align_depth"].as<bool>(settings.align_depth);
                 if (auto depth_filter = realsense["depth_filter"]) {
@@ -282,7 +282,7 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             }
         } else {
             throw std::runtime_error("unsupported camera.type: " +
-                                     cfg.camera.type);
+                                    cfg.camera.type);
         }
     }
 
@@ -559,10 +559,10 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             1, timing["grasp_check_count"].as<int>(t.grasp_check_count));
         t.grasp_check_interval_ms = std::max(
             1, timing["grasp_check_interval_ms"].as<int>(
-                   t.grasp_check_interval_ms));
+                t.grasp_check_interval_ms));
         t.post_lift_settle_ms = std::max(
             0, timing["post_lift_settle_ms"].as<int>(
-                   t.post_lift_settle_ms));
+                t.post_lift_settle_ms));
         t.place_settle_ms =
             timing["place_settle_ms"].as<int>(t.place_settle_ms);
         t.release_wait_ms =
@@ -666,7 +666,7 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
     const auto validate_normalized = [](const char* name, float value) {
         if (value < 0.0f || value > 1.0f) {
             throw std::runtime_error(std::string(name) +
-                                     " must be in [0, 1]");
+                                    " must be in [0, 1]");
         }
     };
     validate_normalized("grasp.gripper_open", cfg.executor.gripper_open);

@@ -60,7 +60,7 @@ struct DebugViewConfig {
 };
 
 static void ResolveConfigPath(const fs::path& config_dir,
-                              std::string* path) {
+                            std::string* path) {
     if (path == nullptr || path->empty()) return;
 
     std::string expanded = *path;
@@ -136,7 +136,7 @@ static DebugViewConfig LoadDebugViewConfig(const std::string& config_path) {
         }
     } else {
         throw std::runtime_error("unsupported camera.type: " +
-                                 config.camera.type);
+                                config.camera.type);
     }
 
     if (const YAML::Node detection = root["detection"]) {
@@ -148,9 +148,9 @@ static DebugViewConfig LoadDebugViewConfig(const std::string& config_path) {
     fs::path config_dir = fs::path(config_path).parent_path();
     if (config_dir.empty()) config_dir = ".";
     ResolveConfigPath(config_dir,
-                      &config.camera.spacemit_las2.model_path);
+                    &config.camera.spacemit_las2.model_path);
     ResolveConfigPath(config_dir,
-                      &config.camera.spacemit_las2.calib_path);
+                    &config.camera.spacemit_las2.calib_path);
     ResolveConfigPath(config_dir, &config.detection_config_path);
     return config;
 }
@@ -206,9 +206,9 @@ int main(int argc, char* argv[]) {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                         << "Options:\n"
                         << "  --config <yaml>    Pipeline config "
-                           "(default: ../config/grasp_pipeline.yaml)\n"
+                        "(default: ../config/grasp_pipeline.yaml)\n"
                         << "  --output <dir>     Output directory "
-                           "(default: ./debug_view_output)\n"
+                        "(default: ./debug_view_output)\n"
                         << "  --frames <N>       Number of frames to capture (default: 1)\n"
                         << "  --no-detect        Skip detection, only save raw images\n"
                         << "  --warmup <N>       Override backend warmup frame count\n"
@@ -217,7 +217,7 @@ int main(int argc, char* argv[]) {
                         << "  " << argv[0] << " --config ../config/grasp_pipeline.yaml\n"
                         << "  " << argv[0]
                         << " --config ../config/grasp_pipeline.yaml "
-                           "--frames 5 --output /tmp/debug\n"
+                        "--frames 5 --output /tmp/debug\n"
                         << "  " << argv[0] << " --no-detect --frames 3\n";
             return 0;
         } else if (arg == "--config" && i + 1 < argc) {
@@ -243,8 +243,8 @@ int main(int argc, char* argv[]) {
 
     if (num_frames < 1 || warmup_frames < -1) {
         std::cerr << "[debug_view] --frames must be positive; --warmup "
-                     "must be -1 or non-negative"
-                  << std::endl;
+                    "must be -1 or non-negative"
+                << std::endl;
         return 1;
     }
     if (warmup_frames < 0) {
@@ -258,11 +258,11 @@ int main(int argc, char* argv[]) {
 
     // ============ 初始化相机 ============
     std::cout << "[debug_view] Initializing camera backend: "
-              << config.camera.type << std::endl;
+            << config.camera.type << std::endl;
     auto camera = perceptive_grasp::CreateStereoCamera(config.camera);
     if (!camera || !camera->Init()) {
         std::cerr << "[debug_view] Failed to initialize camera backend: "
-                  << config.camera.type << std::endl;
+                << config.camera.type << std::endl;
         return 1;
     }
 
@@ -275,7 +275,7 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < warmup_frames; i++) {
         if (!camera->GetFrames(color, depth)) {
             std::cerr << "[debug_view] Failed to acquire warmup frame "
-                      << (i + 1) << std::endl;
+                    << (i + 1) << std::endl;
             return 1;
         }
     }
@@ -287,12 +287,12 @@ int main(int argc, char* argv[]) {
 
     if (do_detect) {
         std::cout << "[debug_view] Detection config: "
-                  << config.detection_config_path << std::endl;
+                << config.detection_config_path << std::endl;
         vision = VisionService::Create(
             config.detection_config_path, "", false);
         if (!vision) {
             std::cerr << "[debug_view] VisionService create failed: "
-                      << VisionService::LastCreateError() << std::endl;
+                    << VisionService::LastCreateError() << std::endl;
             do_detect = false;
         } else {
             const std::string label_path =
@@ -301,7 +301,7 @@ int main(int argc, char* argv[]) {
                 labels = LoadLabels(label_path);
             }
             std::cout << "[debug_view] VisionService ready, "
-                      << labels.size() << " labels loaded" << std::endl;
+                    << labels.size() << " labels loaded" << std::endl;
         }
     }
 #else
@@ -318,7 +318,7 @@ int main(int argc, char* argv[]) {
         if (!camera->GetFrames(color, depth) || color.empty() ||
             depth.empty()) {
             std::cerr << "[debug_view] Failed to acquire frame "
-                      << frame_idx << std::endl;
+                    << frame_idx << std::endl;
             return 1;
         }
 
@@ -478,7 +478,7 @@ int main(int argc, char* argv[]) {
                             << std::fixed << std::setprecision(1) << infer_ms
                             << " ms)" << std::endl;
                 std::cout << "[Frame " << frame_idx << "] Result: "
-                          << pfx + "_result.txt" << std::endl;
+                        << pfx + "_result.txt" << std::endl;
             } else {
                 std::cerr << "[Frame " << frame_idx << "] Detection failed (status="
                             << status << ")" << std::endl;
@@ -491,7 +491,7 @@ int main(int argc, char* argv[]) {
 
     camera.reset();
     std::cout << "[debug_view] Done. Files saved to: "
-              << fs::absolute(output_dir).string() << std::endl;
+            << fs::absolute(output_dir).string() << std::endl;
 
     return 0;
 }

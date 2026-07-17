@@ -33,33 +33,18 @@ perceptive grasp 提供以下功能：
 1. 按[方案依赖](docs/sdk_dependencies.md)下载源码，安装系统依赖，构建依赖组件，并获取视觉和语音模型。
 2. 按[硬件部署](docs/hardware_setup.md)连接立体相机、机械臂、底盘和音频设备。
 
-## 4. 配置与检查
+## 4. 配置
 
 主配置文件为 [`config/grasp_pipeline.yaml`](config/grasp_pipeline.yaml)。首次部署时至少完成以下配置：
 
-1. 运行环境检查，确认机械臂和底盘的稳定串口路径。
+1. 确认机械臂和底盘的稳定串口路径。
 2. 选择立体相机后端，并填写后端所需的设备、模型和标定参数。
 3. 完成 eye-to-hand 标定，更新 `calibration.T_base_camera`。
 4. 根据实际音频设备更新 asr 和 tts 设备编号。
 
 字段说明和配置步骤见[抓取配置参考](docs/grasp_config.md)和[手眼标定](docs/hand_eye_calibration.md)。
 
-运行检查：
-
-```bash
-cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
-source ~/spacemit_robot/build/envsetup.sh
-source ~/.venv-grasp/bin/activate
-python3 scripts/check_runtime_env.py --config config/grasp_pipeline.yaml
-```
-
-环境可运行时，最后一行显示：
-
-```text
-[SUMMARY] ready
-```
-
-## 5. 构建应用
+## 5. 构建与检查
 
 ```bash
 cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
@@ -67,6 +52,22 @@ source ~/spacemit_robot/build/envsetup.sh
 rm -rf build
 cmake -S . -B build
 cmake --build build -j"$(nproc)"
+```
+
+构建目录中的 `perceptive_grasp` 是结构化日志启动器，
+`perceptive_grasp_core` 是实际运行抓取 pipeline 的 c++ 程序。正常运行应使用启动器。
+
+构建完成后检查运行环境：
+
+```bash
+source ~/.venv-grasp/bin/activate
+python3 scripts/check_runtime_env.py --config config/grasp_pipeline.yaml
+```
+
+检查脚本会同时验证启动器和核心程序。环境可运行时，最后一行显示：
+
+```text
+[SUMMARY] ready
 ```
 
 ## 6. 运行抓取

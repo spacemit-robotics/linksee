@@ -6,8 +6,8 @@
     * @brief 视觉抓取主 Pipeline - 串联检测、定位、规划、执行
     */
 
-#ifndef PERCEPTIVE_GRASP_GRASP_PIPELINE_H_
-#define PERCEPTIVE_GRASP_GRASP_PIPELINE_H_
+#ifndef GRASP_PIPELINE_H
+#define GRASP_PIPELINE_H
 
 #include <array>
 #include <atomic>
@@ -245,7 +245,7 @@ private:
     void SetState(PipelineState new_state, const std::string& msg = "");
     void BeginTaskTiming();
     void PrintTaskSummary(PipelineState terminal_state,
-                          const std::string& message);
+                        const std::string& message);
     void ResetTaskState();
     bool HasActiveAction() const { return action_.active; }
     bool StartAction(PipelineState owner, const std::string& name,
@@ -278,4 +278,4 @@ private:
 
 }  // namespace perceptive_grasp
 
-#endif  // PERCEPTIVE_GRASP_GRASP_PIPELINE_H_
+#endif  // GRASP_PIPELINE_H

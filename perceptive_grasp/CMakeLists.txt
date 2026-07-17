@@ -157,28 +157,28 @@ if(ENABLE_LAS2_CAMERA)
             set(_LAS2_PATCH_DIR "${CMAKE_BINARY_DIR}/las2_runtime")
             set(_LAS2_PATCHED_LIBRARY
                 "${_LAS2_PATCH_DIR}/liblas2_usb_stereo.so")
-            file(MAKE_DIRECTORY "${_LAS2_PATCH_DIR}")
-            configure_file("${LAS2_LIBRARY}" "${_LAS2_PATCHED_LIBRARY}"
-                           COPYONLY)
             string(CONCAT _LAS2_PRIVATE_RPATH
                 "${_LAS2_LIB_DIR}:${_LAS2_ROOT_DIR}/lib/spacemit_ort:"
                 "${_LAS2_ROOT_DIR}/lib/opencv")
-            execute_process(
+            add_custom_command(
+                OUTPUT "${_LAS2_PATCHED_LIBRARY}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory
+                    "${_LAS2_PATCH_DIR}"
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${LAS2_LIBRARY}" "${_LAS2_PATCHED_LIBRARY}"
                 COMMAND "${PATCHELF_EXECUTABLE}" --set-rpath
-                    "${_LAS2_PRIVATE_RPATH}"
-                    "${_LAS2_PATCHED_LIBRARY}"
-                RESULT_VARIABLE _LAS2_PATCHELF_RESULT
+                    "${_LAS2_PRIVATE_RPATH}" "${_LAS2_PATCHED_LIBRARY}"
+                DEPENDS "${LAS2_LIBRARY}"
+                COMMENT "Preparing private spacemit_las2 runtime"
+                VERBATIM
             )
-            if(_LAS2_PATCHELF_RESULT EQUAL 0)
-                set(_LAS2_LINK_LIBRARY "${_LAS2_PATCHED_LIBRARY}")
-                list(APPEND EXTRA_BUILD_RPATH "${_LAS2_PATCH_DIR}")
-                message(STATUS
-                    "[Camera] LAS2 private runtime path fixed for this build")
-            else()
-                message(WARNING
-                    "[Camera] Failed to patch LAS2 RUNPATH; "
-                    "LD_LIBRARY_PATH is required at runtime")
-            endif()
+            add_custom_target(spacemit_las2_runtime
+                DEPENDS "${_LAS2_PATCHED_LIBRARY}")
+            set(_LAS2_RUNTIME_TARGET spacemit_las2_runtime)
+            set(_LAS2_LINK_LIBRARY "${_LAS2_PATCHED_LIBRARY}")
+            list(APPEND EXTRA_BUILD_RPATH "${_LAS2_PATCH_DIR}")
+            message(STATUS
+                "[Camera] LAS2 private runtime will be prepared during build")
         else()
             message(WARNING
                 "[Camera] patchelf not found; LD_LIBRARY_PATH is required "
@@ -345,6 +345,9 @@ message(STATUS "")
 # ============ 主程序与日志入口 ============
 
 add_executable(perceptive_grasp_core ${SOURCES})
+if(DEFINED _LAS2_RUNTIME_TARGET)
+    add_dependencies(perceptive_grasp_core ${_LAS2_RUNTIME_TARGET})
+endif()
 
 target_include_directories(perceptive_grasp_core PRIVATE ${EXTRA_INCLUDE_DIRS})
 target_link_libraries(perceptive_grasp_core PRIVATE ${EXTRA_LIBRARIES})
@@ -476,6 +479,9 @@ if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA)
         target_link_libraries(debug_view PRIVATE realsense2::realsense2)
     endif()
     if(HAVE_LAS2_CAMERA)
+        if(DEFINED _LAS2_RUNTIME_TARGET)
+            add_dependencies(debug_view ${_LAS2_RUNTIME_TARGET})
+        endif()
         target_include_directories(debug_view PRIVATE ${LAS2_INCLUDE_DIR})
         target_link_libraries(debug_view PRIVATE ${_LAS2_LINK_LIBRARY})
         target_link_options(debug_view PRIVATE ${EXTRA_LINK_OPTIONS})
@@ -533,6 +539,9 @@ if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA)
             realsense2::realsense2)
     endif()
     if(HAVE_LAS2_CAMERA)
+        if(DEFINED _LAS2_RUNTIME_TARGET)
+            add_dependencies(debug_localize ${_LAS2_RUNTIME_TARGET})
+        endif()
         target_include_directories(debug_localize PRIVATE ${LAS2_INCLUDE_DIR})
         target_link_libraries(debug_localize PRIVATE ${_LAS2_LINK_LIBRARY})
         target_link_options(debug_localize PRIVATE ${EXTRA_LINK_OPTIONS})

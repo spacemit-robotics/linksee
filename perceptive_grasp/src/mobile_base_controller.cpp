@@ -1,10 +1,10 @@
 /*
- * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
- * SPDX-License-Identifier: Apache-2.0
- *
- * @file mobile_base_controller.cpp
- * @brief Chassis-assisted target alignment implementation.
- */
+* Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+* SPDX-License-Identifier: Apache-2.0
+*
+* @file mobile_base_controller.cpp
+* @brief Chassis-assisted target alignment implementation.
+*/
 
 #include "mobile_base_controller.h"
 
@@ -32,9 +32,9 @@ int ClampDurationMs(int duration_ms, const MobileBaseAlignmentConfig& config) {
 int ClampRotationDurationMs(
     int duration_ms, const MobileBaseAlignmentConfig& config) {
     return std::clamp(duration_ms,
-                      std::max(config.min_cmd_duration_ms,
-                               config.min_rotation_duration_ms),
-                      config.max_cmd_duration_ms);
+                    std::max(config.min_cmd_duration_ms,
+                            config.min_rotation_duration_ms),
+                    config.max_cmd_duration_ms);
 }
 
 #ifdef HAVE_CHASSIS
@@ -152,7 +152,7 @@ float RequiredMobileBaseAlignmentProgress(
             std::fabs(previous_command.linear_x) *
             static_cast<float>(previous_command.duration_ms) / 1000.0f;
     } else if (previous_command.type ==
-               MobileBaseAlignmentCommand::Type::ROTATE) {
+            MobileBaseAlignmentCommand::Type::ROTATE) {
         const float y_limit =
             config.y_tolerance + std::max(0.0f, config.y_hysteresis);
         requested_correction_m = std::max(
@@ -162,9 +162,9 @@ float RequiredMobileBaseAlignmentProgress(
     const float scaled =
         requested_correction_m * std::max(0.0f, config.min_progress_ratio);
     return std::clamp(scaled,
-                      std::max(0.0f, config.min_progress_floor_m),
-                      std::max(config.min_progress_floor_m,
-                               config.min_progress_m));
+                    std::max(0.0f, config.min_progress_floor_m),
+                    std::max(config.min_progress_floor_m,
+                            config.min_progress_m));
 }
 
 MobileBaseController::MobileBaseController(

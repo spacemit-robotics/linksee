@@ -6,8 +6,8 @@
     * @brief RealSense D435i 深度相机封装
     */
 
-#ifndef PERCEPTIVE_GRASP_DEPTH_CAMERA_H_
-#define PERCEPTIVE_GRASP_DEPTH_CAMERA_H_
+#ifndef DEPTH_CAMERA_H
+#define DEPTH_CAMERA_H
 
 #include <librealsense2/rs.hpp>
 #include <opencv2/core.hpp>
@@ -86,4 +86,4 @@ private:
 
 }  // namespace perceptive_grasp
 
-#endif  // PERCEPTIVE_GRASP_DEPTH_CAMERA_H_
+#endif  // DEPTH_CAMERA_H

@@ -1,10 +1,10 @@
 /*
- * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
- * SPDX-License-Identifier: Apache-2.0
- *
- * @file stereo_geometry.cpp
- * @brief Stereo calibration and output-intrinsics helpers.
- */
+* Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+* SPDX-License-Identifier: Apache-2.0
+*
+* @file stereo_geometry.cpp
+* @brief Stereo calibration and output-intrinsics helpers.
+*/
 
 #include "stereo_geometry.h"
 
@@ -70,8 +70,8 @@ bool ReadVector(const cv::FileStorage& storage, const char* key,
 }  // namespace
 
 bool LoadRectifiedLeftIntrinsics(const std::string& calibration_json,
-                                 PinholeIntrinsics& intrinsics,
-                                 std::string& error) {
+                                PinholeIntrinsics& intrinsics,
+                                std::string& error) {
     intrinsics = {};
     error.clear();
     try {
@@ -124,10 +124,10 @@ bool LoadRectifiedLeftIntrinsics(const std::string& calibration_json,
         cv::Mat right_projection;
         cv::Mat disparity_to_depth;
         cv::stereoRectify(left_camera, left_distortion, right_camera,
-                          right_distortion, size, rotation, translation,
-                          left_rectification, right_rectification,
-                          left_projection, right_projection, disparity_to_depth,
-                          cv::CALIB_ZERO_DISPARITY, 0.0, size);
+                        right_distortion, size, rotation, translation,
+                        left_rectification, right_rectification,
+                        left_projection, right_projection, disparity_to_depth,
+                        cv::CALIB_ZERO_DISPARITY, 0.0, size);
 
         intrinsics.width = size.width;
         intrinsics.height = size.height;
@@ -149,10 +149,10 @@ bool LoadRectifiedLeftIntrinsics(const std::string& calibration_json,
 }
 
 bool ScaleIntrinsicsWithLetterbox(const PinholeIntrinsics& source,
-                                  int output_width,
-                                  int output_height,
-                                  PinholeIntrinsics& output,
-                                  std::string& error) {
+                                int output_width,
+                                int output_height,
+                                PinholeIntrinsics& output,
+                                std::string& error) {
     output = {};
     error.clear();
     if (source.width <= 0 || source.height <= 0 || !(source.fx > 0.0) ||

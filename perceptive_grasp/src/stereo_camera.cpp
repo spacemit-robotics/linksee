@@ -1,10 +1,10 @@
 /*
- * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
- * SPDX-License-Identifier: Apache-2.0
- *
- * @file stereo_camera.cpp
- * @brief Stereo camera backend factory.
- */
+* Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+* SPDX-License-Identifier: Apache-2.0
+*
+* @file stereo_camera.cpp
+* @brief Stereo camera backend factory.
+*/
 
 #include "stereo_camera.h"
 
@@ -25,9 +25,9 @@ class UnsupportedRealSenseCamera final : public StereoCamera {
 public:
     bool Init() override {
         std::cerr << "[StereoCamera] camera.type=realsense requested, but "
-                  << "the realsense backend is not available in this build. "
-                  << "Install the realsense dependency and rebuild."
-                  << std::endl;
+                << "the realsense backend is not available in this build. "
+                << "Install the realsense dependency and rebuild."
+                << std::endl;
         return false;
     }
 
@@ -44,9 +44,9 @@ class UnsupportedSpacemitLas2Camera final : public StereoCamera {
 public:
     bool Init() override {
         std::cerr << "[StereoCamera] camera.type=spacemit_las2 requested, but "
-                  << "the spacemit_las2 backend is not available in this "
-                  << "build. Install it under ~/las2_runtime or set "
-                  << "LAS2_RUNTIME_DIR, then rebuild." << std::endl;
+                << "the spacemit_las2 backend is not available in this "
+                << "build. Install it under ~/las2_runtime or set "
+                << "LAS2_RUNTIME_DIR, then rebuild." << std::endl;
         return false;
     }
 
@@ -81,7 +81,7 @@ std::unique_ptr<StereoCamera> CreateStereoCamera(
     }
 
     std::cerr << "[StereoCamera] Unknown camera.type: " << config.type
-              << std::endl;
+            << std::endl;
     return nullptr;
 }
 
