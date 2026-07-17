@@ -689,8 +689,12 @@ def check_las2_camera(camera: Dict[str, Any], sdk_root: str) -> bool:
     ok &= status(count_ok, "LAS2 core_count", str(core_count))
     affinity_ok = count_ok and len(affinity_ids) == core_count \
         and len(set(affinity_ids)) == len(affinity_ids) \
-        and all(0 <= core <= 15 for core in affinity_ids)
-    ok &= status(affinity_ok, "LAS2 core_affinity", core_affinity)
+        and all(8 <= core <= 15 for core in affinity_ids)
+    affinity_detail = core_affinity if affinity_ok else (
+        f"{core_affinity}; expected {core_count} unique X100 AI core IDs "
+        "in range 8-15"
+    )
+    ok &= status(affinity_ok, "LAS2 core_affinity", affinity_detail)
     library = _find_las2_library(sdk_root, model, calibration)
     ok &= status(bool(library), "liblas2_usb_stereo.so",
                  library or "set LAS2_RUNTIME_DIR or LD_LIBRARY_PATH")

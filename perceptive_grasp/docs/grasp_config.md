@@ -55,7 +55,7 @@ camera:
 - `model_path`：spacemit_las2 onnx 模型路径，支持以 `~/` 表示当前用户主目录。
 - `calib_path`：双目标定 json 路径，支持以 `~/` 表示当前用户主目录。
 - `core_count`：spacemit_las2 深度推理会话数。
-- `core_affinity`：深度推理绑定的 linux 逻辑核，条目数必须与 `core_count` 一致。
+- `core_affinity`：深度推理绑定的 x100 ai 逻辑核，条目数必须与 `core_count` 一致，有效范围为 `8–15`。
 - `depth.min_m`、`depth.max_m`：参与抓取定位的有效深度范围，单位米。
 
 程序根据 `calib_path` 中的双目标定结果完成图像校正和三维反投影。
