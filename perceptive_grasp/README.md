@@ -54,8 +54,7 @@ cmake -S . -B build
 cmake --build build -j"$(nproc)"
 ```
 
-构建目录中的 `perceptive_grasp` 是结构化日志启动器，
-`perceptive_grasp_core` 是实际运行抓取 pipeline 的 c++ 程序。正常运行应使用启动器。
+构建目录中的 `perceptive_grasp` 是结构化日志启动器，`perceptive_grasp_core` 是实际运行抓取 pipeline 的 c++ 程序。正常运行应使用启动器。
 
 构建完成后检查运行环境：
 
