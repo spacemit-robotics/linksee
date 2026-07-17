@@ -1639,6 +1639,17 @@ void GraspPipeline::HandlePlanning() {
     SaveGraspDebug(static_cast<float>(cx), static_cast<float>(cy), depth_mm,
                     cam_point, base_point, offset_dir_angle);
 
+    if (!planner_->InWorkspace(pre_grasp_pose_.x, pre_grasp_pose_.y,
+                               base_point[2])) {
+        SetState(PipelineState::ERROR,
+            "Adjusted grasp pose out of workspace after gripper_offset: "
+            "pose=[" + std::to_string(pre_grasp_pose_.x) + ", " +
+            std::to_string(pre_grasp_pose_.y) + ", " +
+            std::to_string(pre_grasp_pose_.z) + "], offset=" +
+            std::to_string(config_.planner.gripper_offset));
+        return;
+    }
+
     if (config_.performance_log_enabled) {
         const auto planning_end = std::chrono::steady_clock::now();
         const auto planning_ms =
