@@ -65,8 +65,17 @@ function(fetch_third_party)
                 RESULT_VARIABLE fetch_result
             )
             if(NOT fetch_result EQUAL 0)
-                message(FATAL_ERROR
-                    "Failed to fetch ${ARG_NAME} commit ${ARG_GIT_COMMIT}")
+                message(STATUS
+                    "Shallow fetch failed for ${ARG_NAME}; retrying full fetch")
+                execute_process(
+                    COMMAND git fetch --tags --prune origin
+                    WORKING_DIRECTORY "${source_dir}"
+                    RESULT_VARIABLE full_fetch_result
+                )
+                if(NOT full_fetch_result EQUAL 0)
+                    message(FATAL_ERROR
+                        "Failed to fetch ${ARG_NAME} commit ${ARG_GIT_COMMIT}")
+                endif()
             endif()
         endif()
         execute_process(

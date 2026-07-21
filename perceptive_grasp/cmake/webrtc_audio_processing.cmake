@@ -15,14 +15,7 @@ fetch_third_party(
     OUT_SOURCE_DIR WEBRTC_SOURCE_DIR
 )
 
-if(DEFINED ENV{SROBOTIS_THIRDPARTY_CACHE})
-    set(WEBRTC_CACHE_DIR "$ENV{SROBOTIS_THIRDPARTY_CACHE}")
-elseif(DEFINED ENV{HOME})
-    set(WEBRTC_CACHE_DIR "$ENV{HOME}/.cache/thirdparty")
-else()
-    set(WEBRTC_CACHE_DIR "${CMAKE_BINARY_DIR}/.cache/thirdparty")
-endif()
-set(WEBRTC_BINARY_DIR "${WEBRTC_CACHE_DIR}/webrtc-audio-processing/build")
+set(WEBRTC_BINARY_DIR "${WEBRTC_SOURCE_DIR}/build")
 
 include(ExternalProject)
 ExternalProject_Add(webrtc_audio_processing_project
