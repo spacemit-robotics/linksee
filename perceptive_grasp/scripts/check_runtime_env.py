@@ -572,6 +572,60 @@ def check_application_binaries() -> bool:
     return ok
 
 
+def check_voice_echo_cancellation(root: Dict[str, Any]) -> bool:
+    voice = root.get("voice", {}) if isinstance(root, dict) else {}
+    echo_config = voice.get("echo_cancellation", {}) \
+        if isinstance(voice, dict) else {}
+    echo_config = echo_config if isinstance(echo_config, dict) else {}
+    mode = str(echo_config.get("mode", "half_duplex")).strip().lower()
+    supported_modes = ("hardware_aec", "webrtc_aec", "half_duplex")
+    if mode not in supported_modes:
+        return status(
+            False,
+            "voice echo cancellation",
+            f"unsupported mode {mode!r}",
+        )
+    if mode != "webrtc_aec":
+        return status(True, "voice echo cancellation", f"mode={mode}")
+
+    project_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), os.pardir)
+    )
+    candidates = [
+        os.environ.get("PERCEPTIVE_GRASP_VOICE_AEC_LIB", ""),
+        os.path.join(project_root, "build", "libperceptive_voice_aec.so"),
+        os.path.join(project_root, "build_las2", "libperceptive_voice_aec.so"),
+        os.path.abspath(os.path.join(
+            os.path.dirname(__file__), os.pardir, os.pardir, os.pardir,
+            "lib", "libperceptive_voice_aec.so",
+        )),
+    ]
+    library = next((path for path in candidates if path and os.path.isfile(path)), "")
+    if not library:
+        return status(
+            False,
+            "WebRTC AEC library",
+            "libperceptive_voice_aec.so not found; install meson and "
+            "ninja-build, then rebuild perceptive_grasp",
+        )
+
+    try:
+        result = subprocess.run(
+            ["ldd", library],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return status(False, "WebRTC AEC runtime libraries", str(exc))
+    output = (result.stdout or "") + (result.stderr or "")
+    missing = [line.strip() for line in output.splitlines() if "not found" in line]
+    if missing:
+        return status(False, "WebRTC AEC runtime libraries", "; ".join(missing))
+    return status(True, "voice echo cancellation", f"mode={mode}; {library}")
+
+
 def _check_las2_runtime_libraries(library: str,
                                   application: str = "") -> bool:
     ldd_target = application or library
@@ -942,6 +996,7 @@ def main() -> int:
                 if not imported:
                     missing_modules.append(module)
         ok &= imports_ok
+        ok &= check_voice_echo_cancellation(root)
         ok &= check_audio_permissions(fixer)
         ok &= list_audio_devices()
 

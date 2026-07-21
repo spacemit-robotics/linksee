@@ -24,6 +24,55 @@ import check_runtime_env  # noqa: E402
 
 
 class RuntimeEnvDiagnosticsTest(unittest.TestCase):
+    def test_hardware_aec_does_not_require_software_library(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            ok = check_runtime_env.check_voice_echo_cancellation({
+                "voice": {
+                    "echo_cancellation": {"mode": "hardware_aec"},
+                },
+            })
+
+        self.assertTrue(ok)
+        self.assertIn("mode=hardware_aec", output.getvalue())
+
+    def test_webrtc_aec_requires_native_library(self):
+        with mock.patch.object(check_runtime_env.os.path, "isfile",
+                               return_value=False):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_voice_echo_cancellation({
+                    "voice": {
+                        "echo_cancellation": {"mode": "webrtc_aec"},
+                    },
+                })
+
+        self.assertFalse(ok)
+        self.assertIn("libperceptive_voice_aec.so not found", output.getvalue())
+
+    def test_webrtc_aec_accepts_installed_library(self):
+        def is_installed_library(path):
+            return path.endswith("/lib/libperceptive_voice_aec.so")
+
+        ldd_result = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch.object(
+                check_runtime_env.os.path,
+                "isfile",
+                side_effect=is_installed_library), mock.patch.object(
+                    check_runtime_env.subprocess,
+                    "run",
+                    return_value=ldd_result):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_voice_echo_cancellation({
+                    "voice": {
+                        "echo_cancellation": {"mode": "webrtc_aec"},
+                    },
+                })
+
+        self.assertTrue(ok)
+        self.assertIn("mode=webrtc_aec", output.getvalue())
+
     def test_config_path_expands_user_home(self):
         with mock.patch.dict(os.environ, {"HOME": "/home/annyi"}):
             resolved = check_runtime_env.expand_config_path(

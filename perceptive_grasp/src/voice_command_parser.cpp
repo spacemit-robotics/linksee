@@ -9,6 +9,8 @@
 #include "voice_command_parser.h"
 
 #include <cctype>
+#include <string>
+#include <vector>
 
 namespace perceptive_grasp {
 
@@ -119,7 +121,7 @@ std::optional<std::string> VoiceCommandParser::ParseTarget(
     std::string tail = normalized.substr(trigger_pos + trigger_len);
     if (tail.empty()) return "";
 
-    return ResolveTargetText(tail);
+    return ResolveKnownTargetText(tail);
 }
 
 std::optional<std::string> VoiceCommandParser::ResolveTargetText(

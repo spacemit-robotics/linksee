@@ -44,6 +44,8 @@ sudo apt install -y \
   patchelf \
   cmake \
   build-essential \
+  meson \
+  ninja-build \
   python3-pip \
   python3-venv \
   libyaml-cpp-dev \
@@ -51,6 +53,8 @@ sudo apt install -y \
   libboost-all-dev \
   liburdfdom-dev
 ```
+
+`meson` 和 `ninja-build` 用于构建语音桥的 webrtc 软件回声消除模块。只使用硬件回声消除或 `half_duplex` 模式时，可以在 cmake 配置阶段设置 `-DENABLE_WEBRTC_AEC=OFF`。
 
 ### 2.2 安装 pinocchio
 

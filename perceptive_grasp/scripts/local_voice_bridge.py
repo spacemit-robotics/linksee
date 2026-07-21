@@ -8,12 +8,16 @@
 
 import argparse
 import collections
+import ctypes
+import ctypes.util
+import os
 import queue
 import re
 import signal
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 from asr_node import load_voice_config
@@ -29,9 +33,192 @@ from tts_node import (
 STATUS_PREFIX = "VOICE_STATUS\t"
 READY_LOG_LINE = "[Pipeline] IDLE | Ready"
 READY_STATUS_EVENT = "state=IDLE;message=Ready"
-VOICE_BRIDGE_VERSION = "2026-07-16-atomic-status-v7"
+VOICE_BRIDGE_VERSION = "2026-07-21-webrtc-aec-v10"
 CAPTURE_RATE_CANDIDATES = (48000, 44100, 32000, 16000, 8000)
 WAITING_PROMPT = "请继续说要抓取的物体。"
+TTS_ECHO_GUARD_MS = 600
+WEBRTC_AEC_TAIL_MS = 200
+ECHO_CANCELLATION_MODES = ("hardware_aec", "webrtc_aec", "half_duplex")
+
+
+def load_echo_cancellation_config(voice_cfg):
+    config = voice_cfg.get("echo_cancellation", {}) or {}
+    mode = str(config.get("mode", "half_duplex")).strip().lower()
+    if mode not in ECHO_CANCELLATION_MODES:
+        supported = ", ".join(ECHO_CANCELLATION_MODES)
+        raise ValueError(
+            f"unsupported voice.echo_cancellation.mode={mode!r}; "
+            f"expected one of: {supported}"
+        )
+    return mode, config
+
+
+def update_aec_tail(frame_end, playback_active, has_reference,
+                    tail_until, tail_ms=WEBRTC_AEC_TAIL_MS):
+    if playback_active or has_reference:
+        return max(tail_until, frame_end + tail_ms / 1000.0)
+    return tail_until
+
+
+class PlaybackReferenceTimeline:
+    """Map queued playback samples onto the microphone capture clock."""
+
+    def __init__(self, sample_rate, delay_ms, clock=time.monotonic):
+        self.sample_rate = sample_rate
+        self.delay_sec = max(0, delay_ms) / 1000.0
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.segments = collections.deque()
+        self.next_start_time = 0.0
+
+    def schedule(self, audio, sample_rate, channels):
+        import numpy as np
+
+        samples = np.asarray(audio)
+        if samples.ndim == 2:
+            samples = samples.astype(np.float32).mean(axis=1)
+        elif channels > 1:
+            samples = samples.reshape(-1, channels).astype(np.float32).mean(axis=1)
+        else:
+            samples = samples.astype(np.float32).reshape(-1)
+        if np.issubdtype(np.asarray(audio).dtype, np.integer):
+            samples /= 32768.0
+        if sample_rate != self.sample_rate and len(samples) > 0:
+            output_length = max(
+                1, int(round(len(samples) * self.sample_rate / sample_rate))
+            )
+            source_x = np.linspace(0.0, 1.0, len(samples), endpoint=False)
+            target_x = np.linspace(0.0, 1.0, output_length, endpoint=False)
+            samples = np.interp(target_x, source_x, samples).astype(np.float32)
+
+        now = self.clock()
+        with self.lock:
+            start_time = max(now + self.delay_sec, self.next_start_time)
+            self.segments.append((start_time, samples.copy()))
+            self.next_start_time = start_time + len(samples) / self.sample_rate
+        return start_time
+
+    def read(self, frame_count, end_time=None):
+        import numpy as np
+
+        if end_time is None:
+            end_time = self.clock()
+        start_time = end_time - frame_count / self.sample_rate
+        output = np.zeros(frame_count, dtype=np.float32)
+
+        with self.lock:
+            while self.segments:
+                segment_start, segment = self.segments[0]
+                segment_end = segment_start + len(segment) / self.sample_rate
+                if segment_end >= start_time - 1.0:
+                    break
+                self.segments.popleft()
+
+            for segment_start, segment in self.segments:
+                segment_end = segment_start + len(segment) / self.sample_rate
+                if segment_start >= end_time:
+                    break
+                overlap_start = max(start_time, segment_start)
+                overlap_end = min(end_time, segment_end)
+                if overlap_end <= overlap_start:
+                    continue
+                output_offset = int(round(
+                    (overlap_start - start_time) * self.sample_rate
+                ))
+                segment_offset = int(round(
+                    (overlap_start - segment_start) * self.sample_rate
+                ))
+                count = min(
+                    int(round((overlap_end - overlap_start) * self.sample_rate)),
+                    frame_count - output_offset,
+                    len(segment) - segment_offset,
+                )
+                if count > 0:
+                    output[output_offset:output_offset + count] = (
+                        segment[segment_offset:segment_offset + count]
+                    )
+        return output
+
+
+def find_voice_aec_library(binary_path, environ=os.environ):
+    configured = environ.get("PERCEPTIVE_GRASP_VOICE_AEC_LIB")
+    candidates = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend([
+        Path(binary_path).expanduser().resolve().parent /
+        "libperceptive_voice_aec.so",
+        Path(__file__).resolve().parents[1] / "build" /
+        "libperceptive_voice_aec.so",
+        Path(__file__).resolve().parents[3] / "lib" /
+        "libperceptive_voice_aec.so",
+    ])
+    discovered = ctypes.util.find_library("perceptive_voice_aec")
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return discovered
+
+
+class WebRtcAecProcessor:
+    """ctypes wrapper around the native WebRTC APM frontend."""
+
+    def __init__(self, library_path, sample_rate, noise_suppression=True,
+                 high_pass_filter=True):
+        self.library = ctypes.CDLL(library_path)
+        self.library.voice_aec_create.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        self.library.voice_aec_create.restype = ctypes.c_void_p
+        self.library.voice_aec_destroy.argtypes = [ctypes.c_void_p]
+        self.library.voice_aec_frame_size.argtypes = [ctypes.c_void_p]
+        self.library.voice_aec_frame_size.restype = ctypes.c_int
+        self.library.voice_aec_process.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int16),
+            ctypes.POINTER(ctypes.c_int16),
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_int16),
+        ]
+        self.library.voice_aec_process.restype = ctypes.c_int
+        self.handle = self.library.voice_aec_create(
+            sample_rate,
+            int(noise_suppression),
+            int(high_pass_filter),
+        )
+        if not self.handle:
+            raise RuntimeError(
+                f"WebRTC AEC does not support sample rate {sample_rate}"
+            )
+        self.frame_size = self.library.voice_aec_frame_size(self.handle)
+
+    def process(self, microphone, playback_reference):
+        import numpy as np
+
+        microphone_int16 = (
+            np.clip(microphone, -1.0, 1.0) * 32767.0
+        ).astype(np.int16)
+        reference_int16 = (
+            np.clip(playback_reference, -1.0, 1.0) * 32767.0
+        ).astype(np.int16)
+        output = np.empty(self.frame_size, dtype=np.int16)
+        result = self.library.voice_aec_process(
+            self.handle,
+            microphone_int16.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+            reference_int16.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+            self.frame_size,
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+        )
+        if result != 0:
+            raise RuntimeError(f"WebRTC AEC processing failed: {result}")
+        return output.astype(np.float32) / 32768.0
+
+    def close(self):
+        if self.handle:
+            self.library.voice_aec_destroy(self.handle)
+            self.handle = None
 
 
 def build_grasp_command(binary: str, config: str,
@@ -424,7 +611,8 @@ def wait_for_grasp_ready(proc, status_queue, running,
     return False
 
 
-def run_asr_loop(args, proc, running):
+def run_asr_loop(args, proc, running, playback_active=None,
+                 playback_reference=None):
     import numpy as np
     import spacemit_asr
     import spacemit_audio
@@ -432,6 +620,7 @@ def run_asr_loop(args, proc, running):
     from spacemit_audio import AudioCapture
 
     voice_cfg = load_voice_config(args.config)
+    echo_mode, echo_config = load_echo_cancellation_config(voice_cfg)
     asr_cfg = voice_cfg.get("asr", {}) or {}
     device = args.device if args.device is not None else int(asr_cfg.get("device", -1))
     rate = args.rate if args.rate is not None else int(asr_cfg.get("rate", 16000))
@@ -492,11 +681,108 @@ def run_asr_loop(args, proc, running):
         resampler = spacemit_asr.Resampler(rate, target_rate, channels=1)
         print(f"[VoiceBridge] Resampler: {rate} -> {target_rate} Hz", flush=True)
 
+    aec_processor = None
+    if echo_mode == "webrtc_aec":
+        library_path = find_voice_aec_library(args.binary)
+        if library_path is None:
+            print(
+                "[VoiceBridge] WebRTC AEC library not found; rebuild with "
+                "ENABLE_WEBRTC_AEC=ON",
+                flush=True,
+            )
+            asr.shutdown()
+            running.clear()
+            return
+        try:
+            aec_processor = WebRtcAecProcessor(
+                library_path,
+                target_rate,
+                bool(echo_config.get("noise_suppression", True)),
+                bool(echo_config.get("high_pass_filter", True)),
+            )
+        except Exception as exc:
+            print(f"[VoiceBridge] WebRTC AEC initialization failed: {exc}",
+                  flush=True)
+            asr.shutdown()
+            running.clear()
+            return
+        print(
+            "[VoiceBridge] WebRTC AEC initialized: "
+            f"library={library_path}, frame_size={aec_processor.frame_size}",
+            flush=True,
+        )
+
     audio_queue = queue.Queue()
-    state = {"in_speech": False}
+    state = {
+        "in_speech": False,
+        "playback_suppressed": False,
+        "aec_pending": np.empty(0, dtype=np.float32),
+        "aec_pending_start": None,
+        "aec_tail_until": 0.0,
+        "aec_output_active": False,
+    }
     speech_buffer = []
     pre_buffer = collections.deque()
     pre_buf_max = target_rate * args.pre_buffer_ms // 1000
+
+    def clear_pending_audio():
+        dropped = 0
+        while True:
+            try:
+                audio_queue.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                return dropped
+
+    def reset_speech_segment():
+        state["in_speech"] = False
+        speech_buffer.clear()
+        pre_buffer.clear()
+
+    def is_playback_active():
+        return playback_active is not None and playback_active.is_set()
+
+    def apply_software_aec(samples):
+        if aec_processor is None:
+            return samples
+        if playback_reference is None:
+            raise RuntimeError("WebRTC AEC playback reference is unavailable")
+
+        callback_end = time.monotonic()
+        callback_start = callback_end - len(samples) / target_rate
+        if len(state["aec_pending"]) == 0:
+            state["aec_pending_start"] = callback_start
+        state["aec_pending"] = np.concatenate(
+            (state["aec_pending"], samples.astype(np.float32, copy=False))
+        )
+
+        processed_frames = []
+        frame_size = aec_processor.frame_size
+        while len(state["aec_pending"]) >= frame_size:
+            frame = state["aec_pending"][:frame_size]
+            state["aec_pending"] = state["aec_pending"][frame_size:]
+            frame_end = (
+                state["aec_pending_start"] + frame_size / target_rate
+            )
+            reference = playback_reference.read(frame_size, frame_end)
+            processed = aec_processor.process(frame, reference)
+            has_reference = bool(np.any(np.abs(reference) > 1e-5))
+            state["aec_tail_until"] = update_aec_tail(
+                frame_end,
+                is_playback_active(),
+                has_reference,
+                state["aec_tail_until"],
+            )
+            use_aec_output = frame_end <= state["aec_tail_until"]
+            if use_aec_output != state["aec_output_active"]:
+                state["aec_output_active"] = use_aec_output
+                path = "aec" if use_aec_output else "raw microphone"
+                print(f"\n[VoiceBridge] ASR audio path: {path}", flush=True)
+            processed_frames.append(processed if use_aec_output else frame.copy())
+            state["aec_pending_start"] = frame_end
+        if not processed_frames:
+            return np.empty(0, dtype=np.float32)
+        return np.concatenate(processed_frames)
 
     def on_audio(data: bytes):
         samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
@@ -506,6 +792,39 @@ def run_asr_loop(args, proc, running):
             samples = resampler.process(samples)
         if len(samples) == 0:
             return
+
+        if echo_mode == "webrtc_aec":
+            try:
+                samples = apply_software_aec(samples)
+            except Exception as exc:
+                print(f"\n[VoiceBridge] WebRTC AEC failed: {exc}", flush=True)
+                running.clear()
+                return
+            if len(samples) == 0:
+                return
+
+        if echo_mode == "half_duplex" and is_playback_active():
+            if not state["playback_suppressed"]:
+                state["playback_suppressed"] = True
+                reset_speech_segment()
+                dropped = clear_pending_audio()
+                print(
+                    "\r[VoiceBridge] ASR paused during TTS playback"
+                    f"; dropped_segments={dropped}",
+                    flush=True,
+                )
+            return
+
+        if echo_mode == "half_duplex" and state["playback_suppressed"]:
+            state["playback_suppressed"] = False
+            reset_speech_segment()
+            reset_vad = getattr(vad, "reset", None)
+            if callable(reset_vad):
+                try:
+                    reset_vad()
+                except Exception as exc:
+                    print(f"[VoiceBridge] VAD reset failed: {exc}", flush=True)
+            print("[VoiceBridge] ASR resumed after TTS echo guard", flush=True)
 
         result = vad.detect(samples, target_rate)
         if result is None:
@@ -548,6 +867,9 @@ def run_asr_loop(args, proc, running):
             f"device={device}, {rate}Hz, {channels}ch",
             flush=True,
         )
+        asr.shutdown()
+        if aec_processor is not None:
+            aec_processor.close()
         running.clear()
         return
     print(
@@ -561,8 +883,13 @@ def run_asr_loop(args, proc, running):
                 audio = audio_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
+            if echo_mode == "half_duplex" and is_playback_active():
+                continue
             result = asr.recognize(audio)
             if not result or result.is_empty:
+                continue
+            if echo_mode == "half_duplex" and is_playback_active():
+                print("[VoiceBridge] Drop ASR result captured during TTS", flush=True)
                 continue
             text = result.text.strip()
             if not text:
@@ -574,6 +901,8 @@ def run_asr_loop(args, proc, running):
     finally:
         capture.stop()
         asr.shutdown()
+        if aec_processor is not None:
+            aec_processor.close()
 
 
 def parse_args():
@@ -609,6 +938,11 @@ def parse_args():
 def main():
     args = parse_args()
     voice_cfg = load_voice_config(args.config)
+    try:
+        echo_mode, echo_config = load_echo_cancellation_config(voice_cfg)
+    except ValueError as exc:
+        print(f"[VoiceBridge] Invalid configuration: {exc}", flush=True)
+        return 2
     tts_cfg = voice_cfg.get("tts", {}) or {}
     reverse_aliases = make_reverse_aliases(voice_cfg.get("target_aliases", {}) or {})
 
@@ -641,6 +975,7 @@ def main():
 
     cmd = build_grasp_command(args.binary, args.config, args.grasp_arg)
     print(f"[VoiceBridge] Version: {VOICE_BRIDGE_VERSION}", flush=True)
+    print(f"[VoiceBridge] Echo cancellation: mode={echo_mode}", flush=True)
     print("[VoiceBridge] Start: " + " ".join(cmd), flush=True)
     print(
         "[VoiceBridge] TTS config: "
@@ -662,6 +997,13 @@ def main():
     running = make_running_event()
     text_queue = queue.Queue(maxsize=8)
     status_queue = queue.Queue(maxsize=16)
+    playback_active = threading.Event()
+    playback_reference = None
+    if echo_mode == "webrtc_aec":
+        playback_reference = PlaybackReferenceTimeline(
+            16000,
+            int(echo_config.get("delay_ms", 50)),
+        )
 
     def stop_handler(sig, frame):
         del sig, frame
@@ -699,18 +1041,30 @@ def main():
             thread.join(timeout=2.0)
         return 1
 
-    tts_thread = threading.Thread(
-        target=run_tts_worker,
-        args=(text_queue, running, preset, playback_device, playback_rate,
-              tts_channels, speed, volume, args.no_play, mixer_volume),
-        daemon=True,
-    )
-    threads.append(tts_thread)
-    tts_thread.start()
+    if tts_enabled:
+        tts_thread = threading.Thread(
+            target=run_tts_worker,
+            args=(text_queue, running, preset, playback_device, playback_rate,
+                  tts_channels, speed, volume, args.no_play, mixer_volume,
+                  playback_active,
+                  TTS_ECHO_GUARD_MS if echo_mode == "half_duplex" else 0,
+                  playback_reference.schedule if playback_reference else None),
+            daemon=True,
+        )
+        threads.append(tts_thread)
+        tts_thread.start()
+    else:
+        print("[VoiceBridge] TTS disabled", flush=True)
 
     try:
         if running.is_set():
-            run_asr_loop(args, proc, running)
+            run_asr_loop(
+                args,
+                proc,
+                running,
+                playback_active,
+                playback_reference,
+            )
         return 0 if proc.poll() in (None, 0) else proc.poll()
     finally:
         request_shutdown(proc, running, text_queue)

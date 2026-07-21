@@ -34,10 +34,15 @@ detection:
   stable_frames: 1
 
 # 手眼标定结果
+# spacemit_las2 相机标定结果
 calibration:
   T_base_camera:
     translation: [-0.019765, 0.048938, 0.312118]
     rotation: [-2.126969, -0.007183, -1.598329]
+# realsense 立体相机标定结果
+#    translation: [0.0441, 0.0515, 0.3035]
+#    rotation: [-2.3451, 0.0053, -1.4971]
+
 
 # 抓取策略
 grasp:
@@ -93,6 +98,13 @@ voice:
   home_words: ["结束", "待命", "休息", "回家", "回home", "回到home", "回初始", "回到初始", "end", "home"]
   split_command_timeout_ms: 5000
 
+  # 支持硬件 aec 时改为 hardware_aec；half_duplex 仅作为兼容回退。
+  echo_cancellation:
+    mode: "webrtc_aec"
+    delay_ms: 50
+    noise_suppression: true
+    high_pass_filter: true
+
   asr:
     device: 1
     rate: 16000
@@ -102,6 +114,7 @@ voice:
     vad_min_speech_duration_ms: 100
 
   tts:
+    enabled: true
     engine: "matcha:zh"
     playback_device: 1
     playback_rate: 48000

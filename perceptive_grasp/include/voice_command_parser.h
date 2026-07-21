@@ -67,8 +67,8 @@ public:
 
     /**
     * @brief Parse ASR text such as "抓香蕉" or "grab banana".
-    * @return target detector label, empty string for empty target, or nullopt
-    *         when no trigger word matched.
+    * @return configured target label, empty string for an omitted target, or
+    *         nullopt when no trigger word or configured target matched.
     */
     std::optional<std::string> ParseTarget(const std::string& text) const;
 

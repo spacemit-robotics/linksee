@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from typing import Dict, Optional
 
 
@@ -410,7 +411,9 @@ def write_audio_bytes(player, audio_bytes: bytes, channels: int,
 
 
 def run_tts_worker(text_queue, running, preset, playback_device, playback_rate,
-                   channels, speed, volume, no_play, mixer_volume=-1):
+                   channels, speed, volume, no_play, mixer_volume=-1,
+                   playback_active=None, echo_guard_ms=0,
+                   playback_observer=None):
     try:
         import numpy as np
         import spacemit_tts
@@ -481,12 +484,24 @@ def run_tts_worker(text_queue, running, preset, playback_device, playback_rate,
             audio = np.column_stack((audio, audio))
 
         if player is not None:
-            if not write_audio_bytes(player, audio.tobytes(), channels):
-                print("[TTS] Playback write failed")
-                continue
-            print(f"[TTS] Playback written: {len(audio)} samples")
+            if playback_active is not None:
+                playback_active.set()
+            try:
+                if playback_observer is not None:
+                    playback_observer(audio, playback_rate, channels)
+                if not write_audio_bytes(player, audio.tobytes(), channels):
+                    print("[TTS] Playback write failed")
+                    continue
+                print(f"[TTS] Playback written: {len(audio)} samples")
+            finally:
+                if echo_guard_ms > 0 and running.is_set():
+                    time.sleep(echo_guard_ms / 1000.0)
+                if playback_active is not None:
+                    playback_active.clear()
         print(f"[TTS] Done: {result.duration_ms}ms, RTF={result.rtf:.3f}")
 
+    if playback_active is not None:
+        playback_active.clear()
     if player is not None:
         player.stop()
         player.close()
