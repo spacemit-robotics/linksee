@@ -211,6 +211,12 @@ voice:
   home_words: ["结束", "待命", "休息", "回家", "回home", "回到home", "回初始", "回到初始", "end", "home"]
   split_command_timeout_ms: 5000
 
+  echo_cancellation:
+    mode: "webrtc_aec"
+    delay_ms: 50
+    noise_suppression: true
+    high_pass_filter: true
+
   asr:
     device: 1
     rate: 16000
@@ -220,6 +226,7 @@ voice:
     vad_min_speech_duration_ms: 100
 
   tts:
+    enabled: true
     engine: "matcha:zh"
     playback_device: 1
     playback_rate: 48000
@@ -241,11 +248,19 @@ voice:
 - `cancel_words`：停止当前任务并返回观察状态的关键词。
 - `home_words`：机械臂归位并退出程序的关键词。
 - `split_command_timeout_ms`：分段语音命令等待目标名称的超时时间，单位毫秒。
+- `echo_cancellation.mode`：回声处理模式。硬件已输出消回声录音时使用 `hardware_aec`；普通麦克风和扬声器组合使用 `webrtc_aec`；无法使用回声消除时可使用 `half_duplex`，tts 播放期间会暂停识别。
+- `echo_cancellation.delay_ms`：扬声器播放到回声进入麦克风的估计延迟，单位毫秒，仅用于 `webrtc_aec`。
+- `echo_cancellation.noise_suppression`：是否对软件 aec 输出启用低等级噪声抑制。
+- `echo_cancellation.high_pass_filter`：是否对软件 aec 输出启用高通滤波。
+
+`webrtc_aec` 在 tts 播放及短暂的回声尾音期间处理麦克风输入，播放结束后自动恢复原始麦克风音频。vad 和 asr 在两种路径之间保持连续运行。
+
 - `asr.device`：本地录音设备编号，按硬件检查输出的采集设备编号填写。
 - `asr.rate`、`asr.channels`：录音采样率和声道数。
 - `asr.vad_trigger_threshold`：开始收录语音的 vad 概率阈值。
 - `asr.vad_stop_threshold`：结束收录语音的 vad 概率阈值。
 - `asr.vad_min_speech_duration_ms`：允许识别的最短语音时长，单位毫秒。
+- `tts.enabled`：是否启用状态语音播报。关闭后不启动 tts 引擎和播放设备。
 - `tts.engine`：语音合成引擎及语言预设。
 - `tts.playback_device`：本地播放设备编号，按硬件检查输出的播放设备编号填写。
 - `tts.playback_rate`、`tts.channels`：播放采样率和声道数。

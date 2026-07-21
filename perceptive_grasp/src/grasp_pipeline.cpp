@@ -541,7 +541,7 @@ bool GraspPipeline::TriggerVoiceCommand(const std::string& command_text) {
     }
 
     if (!target.has_value()) {
-        std::cerr << "[Voice] No trigger word matched: "
+        std::cerr << "[Voice] No valid command or configured target matched: "
                     << command_text << std::endl;
         return false;
     }

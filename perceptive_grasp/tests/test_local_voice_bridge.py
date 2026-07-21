@@ -10,9 +10,12 @@ import unittest
 import contextlib
 import io
 import queue
+import threading
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
+import numpy as np
 import sys
 import yaml
 
@@ -259,6 +262,7 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         self.assertEqual(
             set(config["voice"]["tts"].keys()),
             {
+                "enabled",
                 "engine",
                 "playback_device",
                 "playback_rate",
@@ -269,6 +273,7 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
                 "speak_all_states",
             },
         )
+        self.assertTrue(config["voice"]["tts"]["enabled"])
         self.assertEqual(config["voice"]["tts"]["playback_device"], 1)
         self.assertGreaterEqual(config["voice"]["tts"]["mixer_volume"], -1)
         self.assertLessEqual(config["voice"]["tts"]["mixer_volume"], 100)
@@ -285,6 +290,7 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
                 "cancel_words",
                 "home_words",
                 "split_command_timeout_ms",
+                "echo_cancellation",
                 "asr",
                 "tts",
                 "target_aliases",
@@ -292,6 +298,204 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         )
         main_source = (ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
         self.assertIn('voice["home_words"]', main_source)
+
+    def test_pipeline_config_enables_webrtc_aec_for_usb_audio(self):
+        config_path = ROOT / "config" / "grasp_pipeline.yaml"
+        with config_path.open("r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+        echo_config = config["voice"]["echo_cancellation"]
+        self.assertEqual(echo_config["mode"], "webrtc_aec")
+        self.assertGreaterEqual(echo_config["delay_ms"], 0)
+        self.assertTrue(echo_config["noise_suppression"])
+
+    def test_echo_cancellation_mode_is_validated(self):
+        mode, config = local_voice_bridge.load_echo_cancellation_config({
+            "echo_cancellation": {"mode": "hardware_aec"},
+        })
+
+        self.assertEqual(mode, "hardware_aec")
+        self.assertEqual(config["mode"], "hardware_aec")
+        with self.assertRaises(ValueError):
+            local_voice_bridge.load_echo_cancellation_config({
+                "echo_cancellation": {"mode": "unknown"},
+            })
+
+    def test_voice_aec_library_uses_loader_discovery(self):
+        with mock.patch.object(Path, "is_file", return_value=False), \
+                mock.patch.object(
+                    local_voice_bridge.ctypes.util,
+                    "find_library",
+                    return_value="libperceptive_voice_aec.so"):
+            library = local_voice_bridge.find_voice_aec_library(
+                "build/perceptive_grasp",
+                environ={},
+            )
+
+        self.assertEqual(library, "libperceptive_voice_aec.so")
+
+    def test_playback_reference_timeline_applies_delay(self):
+        now = 10.0
+        timeline = local_voice_bridge.PlaybackReferenceTimeline(
+            sample_rate=16000,
+            delay_ms=50,
+            clock=lambda: now,
+        )
+        audio = np.full(160, 16384, dtype=np.int16)
+
+        start = timeline.schedule(audio, 16000, 1)
+        before = timeline.read(160, end_time=start)
+        during = timeline.read(160, end_time=start + 0.01)
+
+        self.assertAlmostEqual(start, 10.05)
+        np.testing.assert_array_equal(before, np.zeros(160, dtype=np.float32))
+        np.testing.assert_allclose(during, 0.5, atol=1e-4)
+
+    def test_webrtc_aec_output_is_limited_to_playback_and_echo_tail(self):
+        tail_until = local_voice_bridge.update_aec_tail(
+            frame_end=10.0,
+            playback_active=True,
+            has_reference=False,
+            tail_until=0.0,
+        )
+
+        self.assertAlmostEqual(tail_until, 10.2)
+        self.assertLessEqual(10.1, tail_until)
+        self.assertGreater(10.3, tail_until)
+        self.assertEqual(
+            local_voice_bridge.update_aec_tail(
+                frame_end=10.3,
+                playback_active=False,
+                has_reference=False,
+                tail_until=tail_until,
+            ),
+            tail_until,
+        )
+
+    def test_asr_capture_start_failure_releases_asr_and_aec(self):
+        class FakeVadConfig:
+            @classmethod
+            def preset(cls, name):
+                del name
+                return cls()
+
+            def with_trigger_threshold(self, value):
+                del value
+                return self
+
+            def with_stop_threshold(self, value):
+                del value
+                return self
+
+            def with_min_speech_duration(self, value):
+                del value
+                return self
+
+            def with_smoothing(self, value):
+                del value
+                return self
+
+        class FakeAsrConfig:
+            def __init__(self):
+                self._config = SimpleNamespace(num_threads=0)
+
+        class FakeAsrBackend:
+            backend_name = "fake"
+
+            def __init__(self):
+                self.shutdown_count = 0
+
+            def recognize(self, audio):
+                del audio
+                return None
+
+            def shutdown(self):
+                self.shutdown_count += 1
+
+        asr_backend = FakeAsrBackend()
+
+        class FakeAsrEngine:
+            def __init__(self, config):
+                del config
+
+            def initialize(self):
+                return asr_backend
+
+        class FakeCapture:
+            def set_callback(self, callback):
+                self.callback = callback
+
+            def start(self):
+                return False
+
+        fake_asr = SimpleNamespace(
+            Config=FakeAsrConfig,
+            Engine=FakeAsrEngine,
+            Language=SimpleNamespace(ZH="zh"),
+        )
+        fake_audio = SimpleNamespace(
+            AudioCapture=FakeCapture,
+            init=lambda **kwargs: None,
+        )
+        fake_vad = SimpleNamespace(
+            VadConfig=FakeVadConfig,
+            VadEngine=lambda config: SimpleNamespace(engine_name="fake"),
+        )
+        fake_aec = SimpleNamespace(frame_size=160, close_count=0)
+
+        def close_aec():
+            fake_aec.close_count += 1
+
+        fake_aec.close = close_aec
+        args = SimpleNamespace(
+            config="config/grasp_pipeline.yaml",
+            binary="build/perceptive_grasp",
+            device=None,
+            rate=None,
+            channels=None,
+            vad_trigger_threshold=None,
+            vad_stop_threshold=None,
+            vad_min_speech_duration_ms=None,
+            asr_threads=4,
+            pre_buffer_ms=800,
+        )
+        running = threading.Event()
+        running.set()
+
+        with mock.patch.dict(
+                sys.modules,
+                {
+                    "spacemit_asr": fake_asr,
+                    "spacemit_audio": fake_audio,
+                    "spacemit_vad": fake_vad,
+                }), mock.patch.object(
+                    local_voice_bridge,
+                    "load_voice_config",
+                    return_value={
+                        "echo_cancellation": {"mode": "webrtc_aec"},
+                        "asr": {"device": 1, "rate": 16000, "channels": 1},
+                    }), mock.patch.object(
+                        local_voice_bridge,
+                        "resolve_spacemit_capture_format",
+                        return_value=(16000, 1)), mock.patch.object(
+                            local_voice_bridge,
+                            "find_voice_aec_library",
+                            return_value="/tmp/libperceptive_voice_aec.so"), \
+                mock.patch.object(
+                    local_voice_bridge,
+                    "WebRtcAecProcessor",
+                    return_value=fake_aec):
+            local_voice_bridge.run_asr_loop(
+                args,
+                FakeProc(),
+                running,
+                threading.Event(),
+                SimpleNamespace(),
+            )
+
+        self.assertEqual(asr_backend.shutdown_count, 1)
+        self.assertEqual(fake_aec.close_count, 1)
+        self.assertFalse(running.is_set())
 
     def test_tts_mixer_volume_targets_playback_hw_card(self):
         devices = [
@@ -333,6 +537,101 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         self.assertTrue(tts_node.write_audio_bytes(player, payload, channels=1))
         self.assertEqual([len(chunk) for chunk in player.chunks],
                          [8192, 8192, 3616])
+
+    def test_tts_worker_marks_playback_active_while_audio_is_written(self):
+        playback_transitions = []
+        test_case = self
+
+        class PlaybackState:
+            active = False
+
+            def set(self):
+                self.active = True
+                playback_transitions.append("set")
+
+            def clear(self):
+                self.active = False
+                playback_transitions.append("clear")
+
+        playback_state = PlaybackState()
+
+        class FakePlayer:
+            @staticmethod
+            def list_devices():
+                return []
+
+            def __init__(self, device):
+                del device
+
+            def start(self):
+                return True
+
+            def write(self, data):
+                del data
+                test_case.assertTrue(playback_state.active)
+                return True
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        fake_audio = SimpleNamespace(
+            init=lambda **kwargs: None,
+            AudioPlayer=FakePlayer,
+        )
+
+        class FakeTtsConfig:
+            speech_rate = 1.0
+            volume = 80
+
+            @classmethod
+            def preset(cls, preset):
+                del preset
+                return cls()
+
+        class FakeTtsEngine:
+            def __init__(self, config):
+                del config
+
+            def synthesize(self, text):
+                del text
+                return SimpleNamespace(
+                    is_success=True,
+                    audio_int16=np.zeros(128, dtype=np.int16),
+                    sample_rate=48000,
+                    duration_ms=10,
+                    rtf=0.1,
+                )
+
+        fake_tts = SimpleNamespace(Config=FakeTtsConfig, Engine=FakeTtsEngine)
+        text_queue = queue.Queue()
+        text_queue.put("测试播报")
+        text_queue.put(None)
+        running = threading.Event()
+        running.set()
+
+        with mock.patch.dict(
+                sys.modules,
+                {"spacemit_audio": fake_audio, "spacemit_tts": fake_tts}):
+            tts_node.run_tts_worker(
+                text_queue,
+                running,
+                "matcha_zh",
+                1,
+                48000,
+                1,
+                1.0,
+                80,
+                False,
+                -1,
+                playback_state,
+                0,
+            )
+
+        self.assertEqual(playback_transitions, ["set", "clear", "clear"])
+        self.assertFalse(playback_state.active)
 
     def test_status_event_fields_are_parsed(self):
         event = "state=IDLE;message=Ready;target=banana"

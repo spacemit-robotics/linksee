@@ -23,6 +23,8 @@ option(USE_MOCK_EXECUTOR "Use mock executor (no real arm)" OFF)
 option(ENABLE_ROS2_VOICE "Enable optional ROS2 std_msgs/String voice bridge" OFF)
 option(ENABLE_LAS2_CAMERA
        "Enable optional spacemit_las2 stereo camera backend" ON)
+option(ENABLE_WEBRTC_AEC
+       "Enable WebRTC acoustic echo cancellation for the voice bridge" ON)
 
 # X86_STANDALONE 是主机侧规划和调试构建的快捷选项。
 if(X86_STANDALONE)
@@ -34,6 +36,21 @@ endif()
 
 find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc highgui imgcodecs dnn calib3d)
 find_package(yaml-cpp REQUIRED)
+
+set(HAVE_WEBRTC_AEC OFF)
+if(ENABLE_WEBRTC_AEC)
+    find_program(MESON_EXECUTABLE meson)
+    find_program(NINJA_EXECUTABLE ninja)
+    if(MESON_EXECUTABLE AND NINJA_EXECUTABLE)
+        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/webrtc_audio_processing.cmake")
+        set(HAVE_WEBRTC_AEC ON)
+        message(STATUS "[Voice] WebRTC AEC enabled")
+    else()
+        message(FATAL_ERROR
+            "[Voice] WebRTC AEC requires meson and ninja-build; install "
+            "them or configure with -DENABLE_WEBRTC_AEC=OFF")
+    endif()
+endif()
 
 set(REALSENSE2_HINTS)
 if(EXISTS "/opt/ros/humble/lib/riscv64-linux-gnu/cmake/realsense2")
@@ -451,10 +468,54 @@ target_include_directories(stereo_geometry_test PRIVATE
 target_link_libraries(stereo_geometry_test PRIVATE ${OpenCV_LIBS})
 add_test(NAME stereo_geometry_test COMMAND stereo_geometry_test)
 
+add_executable(voice_command_parser_test
+    tests/voice_command_parser_test.cpp
+    src/voice_command_parser.cpp
+)
+target_include_directories(voice_command_parser_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+add_test(NAME voice_command_parser_test COMMAND voice_command_parser_test)
+
+if(HAVE_WEBRTC_AEC)
+    add_library(perceptive_voice_aec SHARED src/voice_aec_processor.cpp)
+    add_dependencies(perceptive_voice_aec webrtc_audio_processing_project)
+    target_include_directories(perceptive_voice_aec PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${WEBRTC_INCLUDE_DIRS}
+    )
+    target_link_libraries(perceptive_voice_aec PRIVATE ${WEBRTC_LIBRARY})
+    set_target_properties(perceptive_voice_aec PROPERTIES
+        BUILD_RPATH "${WEBRTC_BINARY_DIR}/webrtc/modules/audio_processing"
+        INSTALL_RPATH "$ORIGIN"
+    )
+
+    add_executable(voice_aec_processor_test
+        tests/voice_aec_processor_test.cpp)
+    target_include_directories(voice_aec_processor_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(voice_aec_processor_test PRIVATE perceptive_voice_aec)
+    add_test(NAME voice_aec_processor_test COMMAND voice_aec_processor_test)
+endif()
+
 
 # ============ 安装 ============
 
 install(TARGETS perceptive_grasp_core DESTINATION bin)
+if(HAVE_WEBRTC_AEC)
+    install(TARGETS perceptive_voice_aec DESTINATION lib)
+    install(FILES "${WEBRTC_RUNTIME_LIBRARY}" DESTINATION lib)
+    install(FILES "${WEBRTC_SOURCE_DIR}/COPYING"
+        DESTINATION share/licenses/perceptive_grasp
+        RENAME webrtc-audio-processing.COPYING)
+    install(FILES "${WEBRTC_SOURCE_DIR}/webrtc/LICENSE"
+        DESTINATION share/licenses/perceptive_grasp
+        RENAME webrtc.LICENSE)
+    install(FILES "${ABSEIL_INCLUDE_DIR}/LICENSE"
+        DESTINATION share/licenses/perceptive_grasp
+        RENAME abseil.LICENSE
+        OPTIONAL)
+endif()
 install(PROGRAMS scripts/run_perceptive_grasp.py
     DESTINATION bin
     RENAME perceptive_grasp)
