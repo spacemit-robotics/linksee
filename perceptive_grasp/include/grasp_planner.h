@@ -82,7 +82,8 @@ public:
     */
     bool PlanTopGrasp(const float base_point[3],
                         Pose3D& grasp_pose,
-                        Pose3D& pre_grasp_pose) const;
+                        Pose3D& pre_grasp_pose,
+                        bool enforce_workspace = true) const;
 
     /**
     * @brief 检查点是否在工作空间内

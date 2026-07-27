@@ -1,6 +1,6 @@
 # 手眼标定
 
-perceptive grasp 使用 eye-to-hand 标定计算立体相机坐标系到 Linksee 机械臂基座坐标系的变换。
+perceptive grasp 使用 eye-to-hand 标定计算立体相机坐标系到 linksee 机械臂基座坐标系的变换。
 
 ## 1. 安装相机和标定板
 

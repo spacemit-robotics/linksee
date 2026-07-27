@@ -1,6 +1,6 @@
 # perceptive grasp
 
-perceptive grasp 是面向 Linksee 轮式机器人的近距离感知抓取应用。系统使用立体相机获取彩色图像和深度信息，通过 yolov8-seg 完成目标分割，结合深度反投影、固定相机手眼标定（eye-to-hand）和顶抓规划生成 Linksee 机械臂可执行的抓取位姿。目标超出机械臂舒适抓取区时，Linksee 底盘会短距离调整位置，停车后重新感知和规划。应用还支持本地自动语音识别（asr）命令和语音合成（tts）状态播报。
+perceptive grasp 是面向 linksee 轮式机器人的近距离感知抓取应用。系统通过立体相机获取彩色图像和深度信息，使用 yolov8-seg 完成目标检测与分割，并结合深度反投影、eye-to-hand 手眼标定和轻量三维几何规划，生成机械臂可执行的顶抓或侧抓位姿。当目标超出机械臂舒适抓取区时，底盘会进行短距离位置调整，并在停车后重新感知和规划。应用同时支持本地自动语音识别（asr）控制和语音合成（tts）状态播报。
 
 ![perceptive grasp 系统链路](docs/assets/grasp-system-flow.svg)
 
@@ -10,12 +10,13 @@ perceptive grasp 提供以下功能：
 
 - 支持 realsense d435i 深度相机和 spacemit_las2 双目相机两种立体相机后端。
 - 使用 yolov8-seg 输出目标类别、检测框和分割掩码。
-- 根据目标表面深度和手眼标定结果计算机械臂基座坐标。
-- 规划并执行接近、夹取、抬升、放置和归位动作。
+- 基于二维分割掩码和对齐深度，为普通目标生成顶抓位姿。
+- 基于目标点云、桌面平面和三维尺寸，为杯、瓶等目标选择并生成顶抓或侧抓位姿。
+- 规划并执行接近、夹取、退出或抬升、放置和归位动作。
 - 在抓取规划阶段执行底盘前后移动或原地转向，并在移动后重新检测。
 - 通过本地语音桥接收抓取、取消和结束命令，并播报任务状态。
 
-本方案面向桌面或近距离场景中的单目标顶抓。底盘辅助不包含导航、避障和全局路径规划。
+本方案面向桌面或近距离场景中的单目标抓取。底盘辅助不包含导航、避障和全局路径规划。
 
 ## 2. 系统组成
 
@@ -23,9 +24,10 @@ perceptive grasp 提供以下功能：
 |---|---|---|
 | 立体相机 | realsense d435i / spacemit_las2 | 输出像素对齐的彩色图像和深度信息 |
 | 目标检测 | spacemit_vision_service(yolov8-seg) | 输出目标类别、检测框和分割掩码 |
-| 抓取规划 | grasp planner | 计算抓取像素、三维坐标、预抓取位和夹爪方向 |
-| 机械臂执行 | spacemit_manipulator/grasp | 控制 Linksee 机械臂和夹爪 |
-| 底盘辅助 | spacemit_base | 调整机器人与目标的相对位置 |
+| 任务控制 | grasp_pipeline | 组织目标感知、抓取规划、底盘对齐、机械臂执行和失败恢复 |
+| 抓取规划 | grasp_planner / grasp_geometry | 根据分割掩码、深度和三维几何生成顶抓或侧抓位姿 |
+| 机械臂执行 | spacemit_manipulator/grasp | 控制 linksee 机械臂和夹爪 |
+| 底盘辅助 | libchassis | 调整机器人与目标的相对位置 |
 | 语音交互 | spacemit_audio/vad/asr/tts | 接收语音命令并播报状态 |
 
 ## 3. 准备环境
@@ -80,6 +82,8 @@ source ~/spacemit_robot/build/envsetup.sh
   --config config/grasp_pipeline.yaml \
   --target banana
 ```
+
+连续抓取时增加 `--loop`。循环次数没有上限；每轮成功或失败恢复后都会重新检测目标并开始下一轮，直到收到退出信号。按一次 `Ctrl+C` 后，程序停止启动下一轮任务，等待当前动作完成并将机械臂移回 `home` 位后退出；仅在无法安全退出时再次按 `Ctrl+C` 强制终止。
 
 排查立体相机、opencl、机械臂、运动学或底盘驱动时增加 `--debug` 来查看更多日志：
 

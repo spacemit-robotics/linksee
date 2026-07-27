@@ -57,8 +57,8 @@ class CameraBackendSourceTest(unittest.TestCase):
         self.assertIn('cam["type"]', self.main)
         self.assertIn('cam["realsense"]', self.main)
         self.assertIn('realsense["motion_flush_frames"]', self.main)
-        self.assertIn("motion_flush_frames: 16", self.config)
-        self.assertIn("int motion_flush_frames = 16", self.stereo_h)
+        self.assertIn("motion_flush_frames: 30", self.config)
+        self.assertIn("int motion_flush_frames = 30", self.stereo_h)
         self.assertIn('cam["spacemit_las2"]', self.main)
         self.assertIn('las2["model_path"]', self.main)
         self.assertIn('las2["core_count"]', self.main)
@@ -149,6 +149,16 @@ class CameraBackendSourceTest(unittest.TestCase):
         self.assertIn("camera->Deproject", self.debug_localize)
         self.assertNotIn("librealsense2/rs.hpp", self.debug_localize)
         self.assertNotIn("rs2::pipeline", self.debug_localize)
+        self.assertIn('" | Capture: "', self.debug_localize)
+        self.assertIn('" ms | Perception: "', self.debug_localize)
+        self.assertIn(
+            'const YAML::Node top = grasp["top"]',
+            self.debug_localize,
+        )
+        self.assertIn(
+            'const YAML::Node side = grasp["side"]',
+            self.debug_localize,
+        )
 
     def test_debug_view_builds_with_any_camera_backend(self):
         self.assertIn(
@@ -169,6 +179,14 @@ class CameraBackendSourceTest(unittest.TestCase):
         self.assertIn("settings.core_affinity.c_str()", self.las2_cpp)
         self.assertIn("stage=CAMERA_REFRESH", self.pipeline)
         self.assertIn("current_frame_id != previous_frame_id", self.pipeline)
+
+    def test_las2_failed_initialization_exits_without_vendor_shutdown(self):
+        self.assertIn(
+            "access(settings.video_device.c_str(), R_OK | W_OK)",
+            self.las2_cpp,
+        )
+        self.assertIn("if (!initialized_)", self.las2_cpp)
+        self.assertIn("camera_ = nullptr", self.las2_cpp)
 
     def test_las2_intrinsics_are_derived_from_calibration(self):
         self.assertIn("LoadRectifiedLeftIntrinsics", self.las2_cpp)

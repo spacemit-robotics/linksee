@@ -91,9 +91,8 @@ float ImageAngleToWristYaw(float image_angle, float camera_yaw_offset = 0.0f);
 /**
     * @brief 计算沿短轴方向偏移的抓取像素坐标
     *
-    * SO-101 固定爪在左侧，抓取点应从物体中心沿短轴方向偏移到固定爪侧边缘。
     * 短轴方向 = 垂直于物体长轴 = image_angle + 90°
-    * 偏移方向固定为 image_angle + 90°，pipeline 会令固定爪朝向该偏移侧。
+    * 偏移方向固定为 image_angle + 90°，与单动爪的固定爪方向配合。
     *
     * @param target 检测目标 (含 mask 和 bbox)
     * @param[out] grasp_px 抓取点 X 像素坐标

@@ -58,7 +58,7 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
     def test_max_base_alignment_attempts_stop_before_arm_planning(self):
         body = _function_body(self.pipeline, "void GraspPipeline::HandlePlanning")
         max_attempts_index = body.find("Base alignment failed: max attempts")
-        plan_index = body.find("planner_->PlanTopGrasp")
+        plan_index = body.find("executor_->ValidateGraspPoses")
         self.assertGreaterEqual(max_attempts_index, 0)
         self.assertGreaterEqual(plan_index, 0)
         self.assertLess(max_attempts_index, plan_index)
@@ -68,14 +68,48 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
         self.assertIn("MeasureMobileBaseAlignmentProgress", body)
         self.assertIn("RequiredMobileBaseAlignmentProgress", body)
         self.assertIn("required_progress", body)
+        self.assertIn("limited but valid", body)
+        self.assertIn("max_visual_regression_m", body)
+        self.assertIn("allowed regression", body)
         self.assertIn("max_total_travel_m", body)
         self.assertIn("visual progress", body)
         self.assertIn("check depth and motion", body)
 
     def test_planning_prefers_foreground_mask_depth(self):
         body = _function_body(self.pipeline, "void GraspPipeline::HandlePlanning")
-        self.assertIn("ForegroundDepthFromMask", body)
-        self.assertIn("mask_foreground_q25", body)
+        self.assertIn("foreground_depth_mm", body)
+        self.assertIn("geometry_foreground_cluster", body)
+
+    def test_side_grasp_aligns_closed_gripper_sweep_distance(self):
+        body = _function_body(self.pipeline, "void GraspPipeline::HandlePlanning")
+        self.assertIn("side_pregrasp_min_x_m", body)
+        self.assertIn("kSidePreGraspAlignmentWindowM", body)
+        self.assertIn("minimum_pregrasp_x", body)
+        self.assertIn("maximum_pregrasp_x", body)
+        self.assertIn("preferred_pregrasp_x", body)
+        self.assertIn("desired_range=[", body)
+        self.assertIn("required_shift", body)
+        self.assertIn("std::clamp", body)
+        self.assertIn("config_.planner.workspace.x_max", body)
+        self.assertNotIn(
+            "config_.mobile_base.target_x +",
+            body,
+        )
+        self.assertIn("alignment_config.target_x = base_point[0]", body)
+        self.assertIn("preserving current base distance", body)
+
+    def test_top_grasp_alignment_uses_candidate_grasp_point(self):
+        body = _function_body(
+            self.pipeline, "void GraspPipeline::HandlePlanning")
+        self.assertIn("candidate.strategy == GraspStrategy::TOP", body)
+        self.assertIn(
+            "alignment_point[0] = candidate.grasp_pose.x", body)
+        self.assertIn(
+            "alignment_point[1] = candidate.grasp_pose.y", body)
+        self.assertIn(
+            "alignment_config, alignment_point, base_align_attempts_", body)
+        self.assertIn(
+            "previous_base_alignment_point_.data(), alignment_point", body)
 
     def test_base_alignment_moves_base_then_detects_again(self):
         body = _function_body(
@@ -92,10 +126,12 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
         self.assertIn("y_tolerance: 0.15", self.config)
         self.assertIn("cfg.mobile_base.enabled", self.main)
         self.assertIn("target_x", self.main)
+        self.assertIn("x_hysteresis", self.main)
         self.assertIn("max_align_attempts", self.main)
         self.assertIn("min_progress_m", self.main)
         self.assertIn("min_progress_ratio", self.main)
         self.assertIn("min_progress_floor_m", self.main)
+        self.assertIn("max_visual_regression_m", self.main)
         self.assertIn("max_total_travel_m", self.main)
 
     def test_build_includes_mobile_base_controller(self):

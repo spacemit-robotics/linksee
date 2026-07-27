@@ -46,6 +46,8 @@ public:
 
     std::int64_t LastFrameId() const override { return last_frame_id_; }
 
+    void ResetAfterMotion() override;
+
     /**
     * @brief 像素坐标 + 深度 → 相机坐标系 3D 点
     * @param pixel_x 像素 x
@@ -68,6 +70,8 @@ public:
     float GetDepthScale() const { return depth_scale_; }
 
 private:
+    void StartStream(int warmup_frames);
+
     StereoCameraConfig config_;
     rs2::pipeline pipeline_;
     rs2::pipeline_profile profile_;

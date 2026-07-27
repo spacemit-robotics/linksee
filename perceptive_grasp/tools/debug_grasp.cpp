@@ -218,9 +218,15 @@ static GraspPlannerConfig LoadPlannerConfig(const std::string& pipeline_config) 
 
     auto grasp = root["grasp"];
     if (grasp) {
-        cfg.approach_height = grasp["approach_height"].as<float>(cfg.approach_height);
-        cfg.grasp_depth = grasp["grasp_depth"].as<float>(cfg.grasp_depth);
-        cfg.gripper_offset = grasp["gripper_offset"].as<float>(cfg.gripper_offset);
+        const YAML::Node top = grasp["top"];
+        if (!top) {
+            throw std::runtime_error("grasp.top configuration is required");
+        }
+        cfg.approach_height = top["approach_height"].as<float>(
+            cfg.approach_height);
+        cfg.grasp_depth = top["grasp_depth"].as<float>(cfg.grasp_depth);
+        cfg.gripper_offset = top["gripper_offset"].as<float>(
+            cfg.gripper_offset);
 
         auto ws = grasp["workspace"];
         if (ws) {
@@ -384,17 +390,7 @@ int main(int argc, char* argv[]) {
         auto ik_cfg = LoadIkConfig(app.config_path);
         std::string detect_config = ResolveDetectConfig(app.config_path);
 
-        // 加载抓取点位置比例
-        float grasp_point_x_ratio = 0.0f;
-        {
-            YAML::Node root = YAML::LoadFile(app.config_path);
-            if (root["grasp"] && root["grasp"]["grasp_point_x_ratio"]) {
-                grasp_point_x_ratio = root["grasp"]["grasp_point_x_ratio"].as<float>(0.0f);
-            }
-        }
-
         std::cout << "[debug_grasp] detect config: " << detect_config << std::endl;
-        std::cout << "[debug_grasp] grasp_point_x_ratio: " << grasp_point_x_ratio << std::endl;
 
         std::cout << "[debug_grasp] Stage 2: create planner" << std::endl;
         GraspPlanner planner(planner_cfg);
@@ -499,17 +495,8 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // 沿短轴方向偏移到固定爪侧边缘
-        float grasp_px_f, grasp_py_f;
-        float offset_dir_angle = NAN;
-        if (!ComputeGraspPixel(det_target, grasp_px_f, grasp_py_f,
-                                grasp_point_x_ratio, orient_cfg,
-                                &offset_dir_angle)) {
-            grasp_px_f = det_target.center.x;
-            grasp_py_f = det_target.center.y;
-        }
-        best_cx = static_cast<int>(grasp_px_f);
-        best_cy = static_cast<int>(grasp_py_f);
+        best_cx = static_cast<int>(det_target.center.x);
+        best_cy = static_cast<int>(det_target.center.y);
         int center_cx = static_cast<int>((best.x1 + best.x2) / 2.0f);
         int center_cy = static_cast<int>((best.y1 + best.y2) / 2.0f);
 
@@ -541,7 +528,8 @@ int main(int argc, char* argv[]) {
 
         in_workspace = planner.PlanTopGrasp(base_point, grasp_pose, pre_grasp_pose);
         if (!in_workspace) {
-            std::cerr << "[debug_grasp] Target out of workspace" << std::endl;
+            std::cerr << "[debug_grasp] Target requires base alignment"
+                        << std::endl;
             std::cerr << "  base_point: ["
                         << base_point[0] << ", "
                         << base_point[1] << ", "
@@ -559,8 +547,7 @@ int main(int argc, char* argv[]) {
                     << static_cast<int>(best.x2) << ", "
                     << static_cast<int>(best.y2) << "]" << std::endl;
         std::cout << "pixel_center: [" << center_cx << ", " << center_cy << "]" << std::endl;
-        std::cout << "pixel_grasp (ratio=" << grasp_point_x_ratio << "): ["
-                    << best_cx << ", " << best_cy << "]" << std::endl;
+        std::cout << "pixel_grasp: [" << best_cx << ", " << best_cy << "]" << std::endl;
         std::cout << "median_depth_mm_5x5: " << best_depth_mm << std::endl;
         std::cout << "camera_point_m: ["
                     << cam_point[0] << ", "
@@ -593,11 +580,7 @@ int main(int argc, char* argv[]) {
         }
 
         float grasp_yaw = NAN;
-        if (!std::isnan(offset_dir_angle)) {
-            grasp_yaw = ImageLineAngleFromHorizontal(offset_dir_angle);
-        } else {
-            grasp_yaw = ComputeGraspYaw(det_target, orient_cfg);
-        }
+        grasp_yaw = ComputeGraspYaw(det_target, orient_cfg);
 
         std::cout << "\n=== Orientation Debug ===" << std::endl;
         std::cout << "image_angle:    " << image_angle << " rad ("
@@ -605,10 +588,6 @@ int main(int argc, char* argv[]) {
         std::cout << "aspect_ratio:   " << aspect_ratio << std::endl;
         std::cout << "threshold:      " << orient_cfg.aspect_ratio_threshold << std::endl;
         std::cout << "camera_yaw_off: " << orient_cfg.camera_yaw_offset << " rad" << std::endl;
-        if (!std::isnan(offset_dir_angle)) {
-            std::cout << "offset_dir:     " << offset_dir_angle << " rad ("
-                        << offset_dir_angle * 180.0f / M_PI << "°)" << std::endl;
-        }
         if (std::isnan(grasp_yaw)) {
             std::cout << "grasp_yaw:      NAN (object is symmetric, no alignment)" << std::endl;
         } else {
@@ -660,10 +639,8 @@ int main(int argc, char* argv[]) {
                             cv::Scalar(0, 255, 0), 2);
             // 绿色圆点 = bbox 中心
             cv::circle(annotated, cv::Point(center_cx, center_cy), 4, cv::Scalar(0, 255, 0), -1);
-            // 红色圆点 = 实际抓取点 (根据 ratio 偏移)
+            // 红色圆点 = 实际抓取点
             cv::circle(annotated, cv::Point(best_cx, best_cy), 6, cv::Scalar(0, 0, 255), -1);
-            // 连线显示偏移
-            cv::line(annotated, cv::Point(center_cx, center_cy), cv::Point(best_cx, best_cy), cv::Scalar(0, 0, 255), 1);
 
             // === 方向可视化 ===
             if (!std::isnan(grasp_yaw)) {

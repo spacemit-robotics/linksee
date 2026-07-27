@@ -73,10 +73,11 @@ void GraspPlanner::CameraToBase(const float cam_point[3],
 }
 
 bool GraspPlanner::PlanTopGrasp(const float base_point[3], Pose3D& grasp_pose,
-                                Pose3D& pre_grasp_pose) const {
-    // 检查工作空间
-    if (!InWorkspace(base_point[0], base_point[1], base_point[2])) {
-        std::cerr << "[GraspPlanner] Target out of workspace: ("
+                                Pose3D& pre_grasp_pose,
+                                bool enforce_workspace) const {
+    if (enforce_workspace &&
+        !InWorkspace(base_point[0], base_point[1], base_point[2])) {
+        std::cerr << "[GraspPlanner] Target requires base alignment: ("
                     << base_point[0] << ", " << base_point[1] << ", "
                     << base_point[2] << ")" << std::endl;
         return false;

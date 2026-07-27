@@ -259,14 +259,13 @@ bool ComputeGraspPixel(const DetectionTarget& target,
     // 短轴方向 = 长轴方向 + 90°
     float short_axis_angle = image_angle + static_cast<float>(M_PI) / 2.0f;
 
-    // 固定选择 image_angle + 90° 这一侧作为抓取点偏移方向。
-    // executor/pipeline 会令固定爪朝向该偏移侧；不要为了减少 wrist_roll
-    // 行程自动翻到相反侧，否则单动爪结构会从物体另一侧闭合。
+    // Keep the configured fixed-jaw side. Switching to the opposite
+    // short-axis endpoint changes how the asymmetric gripper closes.
     float dir_angle = NormalizeAnglePi(short_axis_angle);
     float dir_x = std::cos(dir_angle);
     float dir_y = std::sin(dir_angle);
 
-    // 偏移距离 = 短轴半长 × offset_ratio
+    // 偏移距离 = 短轴半长 × 偏移比例
     float offset_px = short_half * offset_ratio;
 
     grasp_px = cx + dir_x * offset_px;

@@ -62,7 +62,7 @@ voice:
 - `tts.playback_device` 使用播放设备列表中的编号。
 - `tts.mixer_volume` 设置启动时的 alsa `pcm` 音量。设为 `-1` 时不修改 mixer。
 - 音频硬件已提供回声消除后的录音流时，将 `echo_cancellation.mode` 设为 `hardware_aec`；否则使用 `webrtc_aec`。两种模式在 tts 播放期间都会继续执行 vad 和 asr。
-- `webrtc_aec` 只在 tts 播放和回声尾音期间使用软件 aec 输出，随后恢复原始麦克风输入，避免连续处理造成语音失真。
+- `webrtc_aec` 只在 tts 播放和回声尾音期间使用软件 aec 输出，随后切换回麦克风原始输入，避免连续处理造成语音失真。
 
 录音格式、vad 阈值和 tts 参数见[抓取配置](grasp_config.md#6-配置语音交互)。
 
@@ -122,7 +122,7 @@ source ~/spacemit_robot/build/envsetup.sh
 - 未找到采集或播放设备：重新运行环境检查，确认当前用户具有音频设备访问权限，然后更新 `asr.device` 和 `tts.playback_device`。
 - 语音桥提示抓取进程未就绪：先根据抓取进程输出处理相机、机械臂、底盘或模型初始化失败。
 - 识别文本正确但命令未执行：检查 `trigger_words` 和 `target_aliases`，确认目标别名映射到有效的检测模型类别名。
-- tts 播报被识别为命令：硬件没有回声消除时确认 `echo_cancellation.mode` 为 `webrtc_aec`，然后根据录音效果微调 `delay_ms`。只有兼容模式 `half_duplex` 会在播报期间暂停 asr。
+- tts 播报被识别为命令：硬件没有回声消除时确认 `echo_cancellation.mode` 为 `webrtc_aec`，然后根据录音效果微调 `delay_ms`。`half_duplex` 模式会在播报期间暂停 asr。
 - 没有语音播报：检查播放设备编号、`tts.volume` 和 `tts.mixer_volume`。
 
 更多运行问题见[故障诊断](debugging.md)。

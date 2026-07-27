@@ -13,10 +13,10 @@
   基于 TheRobotStudio/SO-ARM100 项目的 so101_new_calib.urdf 简化而来。
   原始文件: https://github.com/TheRobotStudio/SO-ARM100/blob/main/Simulation/SO101/so101_new_calib.urdf
 
-  简化内容:
-    - 去掉了 STL mesh, 使用简单几何体 (圆柱/盒体) 替代
-    - 保留了完整的运动学参数 (关节原点、轴向、限位)
-    - 保留了惯性参数 (质量、惯性矩阵)
+  模型内容:
+    - 碰撞和外观模型使用圆柱、盒体等基础几何体，不依赖 STL mesh
+    - 包含关节原点、轴向、限位等运动学参数
+    - 包含质量和惯性矩阵
     - 运动链: base_link → shoulder_link → upper_arm_link → lower_arm_link
               → wrist_link → gripper_link → gripper_frame_link (固定)
 

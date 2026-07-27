@@ -26,30 +26,9 @@ DepthCamera::~DepthCamera() {
 
 bool DepthCamera::Init() {
     try {
+        constexpr int kInitialWarmupFrames = 30;
+        StartStream(kInitialWarmupFrames);
         const auto& settings = config_.realsense;
-        rs2::config cfg;
-        cfg.enable_stream(RS2_STREAM_COLOR, settings.width, settings.height,
-                            RS2_FORMAT_BGR8, settings.fps);
-        cfg.enable_stream(RS2_STREAM_DEPTH, settings.width, settings.height,
-                            RS2_FORMAT_Z16, settings.fps);
-
-        profile_ = pipeline_.start(cfg);
-
-        // 获取深度比例
-        auto depth_sensor = profile_.get_device().first<rs2::depth_sensor>();
-        depth_scale_ = depth_sensor.get_depth_scale();
-
-        // 获取彩色流内参 (用于反投影)
-        auto color_stream = profile_.get_stream(RS2_STREAM_COLOR)
-                                .as<rs2::video_stream_profile>();
-        intrinsics_ = color_stream.get_intrinsics();
-
-        // 丢弃前几帧让自动曝光稳定
-        for (int i = 0; i < 30; i++) {
-            pipeline_.wait_for_frames();
-        }
-
-        initialized_ = true;
         std::cout << "[DepthCamera] Initialized: " << settings.width << "x"
                     << settings.height << "@" << settings.fps << "fps"
                     << ", depth_scale=" << depth_scale_ << std::endl;
@@ -62,6 +41,27 @@ bool DepthCamera::Init() {
         std::cerr << "[DepthCamera] Init error: " << e.what() << std::endl;
         return false;
     }
+}
+
+void DepthCamera::StartStream(int warmup_frames) {
+    const auto& settings = config_.realsense;
+    rs2::config cfg;
+    cfg.enable_stream(RS2_STREAM_COLOR, settings.width, settings.height,
+                        RS2_FORMAT_BGR8, settings.fps);
+    cfg.enable_stream(RS2_STREAM_DEPTH, settings.width, settings.height,
+                        RS2_FORMAT_Z16, settings.fps);
+
+    profile_ = pipeline_.start(cfg);
+    auto depth_sensor = profile_.get_device().first<rs2::depth_sensor>();
+    depth_scale_ = depth_sensor.get_depth_scale();
+    const auto color_stream = profile_.get_stream(RS2_STREAM_COLOR)
+                                .as<rs2::video_stream_profile>();
+    intrinsics_ = color_stream.get_intrinsics();
+    for (int frame = 0; frame < warmup_frames; ++frame) {
+        pipeline_.wait_for_frames();
+    }
+    last_frame_id_ = -1;
+    initialized_ = true;
 }
 
 bool DepthCamera::GetFrames(cv::Mat& color_frame, cv::Mat& depth_frame) {
@@ -113,6 +113,17 @@ bool DepthCamera::GetFrames(cv::Mat& color_frame, cv::Mat& depth_frame) {
     } catch (const rs2::error& e) {
         std::cerr << "[DepthCamera] Frame error: " << e.what() << std::endl;
         return false;
+    }
+}
+
+void DepthCamera::ResetAfterMotion() {
+    if (!initialized_) return;
+    spatial_filter_ = rs2::spatial_filter();
+    if (config_.realsense.temporal_filter) {
+        temporal_filter_ = rs2::temporal_filter();
+    }
+    if (config_.realsense.hole_filling) {
+        hole_filter_ = rs2::hole_filling_filter();
     }
 }
 

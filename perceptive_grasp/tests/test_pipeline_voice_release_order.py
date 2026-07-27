@@ -55,7 +55,25 @@ class PipelineVoiceReleaseOrderTest(unittest.TestCase):
         cancel_body = cancel_match.group("body")
         self.assertIn("Cancelling; keeping observe pose", cancel_body)
         self.assertIn("return_to_observe_pending_", cancel_body)
+        self.assertIn("return_to_home_pending_", cancel_body)
         self.assertNotIn("executor_->EmergencyStop()", cancel_body)
+
+    def test_cancel_while_holding_returns_home(self):
+        body = _function_body(self.source, "void GraspPipeline::SpinOnce")
+        cancel_match = re.search(
+            r"if \(cancel_requested_\.exchange\(false\)\) "
+            r"\{(?P<body>.*?)\n    \}",
+            body,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(cancel_match, "missing cancel branch")
+        cancel_body = cancel_match.group("body")
+        self.assertIn(
+            "graceful_shutdown || object_may_be_held_.load()",
+            cancel_body,
+        )
+        self.assertIn("if (return_home)", cancel_body)
+        self.assertIn("return_to_home_pending_ = true", cancel_body)
 
     def test_stop_does_not_release_torque(self):
         body = _function_body(self.source, "void GraspPipeline::Stop")
@@ -117,6 +135,91 @@ class PipelineVoiceReleaseOrderTest(unittest.TestCase):
         self.assertIn("shutdown_requested_", idle_body)
         self.assertIn("Home position reached; exiting", idle_body)
         self.assertIn("shutdown_requested_", run_body)
+
+    def test_graceful_shutdown_waits_for_action_then_returns_home(self):
+        request_body = _function_body(
+            self.source,
+            "void GraspPipeline::RequestGracefulShutdown",
+        )
+        spin_body = _function_body(self.source, "void GraspPipeline::SpinOnce")
+        idle_body = _function_body(self.source, "void GraspPipeline::HandleIdle")
+        run_body = _function_body(self.source, "void GraspPipeline::Run")
+
+        self.assertIn("graceful_shutdown_requested_.exchange(true)",
+                      request_body)
+        self.assertIn("cancel_requested_.store(true)", request_body)
+        self.assertNotIn("executor_->EmergencyStop()", request_body)
+        self.assertIn("action_.cancelling = true", spin_body)
+        self.assertIn("return_to_home_pending_", spin_body)
+        self.assertIn("return_to_home_on_command", idle_body)
+        self.assertIn("executor_->MoveToHome()", idle_body)
+        self.assertIn("external_shutdown_requested()", run_body)
+        self.assertIn("shutdown_requested_", run_body)
+
+    def test_home_failure_ends_with_error(self):
+        idle_body = _function_body(self.source, "void GraspPipeline::HandleIdle")
+        self.assertIn("*result == GraspResult::SUCCESS", idle_body)
+        self.assertIn("Home return failed during shutdown", idle_body)
+        self.assertIn("SetState(\n                        PipelineState::ERROR",
+                      idle_body)
+
+    def test_task_failure_returns_to_safe_pose_before_terminal_error(self):
+        set_state_body = _function_body(
+            self.source,
+            "void GraspPipeline::SetState",
+        )
+        recovery_body = _function_body(
+            self.source,
+            "void GraspPipeline::HandleRecovering",
+        )
+        self.assertIn("requested_state == PipelineState::ERROR", set_state_body)
+        self.assertIn("new_state = PipelineState::RECOVERING", set_state_body)
+        self.assertIn("!config_.plan_only", set_state_body)
+        self.assertIn("failure_recovery_active_", set_state_body)
+        self.assertIn("config_.auto_loop", recovery_body)
+        self.assertIn("executor_->MoveToHome()", recovery_body)
+        self.assertIn("executor_->MoveToSideObserve()", recovery_body)
+        self.assertIn("executor_->MoveToObserve()", recovery_body)
+        self.assertIn("return_home_after_failure", recovery_body)
+        self.assertIn("return_observe_after_failure", recovery_body)
+        self.assertIn(
+            "observation_strategy_selected_ = false", recovery_body)
+        self.assertIn("SetState(PipelineState::ERROR", recovery_body)
+        self.assertNotIn("executor_->EmergencyStop()", recovery_body)
+
+    def test_held_object_failure_returns_home_and_stops_restart(self):
+        grasp_body = _function_body(
+            self.source,
+            "void GraspPipeline::HandleGrasping",
+        )
+        place_body = _function_body(
+            self.source,
+            "void GraspPipeline::HandlePlacing",
+        )
+        recovery_body = _function_body(
+            self.source,
+            "void GraspPipeline::HandleRecovering",
+        )
+        spin_body = _function_body(self.source, "void GraspPipeline::SpinOnce")
+
+        self.assertIn("object_may_be_held_.store(true)", grasp_body)
+        self.assertIn("object_may_be_held_.store(false)", grasp_body)
+        self.assertIn("object_may_be_held_.store(false)", place_body)
+        self.assertIn("const bool carrying_object", recovery_body)
+        self.assertIn(
+            "config_.auto_loop && !carrying_object", recovery_body)
+        self.assertIn("shutdown_requested_.store(true)", recovery_body)
+        self.assertIn("if (!object_may_be_held_.load())", spin_body)
+
+    def test_step_input_eof_aborts_and_returns_home(self):
+        confirm_body = _function_body(
+            self.source,
+            "bool GraspPipeline::WaitForConfirm",
+        )
+        eof_branch = confirm_body[:confirm_body.index("if (input.empty())")]
+        self.assertIn("if (!std::getline(std::cin, input))", eof_branch)
+        self.assertIn("RequestGracefulShutdown()", eof_branch)
+        self.assertIn("return false", eof_branch)
 
 
 if __name__ == "__main__":

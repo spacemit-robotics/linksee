@@ -24,6 +24,10 @@ namespace perceptive_grasp {
 
 namespace {
 
+// The Linksee UART chassis remains in its motor dead zone below this command.
+// Keep short corrections bounded by duration while using an effective speed.
+constexpr float kMinimumEffectiveLinearSpeedMps = 0.15f;
+
 int ClampDurationMs(int duration_ms, const MobileBaseAlignmentConfig& config) {
     return std::clamp(
         duration_ms, config.min_cmd_duration_ms, config.max_cmd_duration_ms);
@@ -76,10 +80,12 @@ MobileBaseAlignmentCommand PlanMobileBaseAlignment(
     }
     const float x_error = base_point[0] - config.target_x;
     const float y_error = base_point[1];
+    const float x_limit =
+        config.x_tolerance + std::max(0.0f, config.x_hysteresis);
     const float y_limit =
         config.y_tolerance + std::max(0.0f, config.y_hysteresis);
 
-    if (std::fabs(x_error) <= config.x_tolerance &&
+    if (std::fabs(x_error) <= x_limit &&
         std::fabs(y_error) <= y_limit) {
         command.reason = "target in comfortable range";
         return command;
@@ -110,14 +116,21 @@ MobileBaseAlignmentCommand PlanMobileBaseAlignment(
         return command;
     }
 
-    if (std::fabs(x_error) > config.x_tolerance) {
+    if (std::fabs(x_error) > x_limit) {
         const float step_m = std::min(std::fabs(x_error), config.max_step_m);
         command.type = MobileBaseAlignmentCommand::Type::DRIVE;
-        command.linear_x = std::copysign(config.linear_speed, x_error);
         command.angular_z = 0.0f;
         command.duration_ms = ClampDurationMs(
             static_cast<int>((step_m / config.linear_speed) * 1000.0f),
             config);
+        const float duration_s =
+            static_cast<float>(command.duration_ms) / 1000.0f;
+        const float distance_matched_speed = step_m / duration_s;
+        const float minimum_speed = std::min(
+            config.linear_speed, kMinimumEffectiveLinearSpeedMps);
+        const float command_speed = std::clamp(
+            distance_matched_speed, minimum_speed, config.linear_speed);
+        command.linear_x = std::copysign(command_speed, x_error);
         command.reason = x_error > 0.0f ? "target too far"
                                         : "target too close";
         return command;
@@ -306,7 +319,7 @@ GraspResult MobileBaseController::Execute(
             break;
         }
         std::this_thread::sleep_for(
-            std::min(std::chrono::milliseconds(100), remaining));
+            std::min(std::chrono::milliseconds(50), remaining));
     }
 
     Brake();

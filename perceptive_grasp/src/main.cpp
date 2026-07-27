@@ -51,6 +51,7 @@ static std::unique_ptr<VoiceCommandListener> g_voice_listener;
 #endif
 static std::thread g_local_voice_thread;
 static std::mutex g_pipeline_mutex;
+static volatile std::sig_atomic_t g_shutdown_signal = 0;
 
 static bool TriggerVoiceCommand(const std::string& command_text) {
     std::lock_guard<std::mutex> lock(g_pipeline_mutex);
@@ -86,6 +87,7 @@ static const char* PipelineStateName(PipelineState state) {
         case PipelineState::LIFTING: return "LIFTING";
         case PipelineState::PLACING: return "PLACING";
         case PipelineState::HOMING: return "HOMING";
+        case PipelineState::RECOVERING: return "RECOVERING";
         case PipelineState::DONE: return "DONE";
         case PipelineState::ERROR: return "ERROR";
     }
@@ -171,7 +173,18 @@ static void WriteStatusEvent(PipelineState state, const std::string& msg) {
 }
 
 static void SignalHandler(int sig) {
-    const char msg[] = "\n[Main] Signal received, exiting...\n";
+    if (g_shutdown_signal == 0) {
+        g_shutdown_signal = sig;
+        const char msg[] =
+            "\n[Main] Graceful shutdown requested; waiting for the current "
+            "action and returning home. Press Ctrl+C again to force exit.\n";
+        const ssize_t written = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        (void)written;
+        return;
+    }
+
+    const char msg[] =
+        "\n[Main] Second signal received; forcing exit.\n";
     const ssize_t written = write(STDERR_FILENO, msg, sizeof(msg) - 1);
     (void)written;
     std::_Exit(128 + sig);
@@ -185,8 +198,9 @@ static void PrintUsage(const char* prog) {
                 << "  --voice-command <text>  Test one ASR text command (e.g. 抓香蕉)\n"
                 << "  --voice-stdin     Read ASR text commands from stdin\n"
                 << "  --status-stdout   Print status events to stdout for local TTS\n"
-                << "  --loop            Auto-loop grasp mode\n"
+                << "  --loop            Auto-loop; Ctrl+C returns home and exits\n"
                 << "  --step            Step mode: pause before each stage\n"
+                << "  --plan-only       Validate perception and arm path without motion\n"
                 << "  --help            Show this help\n";
 #ifdef ENABLE_ROS2_VOICE
     std::cout << "  --voice           Listen for ASR text from ROS2 topic (optional)\n"
@@ -320,15 +334,25 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
 
     // Grasp strategy
     if (auto g = root["grasp"]) {
-        cfg.planner.approach_height = g["approach_height"].as<float>(
+        const YAML::Node top = g["top"];
+        if (!top) {
+            throw std::runtime_error("grasp.top configuration is required");
+        }
+        cfg.planner.approach_height = top["approach_height"].as<float>(
             cfg.planner.approach_height);
-        cfg.planner.grasp_depth = g["grasp_depth"].as<float>(
+        cfg.planner.grasp_depth = top["grasp_depth"].as<float>(
             cfg.planner.grasp_depth);
-        cfg.planner.gripper_offset = g["gripper_offset"].as<float>(
+        cfg.planner.gripper_offset = top["gripper_offset"].as<float>(
             cfg.planner.gripper_offset);
-        cfg.grasp_point_x_ratio = g["grasp_point_x_ratio"].as<float>(
-            cfg.grasp_point_x_ratio);
-        cfg.executor.gripper_open = g["gripper_open"].as<float>(
+        cfg.top_grasp_point_x_ratio =
+            top["grasp_point_x_ratio"].as<float>(
+                cfg.top_grasp_point_x_ratio);
+        if (cfg.top_grasp_point_x_ratio < 0.0f ||
+            cfg.top_grasp_point_x_ratio > 1.0f) {
+            throw std::runtime_error(
+                "grasp.top.grasp_point_x_ratio must be in [0, 1]");
+        }
+        cfg.executor.gripper_open = top["gripper_open"].as<float>(
             cfg.executor.gripper_open);
         cfg.executor.gripper_effort = g["gripper_effort"].as<float>(
             cfg.executor.gripper_effort);
@@ -341,6 +365,91 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         cfg.executor.gripper_timeout_ms =
             g["gripper_timeout_ms"].as<int>(
                 cfg.executor.gripper_timeout_ms);
+        auto& settings = cfg.geometry;
+        settings.strategy = g["strategy"].as<std::string>(
+            settings.strategy);
+        if (auto geometry = g["geometry"]) {
+            settings.sample_stride = std::max(
+                1, geometry["sample_stride"].as<int>(
+                        settings.sample_stride));
+            settings.max_object_points = std::max(
+                200, geometry["max_object_points"].as<int>(
+                        settings.max_object_points));
+            settings.min_object_points = std::max(
+                20, geometry["min_object_points"].as<int>(
+                        settings.min_object_points));
+            settings.plane_distance_threshold_m =
+                geometry["plane_distance_threshold_m"].as<float>(
+                    settings.plane_distance_threshold_m);
+            settings.table_clearance_m =
+                geometry["table_clearance_m"].as<float>(
+                    settings.table_clearance_m);
+            settings.footprint_padding_m =
+                geometry["footprint_padding_m"].as<float>(
+                    settings.footprint_padding_m);
+            settings.gripper_max_width_m =
+                geometry["gripper_max_width_m"].as<float>(
+                    settings.gripper_max_width_m);
+            settings.planning_timeout_ms = std::max(
+                50, geometry["planning_timeout_ms"].as<int>(
+                        settings.planning_timeout_ms));
+            settings.perception_budget_ms = std::max(
+                settings.planning_timeout_ms,
+                geometry["perception_budget_ms"].as<int>(
+                    settings.perception_budget_ms));
+        }
+        if (auto side = g["side"]) {
+            settings.side_min_height_m =
+                side["min_height_m"].as<float>(
+                    settings.side_min_height_m);
+            settings.side_approach_distance_m =
+                side["approach_distance_m"].as<float>(
+                    settings.side_approach_distance_m);
+            settings.side_pregrasp_min_x_m =
+                side["pregrasp_min_x_m"].as<float>(
+                    settings.side_pregrasp_min_x_m);
+            settings.side_gripper_offset_m =
+                side["gripper_offset_m"].as<float>(
+                    settings.side_gripper_offset_m);
+            settings.side_grasp_forward_offset_m =
+                side["grasp_forward_offset_m"].as<float>(
+                    settings.side_grasp_forward_offset_m);
+            settings.side_grasp_height_ratio =
+                side["grasp_height_ratio"].as<float>(
+                    settings.side_grasp_height_ratio);
+            settings.side_initial_lift_m =
+                side["initial_lift_m"].as<float>(
+                    settings.side_initial_lift_m);
+            settings.side_lift_retreat_m =
+                side["lift_retreat_m"].as<float>(
+                    settings.side_lift_retreat_m);
+        }
+        if (settings.strategy != "auto" &&
+            settings.strategy != "top" &&
+            settings.strategy != "side") {
+            throw std::runtime_error(
+                "grasp.strategy must be auto, top, or side");
+        }
+        if (settings.min_object_points > settings.max_object_points) {
+            throw std::runtime_error(
+                "grasp.geometry.min_object_points must not exceed "
+                "max_object_points");
+        }
+        if (settings.plane_distance_threshold_m <= 0.0f ||
+            settings.table_clearance_m < 0.0f ||
+            settings.footprint_padding_m < 0.0f ||
+            settings.gripper_max_width_m <= 0.0f ||
+            settings.side_min_height_m < 0.0f ||
+            settings.side_approach_distance_m <= 0.0f ||
+            settings.side_pregrasp_min_x_m < 0.0f ||
+            settings.side_grasp_forward_offset_m < 0.0f ||
+            settings.side_grasp_height_ratio <= 0.0f ||
+            settings.side_grasp_height_ratio >= 1.0f ||
+            settings.side_initial_lift_m <= 0.0f ||
+            settings.side_lift_retreat_m < 0.0f) {
+            throw std::runtime_error(
+                "grasp geometry, top, or side values are invalid");
+        }
         if (auto ws = g["workspace"]) {
             auto& workspace = cfg.planner.workspace;
             workspace.x_min = ws["x_min"].as<float>(workspace.x_min);
@@ -405,6 +514,13 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             for (size_t i = 0; i < oj.size(); i++)
                 cfg.executor.observe_joints.push_back(oj[i].as<float>());
         }
+        if (auto srj = m["side_ready_joints"]) {
+            cfg.executor.side_ready_joints.clear();
+            for (size_t i = 0; i < srj.size(); ++i) {
+                cfg.executor.side_ready_joints.push_back(
+                    srj[i].as<float>());
+            }
+        }
 
         cfg.executor.ik_max_trials = m["ik_max_trials"].as<int>(cfg.executor.ik_max_trials);
         cfg.executor.wrist_yaw_scale = m["wrist_yaw_scale"].as<float>(cfg.executor.wrist_yaw_scale);
@@ -418,6 +534,18 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
                 c.max_rad = jc[i]["max"].as<float>(0.0f);
                 if (c.joint_index >= 0) {
                     cfg.executor.joint_constraints.push_back(c);
+                }
+            }
+        }
+        if (auto jl = m["joint_limits"]) {
+            cfg.executor.joint_limits.clear();
+            for (size_t i = 0; i < jl.size(); ++i) {
+                JointConstraint limit;
+                limit.joint_index = jl[i]["joint"].as<int>(-1);
+                limit.min_rad = jl[i]["min"].as<float>(0.0f);
+                limit.max_rad = jl[i]["max"].as<float>(0.0f);
+                if (limit.joint_index >= 0) {
+                    cfg.executor.joint_limits.push_back(limit);
                 }
             }
         }
@@ -447,6 +575,37 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         cfg.executor.place_release_open =
             p["release_open"].as<float>(cfg.executor.place_release_open);
     }
+
+    const auto validate_joint_pose =
+        [&cfg](const char* name, const std::vector<float>& joints) {
+            for (const JointConstraint& limit :
+                cfg.executor.joint_limits) {
+                if (limit.joint_index < 0 ||
+                    limit.joint_index >= static_cast<int>(joints.size()) ||
+                    limit.min_rad > limit.max_rad) {
+                    throw std::runtime_error(
+                        "manipulator.joint_limits is invalid for " +
+                        std::string(name));
+                }
+                const float value = joints[limit.joint_index];
+                if (value < limit.min_rad || value > limit.max_rad) {
+                    std::ostringstream error;
+                    error << name << " joint " << limit.joint_index
+                            << " target " << value
+                            << " is outside configured range ["
+                            << limit.min_rad << ", " << limit.max_rad << "]";
+                    throw std::runtime_error(error.str());
+                }
+            }
+        };
+    validate_joint_pose(
+        "manipulator.home_joints", cfg.executor.home_joints);
+    validate_joint_pose(
+        "manipulator.observe_joints", cfg.executor.observe_joints);
+    validate_joint_pose(
+        "manipulator.side_ready_joints", cfg.executor.side_ready_joints);
+    validate_joint_pose(
+        "place.place_joints", cfg.executor.place_joints);
 
     // Mobile base alignment
     if (auto base = root["mobile_base"]) {
@@ -498,6 +657,9 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             base["target_x"].as<float>(cfg.mobile_base.target_x);
         cfg.mobile_base.x_tolerance =
             base["x_tolerance"].as<float>(cfg.mobile_base.x_tolerance);
+        cfg.mobile_base.x_hysteresis =
+            base["x_hysteresis"].as<float>(
+                cfg.mobile_base.x_hysteresis);
         cfg.mobile_base.y_tolerance =
             base["y_tolerance"].as<float>(cfg.mobile_base.y_tolerance);
         cfg.mobile_base.y_hysteresis =
@@ -534,6 +696,9 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         cfg.mobile_base.min_progress_floor_m =
             base["min_progress_floor_m"].as<float>(
                 cfg.mobile_base.min_progress_floor_m);
+        cfg.mobile_base.max_visual_regression_m =
+            base["max_visual_regression_m"].as<float>(
+                cfg.mobile_base.max_visual_regression_m);
         cfg.mobile_base.max_total_travel_m =
             base["max_total_travel_m"].as<float>(
                 cfg.mobile_base.max_total_travel_m);
@@ -669,7 +834,8 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
                                     " must be in [0, 1]");
         }
     };
-    validate_normalized("grasp.gripper_open", cfg.executor.gripper_open);
+    validate_normalized("grasp.top.gripper_open",
+                        cfg.executor.gripper_open);
     validate_normalized("grasp.gripper_effort", cfg.executor.gripper_effort);
     validate_normalized("place.release_open",
                         cfg.executor.place_release_open);
@@ -689,6 +855,7 @@ int main(int argc, char* argv[]) {
     std::string status_topic;
     bool auto_loop = false;
     bool step_mode = false;
+    bool plan_only = false;
     bool voice_mode = false;
     bool tts_mode = false;
     bool voice_stdin = false;
@@ -721,6 +888,8 @@ int main(int argc, char* argv[]) {
             auto_loop = true;
         } else if (arg == "--step") {
             step_mode = true;
+        } else if (arg == "--plan-only") {
+            plan_only = true;
         }
     }
 
@@ -758,6 +927,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Mode: auto-loop" << std::endl;
     }
     if (step_mode) std::cout << "Mode: step (pause before each stage)" << std::endl;
+    if (plan_only) std::cout << "Mode: plan-only (no motion commands)" << std::endl;
     std::cout << std::endl;
 
     // 加载配置
@@ -770,6 +940,8 @@ int main(int argc, char* argv[]) {
     }
     cfg.auto_loop = auto_loop;
     cfg.step_mode = step_mode;
+    cfg.plan_only = plan_only;
+    if (plan_only) cfg.mobile_base.enabled = false;
     cfg.voice.enabled = voice_mode || voice_stdin;
     if (tts_mode || status_stdout) cfg.voice.tts_enabled = true;
     if (!voice_topic.empty()) cfg.voice.input_topic = voice_topic;
@@ -883,7 +1055,9 @@ int main(int argc, char* argv[]) {
     }
 
     // 主循环
-    g_pipeline->Run();
+    g_pipeline->Run([]() {
+        return g_shutdown_signal != 0;
+    });
     const int exit_code = g_pipeline->GetState() == PipelineState::ERROR
         ? 1
         : 0;

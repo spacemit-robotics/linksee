@@ -8,6 +8,7 @@
 
 #include "mock/mock_executor.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -39,6 +40,18 @@ GraspResult MockExecutor::MoveToObserve() {
     return GraspResult::SUCCESS;
 }
 
+GraspResult MockExecutor::MoveToSideObserve() {
+    std::cout << "[MockExecutor] MoveToSideObserve: joint3 first, then joints=[";
+    for (size_t i = 0; i < config_.side_ready_joints.size(); ++i) {
+        if (i > 0) std::cout << ", ";
+        printf("%.2f", config_.side_ready_joints[i]);
+    }
+    std::cout << "]" << std::endl;
+    std::this_thread::sleep_for(std::chrono::milliseconds(
+        config_.timing.observe_gripper_close_wait_ms));
+    return GraspResult::SUCCESS;
+}
+
 GraspResult MockExecutor::MoveToHome() {
     std::cout << "[MockExecutor] MoveToHome: joints=[";
     for (size_t i = 0; i < config_.home_joints.size(); i++) {
@@ -52,7 +65,9 @@ GraspResult MockExecutor::MoveToHome() {
 }
 
 GraspResult MockExecutor::MoveToPreGrasp(const Pose3D& pre_grasp_pose,
-                                        float grasp_yaw_rad) {
+                                        float grasp_yaw_rad,
+                                        bool use_top_constraints) {
+    (void)use_top_constraints;
     printf("[MockExecutor] MoveToPreGrasp: (%.4f, %.4f, %.4f)\n",
             pre_grasp_pose.x, pre_grasp_pose.y, pre_grasp_pose.z);
     if (!std::isnan(grasp_yaw_rad)) {
@@ -64,16 +79,22 @@ GraspResult MockExecutor::MoveToPreGrasp(const Pose3D& pre_grasp_pose,
     return GraspResult::SUCCESS;
 }
 
-GraspResult MockExecutor::OpenGripperForGrasp() {
+GraspResult MockExecutor::OpenGripperForGrasp(float minimum_opening) {
+    const float opening = std::isfinite(minimum_opening)
+        ? std::max(config_.gripper_open,
+                    std::clamp(minimum_opening, 0.0f, 1.0f))
+        : config_.gripper_open;
     std::cout << "[MockExecutor] OpenGripperForGrasp: open="
-                << config_.gripper_open << std::endl;
+                << opening << std::endl;
     std::this_thread::sleep_for(
         std::chrono::milliseconds(config_.timing.gripper_open_wait_ms));
     return GraspResult::SUCCESS;
 }
 
 GraspResult MockExecutor::MoveToGrasp(const Pose3D& grasp_pose,
-                                        float grasp_yaw_rad) {
+                                        float grasp_yaw_rad,
+                                        bool use_top_constraints) {
+    (void)use_top_constraints;
     printf("[MockExecutor] MoveToGrasp: (%.4f, %.4f, %.4f)\n",
             grasp_pose.x, grasp_pose.y, grasp_pose.z);
     if (!std::isnan(grasp_yaw_rad)) {
@@ -93,15 +114,46 @@ GraspResult MockExecutor::CloseGripperAndCheck() {
     return GraspResult::SUCCESS;
 }
 
-GraspResult MockExecutor::LiftFromGrasp(const Pose3D& pre_grasp_pose,
-                                        float grasp_yaw_rad) {
+GraspResult MockExecutor::LiftFromGrasp(const Pose3D& retreat_pose,
+                                        const Pose3D& lift_pose,
+                                        float grasp_yaw_rad,
+                                        bool use_top_constraints) {
     (void)grasp_yaw_rad;
+    (void)use_top_constraints;
+    printf("[MockExecutor] RetreatFromGrasp: (%.4f, %.4f, %.4f)\n",
+            retreat_pose.x, retreat_pose.y, retreat_pose.z);
     printf("[MockExecutor] LiftFromGrasp: (%.4f, %.4f, %.4f)\n",
-            pre_grasp_pose.x, pre_grasp_pose.y, pre_grasp_pose.z);
+            lift_pose.x, lift_pose.y, lift_pose.z);
     std::this_thread::sleep_for(std::chrono::milliseconds(
         config_.timing.grasp_check_count *
         config_.timing.grasp_check_interval_ms));
     return GraspResult::SUCCESS;
+}
+
+GraspResult MockExecutor::ValidateGraspPoses(
+    const Pose3D& pre_grasp_pose,
+    const Pose3D& grasp_pose,
+    const Pose3D& retreat_pose,
+    const Pose3D& lift_pose,
+    float entry_clearance_z_m,
+    float grasp_yaw_rad,
+    bool use_top_constraints,
+    int timeout_ms,
+    std::string* detail) {
+    (void)pre_grasp_pose;
+    (void)grasp_pose;
+    (void)retreat_pose;
+    (void)lift_pose;
+    (void)entry_clearance_z_m;
+    (void)grasp_yaw_rad;
+    (void)use_top_constraints;
+    (void)timeout_ms;
+    if (detail) detail->clear();
+    return GraspResult::SUCCESS;
+}
+
+void MockExecutor::SetSupportPlane(const SupportPlane& support_plane) {
+    (void)support_plane;
 }
 
 GraspResult MockExecutor::MoveToPlace() {
@@ -147,15 +199,17 @@ GraspResult MockExecutor::ExecuteGrasp(const Pose3D& grasp_pose,
                 grasp_yaw_rad, grasp_yaw_rad * 180.0f / M_PI);
     }
 
-    GraspResult result = MoveToPreGrasp(pre_grasp_pose, grasp_yaw_rad);
+    GraspResult result = MoveToPreGrasp(
+        pre_grasp_pose, grasp_yaw_rad, true);
     if (result != GraspResult::SUCCESS) return result;
     result = OpenGripperForGrasp();
     if (result != GraspResult::SUCCESS) return result;
-    result = MoveToGrasp(grasp_pose, grasp_yaw_rad);
+    result = MoveToGrasp(grasp_pose, grasp_yaw_rad, true);
     if (result != GraspResult::SUCCESS) return result;
     result = CloseGripperAndCheck();
     if (result != GraspResult::SUCCESS) return result;
-    result = LiftFromGrasp(pre_grasp_pose, grasp_yaw_rad);
+    result = LiftFromGrasp(
+        pre_grasp_pose, pre_grasp_pose, grasp_yaw_rad, true);
     if (result != GraspResult::SUCCESS) return result;
     std::cout << "[MockExecutor] === Grasp SUCCESS ===" << std::endl;
     return GraspResult::SUCCESS;

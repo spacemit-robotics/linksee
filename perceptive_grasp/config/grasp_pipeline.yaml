@@ -1,20 +1,20 @@
 # perceptive grasp 发布配置
-# 仅保留部署必填项和现场常用调节项，完整说明见 ../docs/grasp_config.md。
+# 包含部署必填项和现场常用调节项，完整说明见 ../docs/grasp_config.md。
 
 # 立体相机与目标检测
 camera:
-  type: "spacemit_las2"  # realsense 或 spacemit_las2
+  type: "realsense"  # realsense 或 spacemit_las2
 
   realsense:
     width: 640
     height: 480
     fps: 30
-    motion_flush_frames: 16
+    motion_flush_frames: 30
     align_depth: true
     depth_filter:
       spatial: true
-      temporal: true
-      hole_filling: true
+      temporal: false
+      hole_filling: false
 
   spacemit_las2:
     video_device: "/dev/v4l/by-id/usb-DECXIN_DECXIN_Camera_01.00.00-video-index0"
@@ -34,27 +34,45 @@ detection:
   stable_frames: 1
 
 # 手眼标定结果
-# spacemit_las2 相机标定结果
+# realsense 立体相机标定结果
 calibration:
   T_base_camera:
-    translation: [-0.019765, 0.048938, 0.312118]
-    rotation: [-2.126969, -0.007183, -1.598329]
-# realsense 立体相机标定结果
-#    translation: [0.0441, 0.0515, 0.3035]
-#    rotation: [-2.3451, 0.0053, -1.4971]
+    translation: [0.005122, 0.056533, 0.310072]
+    rotation: [-2.162887, -0.009940, -1.551754]
 
 
 # 抓取策略
 grasp:
-  approach_height: 0.10
-  grasp_depth: 0.01
-  gripper_offset: 0.005
-  grasp_point_x_ratio: 1
-  gripper_open: 0.6
+  strategy: "auto"  # auto、top 或 side
+  top:
+    approach_height: 0.10
+    grasp_depth: 0.015
+    gripper_offset: 0.02
+    grasp_point_x_ratio: 1.0
+    gripper_open: 0.6
+  side:
+    min_height_m: 0.060
+    approach_distance_m: 0.030
+    pregrasp_min_x_m: 0.270
+    gripper_offset_m: 0.005
+    grasp_forward_offset_m: 0.020
+    grasp_height_ratio: 0.60
+    initial_lift_m: 0.050
+    lift_retreat_m: 0.025
   gripper_effort: 0.8
   gripper_hold_load_threshold: 100.0
   gripper_empty_position_margin: 0.03
   gripper_timeout_ms: 3000
+  geometry:
+    sample_stride: 2
+    max_object_points: 4000
+    min_object_points: 80
+    plane_distance_threshold_m: 0.008
+    table_clearance_m: 0.005
+    footprint_padding_m: 0.005
+    gripper_max_width_m: 0.10
+    planning_timeout_ms: 220
+    perception_budget_ms: 500
   workspace:
     x_min: 0.0
     x_max: 0.5
@@ -73,11 +91,18 @@ manipulator:
   urdf_path: "../urdf/so101.urdf"
   move_speed: 1.0
   line_speed: 0.5
-  home_joints: [1.816, -1.850, 1.639, 1.147, 0.189]
-  observe_joints: [1.759, 0.050, -0.217, 1.606, 0.015]
+  home_joints: [1.550, -1.620, 1.420, 1.147, 0.189]
+  observe_joints: [1.550, 0.050, -0.217, 1.606, 0.015]
+  side_ready_joints: [1.550, 0.021, 1.490, -1.700, -0.036]
+  joint_limits:
+    - {joint: 0, min: -1.540, max: 1.630}
+    - {joint: 1, min: -1.690, max: 1.680}
+    - {joint: 2, min: -1.840, max: 1.500}
+    - {joint: 3, min: -1.790, max: 1.670}
+    - {joint: 4, min: -2.700, max: 2.800}
 
 place:
-  place_joints: [-1.636, 0.087, -0.140, 1.389, 0.033]
+  place_joints: [-1.480, 0.087, -0.140, 1.389, 0.033]
   release_open: 0.5
 
 # 底盘辅助对齐
@@ -85,11 +110,12 @@ mobile_base:
   enabled: true
   dev_path: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5958002008-if00"
   target_x: 0.275
-  x_tolerance: 0.045
+  x_tolerance: 0.035
   y_tolerance: 0.15
   max_step_m: 0.12
   linear_speed: 0.20
   angular_speed: 1.2
+  min_cmd_duration_ms: 200
 
 # 语音交互
 voice:
@@ -98,7 +124,7 @@ voice:
   home_words: ["结束", "待命", "休息", "回家", "回home", "回到home", "回初始", "回到初始", "end", "home"]
   split_command_timeout_ms: 5000
 
-  # 支持硬件 aec 时改为 hardware_aec；half_duplex 仅作为兼容回退。
+  # 支持硬件 aec 时使用 hardware_aec；需要暂停播报期间识别时使用 half_duplex。
   echo_cancellation:
     mode: "webrtc_aec"
     delay_ms: 50

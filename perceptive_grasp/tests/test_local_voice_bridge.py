@@ -786,6 +786,27 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
                       output.getvalue())
         self.assertEqual(text_queue.get_nowait(), "收到，准备抓取香蕉。")
 
+    def test_initial_detection_status_acknowledges_target(self):
+        event = (
+            "state=DETECTING;"
+            "message=Detecting target before observation, target: cup;"
+            "target=cup"
+        )
+        self.assertEqual(
+            local_voice_bridge.status_to_speech(event, {}, False),
+            "收到，准备抓取cup。",
+        )
+
+    def test_strategy_observation_does_not_repeat_acknowledgement(self):
+        event = (
+            "state=OBSERVING;"
+            "message=Strategy selected: side; moving to matching "
+            "observation pose"
+        )
+        self.assertIsNone(
+            local_voice_bridge.status_to_speech(event, {}, False),
+        )
+
     def test_ready_log_is_used_when_ready_status_is_missing(self):
         class FakeStdout:
             def __init__(self):

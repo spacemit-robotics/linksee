@@ -40,6 +40,7 @@ struct MobileBaseAlignmentConfig {
 
     float target_x = 0.275f;
     float x_tolerance = 0.025f;
+    float x_hysteresis = 0.005f;
     float y_tolerance = 0.15f;
     float y_hysteresis = 0.025f;
     float max_step_m = 0.12f;
@@ -47,7 +48,7 @@ struct MobileBaseAlignmentConfig {
     float angular_speed = 1.2f;
     // Compensates the measured yaw response of the Linksee UART chassis.
     float yaw_gain = 8.0f;
-    int min_cmd_duration_ms = 200;
+    int min_cmd_duration_ms = 350;
     int min_rotation_duration_ms = 1000;
     int max_cmd_duration_ms = 2000;
     int settle_ms = 500;
@@ -55,6 +56,7 @@ struct MobileBaseAlignmentConfig {
     float min_progress_m = 0.02f;
     float min_progress_ratio = 0.15f;
     float min_progress_floor_m = 0.003f;
+    float max_visual_regression_m = 0.010f;
     float max_total_travel_m = 0.24f;
 };
 

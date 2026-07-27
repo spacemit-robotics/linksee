@@ -36,6 +36,8 @@ endif()
 
 find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc highgui imgcodecs dnn calib3d)
 find_package(yaml-cpp REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(URDFDOM REQUIRED IMPORTED_TARGET urdfdom)
 
 set(HAVE_WEBRTC_AEC OFF)
 if(ENABLE_WEBRTC_AEC)
@@ -85,6 +87,7 @@ endif()
 
 set(SOURCES
     src/main.cpp
+    src/grasp_geometry.cpp
     src/grasp_planner.cpp
     src/grasp_pipeline.cpp
     src/stereo_camera.cpp
@@ -353,9 +356,13 @@ else()
             "Build components/control first, or use -DUSE_MOCK_EXECUTOR=ON")
     endif()
 
-    list(APPEND SOURCES src/grasp_executor.cpp)
+    list(APPEND SOURCES src/grasp_executor.cpp src/arm_path_safety.cpp)
     list(APPEND EXTRA_INCLUDE_DIRS ${MANIP_INCLUDE_DIR})
-    list(APPEND EXTRA_LIBRARIES ${MANIP_LIBRARY} ${GRASP_LIBRARY})
+    list(APPEND EXTRA_LIBRARIES
+        ${MANIP_LIBRARY}
+        ${GRASP_LIBRARY}
+        PkgConfig::URDFDOM
+    )
 endif()
 
 # ============ 构建摘要 ============
@@ -467,6 +474,41 @@ target_include_directories(stereo_geometry_test PRIVATE
 )
 target_link_libraries(stereo_geometry_test PRIVATE ${OpenCV_LIBS})
 add_test(NAME stereo_geometry_test COMMAND stereo_geometry_test)
+
+add_executable(grasp_geometry_test
+    tests/grasp_geometry_test.cpp
+    src/grasp_geometry.cpp
+    src/grasp_planner.cpp
+)
+target_include_directories(grasp_geometry_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_compile_definitions(grasp_geometry_test PRIVATE MOCK_DETECTOR=1)
+target_link_libraries(grasp_geometry_test PRIVATE ${OpenCV_LIBS})
+add_test(NAME grasp_geometry_test COMMAND grasp_geometry_test)
+
+add_executable(orientation_estimator_test
+    tests/orientation_estimator_test.cpp
+    src/orientation_estimator.cpp
+)
+target_include_directories(orientation_estimator_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_compile_definitions(orientation_estimator_test PRIVATE MOCK_DETECTOR=1)
+target_link_libraries(orientation_estimator_test PRIVATE ${OpenCV_LIBS})
+add_test(NAME orientation_estimator_test COMMAND orientation_estimator_test)
+
+add_executable(arm_path_safety_test
+    tests/arm_path_safety_test.cpp
+    src/arm_path_safety.cpp
+)
+target_include_directories(arm_path_safety_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(arm_path_safety_test PRIVATE PkgConfig::URDFDOM)
+add_test(NAME arm_path_safety_test COMMAND arm_path_safety_test)
 
 add_executable(voice_command_parser_test
     tests/voice_command_parser_test.cpp
@@ -598,6 +640,7 @@ endif()
 if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA)
     set(DEBUG_LOCALIZE_SOURCES
         tools/debug_localize.cpp
+        src/grasp_geometry.cpp
         src/grasp_planner.cpp
         src/stereo_camera.cpp
         src/stereo_geometry.cpp
@@ -710,7 +753,11 @@ if(NOT USE_MOCK_EXECUTOR)
     )
     install(TARGETS debug_ik DESTINATION bin)
 
-    add_executable(debug_execute_safe tools/debug_execute_safe.cpp src/grasp_executor.cpp)
+    add_executable(debug_execute_safe
+        tools/debug_execute_safe.cpp
+        src/grasp_executor.cpp
+        src/arm_path_safety.cpp
+    )
     target_include_directories(debug_execute_safe PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${OpenCV_INCLUDE_DIRS}
@@ -721,6 +768,7 @@ if(NOT USE_MOCK_EXECUTOR)
         ${OpenCV_LIBS}
         ${MANIP_LIBRARY}
         ${GRASP_LIBRARY}
+        PkgConfig::URDFDOM
         pthread
     )
     install(TARGETS debug_execute_safe DESTINATION bin)

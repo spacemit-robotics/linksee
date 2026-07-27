@@ -15,7 +15,9 @@ from typing import Sequence
 
 
 STRUCTURED_PREFIXES = (
+    "[Main]",
     "[Init]",
+    "[Loop]",
     "[Stage ",
     "[Action]",
     "[Timing]",
@@ -48,7 +50,7 @@ def should_keep_line(line: str) -> bool:
         return True
     if re.match(r"^\s{2}\[\d{2}\]\s", text):
         return True
-    if text == "[Pipeline] IDLE | Ready":
+    if text.startswith("[Pipeline] IDLE |"):
         return True
     if text.startswith("Pipeline initialization failed!"):
         return True
@@ -97,13 +99,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     command, step_mode, debug_mode = _parse_command(
         sys.argv[1:] if argv is None else argv)
     try:
-        if debug_mode:
-            return subprocess.call(command)
         process = subprocess.Popen(
             command,
             stdin=None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdout=None if debug_mode else subprocess.PIPE,
+            stderr=None if debug_mode else subprocess.STDOUT,
             bufsize=0,
         )
     except OSError as exc:
@@ -111,16 +111,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 127
 
     def forward_signal(signum, _frame):
-        if process.poll() is None:
+        # A terminal-generated SIGINT already reaches both processes in the
+        # foreground process group. Forwarding it would turn one Ctrl+C into
+        # two signals for the core and bypass its graceful shutdown.
+        if process.poll() is None and signum != signal.SIGINT:
             process.send_signal(signum)
 
     previous_handlers = {}
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous_handlers[signum] = signal.signal(signum, forward_signal)
 
-    assert process.stdout is not None
-    buffer = b""
     try:
+        if debug_mode:
+            return process.wait()
+
+        assert process.stdout is not None
+        buffer = b""
         while True:
             chunk = os.read(process.stdout.fileno(), 4096)
             if not chunk:

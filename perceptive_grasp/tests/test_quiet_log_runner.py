@@ -26,6 +26,7 @@ class QuietLogRunnerTest(unittest.TestCase):
     def test_keeps_structured_pipeline_lines(self):
         lines = [
             "[Init] START pipeline\n",
+            "[Loop] START iteration=4 target=banana\n",
             "[Stage 2] START DETECTING\n",
             "[Action] END stage=GRASPING result=SUCCESS\n",
             "[Timing] stage=DETECTING elapsed_ms=145\n",
@@ -56,6 +57,10 @@ class QuietLogRunnerTest(unittest.TestCase):
     def test_preserves_step_prompts_and_ready_state(self):
         self.assertTrue(MODULE.should_keep_line("[Step] continue?"))
         self.assertTrue(MODULE.should_keep_line("[Pipeline] IDLE | Ready\n"))
+        self.assertTrue(MODULE.should_keep_line(
+            "[Pipeline] IDLE | Home position reached; exiting\n"))
+        self.assertTrue(MODULE.should_keep_line(
+            "[Main] Graceful shutdown requested\n"))
         self.assertTrue(MODULE.should_keep_line(
             "Usage: ./perceptive_grasp_core [options]\n"))
 
@@ -93,7 +98,19 @@ class QuietLogRunnerTest(unittest.TestCase):
 
     def test_normal_mode_filters_stdout_and_stderr_together(self):
         source = inspect.getsource(MODULE.main)
-        self.assertIn("stderr=subprocess.STDOUT", source)
+        self.assertIn(
+            "stderr=None if debug_mode else subprocess.STDOUT",
+            source,
+        )
+
+    def test_sigint_is_not_forwarded_twice(self):
+        source = inspect.getsource(MODULE.main)
+        self.assertIn("signum != signal.SIGINT", source)
+
+    def test_debug_mode_uses_managed_child_process(self):
+        source = inspect.getsource(MODULE.main)
+        self.assertNotIn("subprocess.call", source)
+        self.assertIn("if debug_mode:\n            return process.wait()", source)
 
 
 if __name__ == "__main__":
