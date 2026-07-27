@@ -21,14 +21,9 @@ class MainRuntimeShutdownTest(unittest.TestCase):
         cls.source = MAIN_CPP.read_text(encoding="utf-8")
 
     def test_voice_stdin_exit_forces_process_after_cleanup(self):
-        match = re.search(
-            r"g_pipeline->Run\(\);(?P<body>.*?)return exit_code;",
-            self.source,
-            re.DOTALL,
-        )
-
-        self.assertIsNotNone(match, "main must clean up after Run()")
-        body = match.group("body")
+        run_index = self.source.index("g_pipeline->Run([]()")
+        return_index = self.source.index("return exit_code;", run_index)
+        body = self.source[run_index:return_index]
         self.assertIn("voice_stdin", body)
         self.assertIn("CleanupRuntime(false)", body)
         self.assertIn("std::_Exit(exit_code)", body)
@@ -51,7 +46,7 @@ class MainRuntimeShutdownTest(unittest.TestCase):
         )
         self.assertIn("std::_Exit(exit_code)", self.source)
 
-    def test_signal_handler_exits_without_blocking_cleanup(self):
+    def test_first_signal_requests_graceful_shutdown(self):
         match = re.search(
             r"static void SignalHandler\(int sig\) \{(?P<body>.*?)\n\}",
             self.source,
@@ -61,7 +56,29 @@ class MainRuntimeShutdownTest(unittest.TestCase):
         self.assertIsNotNone(match, "missing SignalHandler")
         body = match.group("body")
         self.assertNotIn("CleanupRuntime()", body)
+        self.assertIn("g_shutdown_signal = sig", body)
+        self.assertIn("Graceful shutdown requested", body)
+        self.assertIn("return;", body)
+
+    def test_second_signal_forces_exit(self):
+        match = re.search(
+            r"static void SignalHandler\(int sig\) \{(?P<body>.*?)\n\}",
+            self.source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(match, "missing SignalHandler")
+        body = match.group("body")
+        self.assertIn("Second signal received; forcing exit", body)
         self.assertIn("std::_Exit", body)
+
+    def test_run_polls_signal_outside_handler(self):
+        self.assertIn(
+            "g_pipeline->Run([]() {\n"
+            "        return g_shutdown_signal != 0;\n"
+            "    });",
+            self.source,
+        )
 
     def test_status_event_uses_one_low_level_write(self):
         match = re.search(

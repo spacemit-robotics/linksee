@@ -9,10 +9,14 @@
 #include "las2_stereo_camera.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <utility>
+
+#include <unistd.h>
 
 #include <opencv2/imgproc.hpp>
 
@@ -33,6 +37,10 @@ public:
 
     ~Las2StereoCamera() override {
         if (!camera_) {
+            return;
+        }
+        if (!initialized_) {
+            camera_ = nullptr;
             return;
         }
         std::cout << "[Las2StereoCamera] Shutting down..." << std::endl;
@@ -68,6 +76,12 @@ public:
         if (!(settings.min_depth_m >= 0.0f) ||
             !(settings.max_depth_m > settings.min_depth_m)) {
             std::cerr << "[Las2StereoCamera] invalid depth range" << std::endl;
+            return false;
+        }
+        if (access(settings.video_device.c_str(), R_OK | W_OK) != 0) {
+            std::cerr << "[Las2StereoCamera] video device is not accessible: "
+                    << settings.video_device << ": " << std::strerror(errno)
+                    << std::endl;
             return false;
         }
 

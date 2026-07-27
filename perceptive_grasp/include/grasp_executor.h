@@ -9,10 +9,13 @@
 #ifndef GRASP_EXECUTOR_H
 #define GRASP_EXECUTOR_H
 
+#include <cstddef>
 #include <cmath>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "arm_path_safety.h"
 #include "grasp_planner.h"
 
 // Forward declarations for C API (avoid pulling full headers into this header)
@@ -97,7 +100,7 @@ struct TimingConfig {
     // 到抓取位后，闭合夹爪前等待
     int grasp_settle_ms = 100;
     // 闭合夹爪后等待
-    int gripper_close_wait_ms = 500;
+    int gripper_close_wait_ms = 1000;
     // 夹爪状态检测次数与间隔
     int grasp_check_count = 10;
     int grasp_check_interval_ms = 50;
@@ -126,6 +129,12 @@ struct ExecutorConfig {
     float move_speed = 1.0f;
     float line_speed = 0.5f;
     float pose_position_tolerance = 0.03f;
+    float side_pose_position_tolerance = 0.005f;
+    float side_lift_clearance_m = 0.010f;
+    float support_surface_clearance_m = 0.005f;
+    float path_joint_step_rad = 0.040f;
+    float side_waypoint_joint_tolerance_rad = 0.040f;
+    float place_joint_tolerance_rad = 0.080f;
 
     // 夹爪
     float gripper_open = 0.5f;
@@ -137,11 +146,13 @@ struct ExecutorConfig {
 
     // 预定义姿态
     std::vector<float> home_joints = {
-        1.816f, -1.850f, 1.639f, 1.147f, 0.189f};
+        1.550f, -1.620f, 1.420f, 1.147f, 0.189f};
     std::vector<float> observe_joints = {
-        1.759f, 0.050f, -0.217f, 1.606f, 0.015f};
+        1.550f, 0.050f, -0.217f, 1.606f, 0.015f};
+    std::vector<float> side_ready_joints = {
+        1.550f, 0.021f, 1.490f, -1.700f, -0.036f};
     std::vector<float> place_joints = {
-        -1.636f, 0.087f, -0.140f, 1.389f, 0.033f};
+        -1.480f, 0.087f, -0.140f, 1.389f, 0.033f};
 
     // 阶段间等待时间
     TimingConfig timing;
@@ -149,6 +160,15 @@ struct ExecutorConfig {
     // IK 关节约束 (用于多种子采样时筛选合格解)
     std::vector<JointConstraint> joint_constraints = {
         {3, 1.102f, 1.667f},
+    };
+
+    // Calibrated servo limits, kept inside the persistent register limits.
+    std::vector<JointConstraint> joint_limits = {
+        {0, -1.540f, 1.630f},
+        {1, -1.690f, 1.680f},
+        {2, -1.840f, 1.500f},
+        {3, -1.790f, 1.670f},
+        {4, -2.700f, 2.800f},
     };
 
     // IK 多种子采样参数
@@ -194,15 +214,32 @@ public:
 #ifdef MOCK_EXECUTOR
     virtual bool Init() = 0;
     virtual GraspResult MoveToObserve() = 0;
+    virtual GraspResult MoveToSideObserve() = 0;
     virtual GraspResult MoveToHome() = 0;
     virtual GraspResult MoveToPreGrasp(const Pose3D& pre_grasp_pose,
-                                        float grasp_yaw_rad = NAN) = 0;
-    virtual GraspResult OpenGripperForGrasp() = 0;
+                                        float grasp_yaw_rad = NAN,
+                                        bool use_top_constraints = true) = 0;
+    virtual GraspResult OpenGripperForGrasp(
+        float minimum_opening = NAN) = 0;
     virtual GraspResult MoveToGrasp(const Pose3D& grasp_pose,
-                                    float grasp_yaw_rad = NAN) = 0;
+                                    float grasp_yaw_rad = NAN,
+                                    bool use_top_constraints = true) = 0;
     virtual GraspResult CloseGripperAndCheck() = 0;
-    virtual GraspResult LiftFromGrasp(const Pose3D& pre_grasp_pose,
-                                        float grasp_yaw_rad = NAN) = 0;
+    virtual GraspResult LiftFromGrasp(const Pose3D& retreat_pose,
+                                        const Pose3D& lift_pose,
+                                        float grasp_yaw_rad = NAN,
+                                        bool use_top_constraints = true) = 0;
+    virtual GraspResult ValidateGraspPoses(
+        const Pose3D& pre_grasp_pose,
+        const Pose3D& grasp_pose,
+        const Pose3D& retreat_pose,
+        const Pose3D& lift_pose,
+        float entry_clearance_z_m,
+        float grasp_yaw_rad,
+        bool use_top_constraints,
+        int timeout_ms,
+        std::string* detail) = 0;
+    virtual void SetSupportPlane(const SupportPlane& support_plane) = 0;
     virtual GraspResult MoveToPlace() = 0;
     virtual GraspResult ReleaseObject() = 0;
     virtual GraspResult CloseGripper() = 0;
@@ -217,15 +254,31 @@ public:
 #else
     virtual bool Init();
     virtual GraspResult MoveToObserve();
+    virtual GraspResult MoveToSideObserve();
     virtual GraspResult MoveToHome();
     virtual GraspResult MoveToPreGrasp(const Pose3D& pre_grasp_pose,
-                                        float grasp_yaw_rad = NAN);
-    virtual GraspResult OpenGripperForGrasp();
+                                        float grasp_yaw_rad = NAN,
+                                        bool use_top_constraints = true);
+    virtual GraspResult OpenGripperForGrasp(float minimum_opening = NAN);
     virtual GraspResult MoveToGrasp(const Pose3D& grasp_pose,
-                                    float grasp_yaw_rad = NAN);
+                                    float grasp_yaw_rad = NAN,
+                                    bool use_top_constraints = true);
     virtual GraspResult CloseGripperAndCheck();
-    virtual GraspResult LiftFromGrasp(const Pose3D& pre_grasp_pose,
-                                        float grasp_yaw_rad = NAN);
+    virtual GraspResult LiftFromGrasp(const Pose3D& retreat_pose,
+                                        const Pose3D& lift_pose,
+                                        float grasp_yaw_rad = NAN,
+                                        bool use_top_constraints = true);
+    virtual GraspResult ValidateGraspPoses(
+        const Pose3D& pre_grasp_pose,
+        const Pose3D& grasp_pose,
+        const Pose3D& retreat_pose,
+        const Pose3D& lift_pose,
+        float entry_clearance_z_m,
+        float grasp_yaw_rad,
+        bool use_top_constraints,
+        int timeout_ms,
+        std::string* detail);
+    virtual void SetSupportPlane(const SupportPlane& support_plane);
     virtual GraspResult MoveToPlace();
     virtual GraspResult ReleaseObject();
     virtual GraspResult CloseGripper();
@@ -265,6 +318,16 @@ private:
     struct manip_dev* arm_ = nullptr;
     struct grasp_dev* gripper_ = nullptr;
     kin_solver_t* kin_ = nullptr;
+    std::unique_ptr<ArmPathSafety> arm_path_safety_;
+    SupportPlane support_plane_;
+    std::vector<float> validated_side_staging_joints_;
+    std::vector<float> validated_side_sweep_joints_;
+    Pose3D validated_side_entry_pose_{};
+    std::vector<float> validated_side_entry_joints_;
+    std::vector<Pose3D> validated_side_poses_;
+    std::vector<std::vector<float>> validated_side_joint_path_;
+    size_t validated_side_path_index_ = 0;
+    std::vector<float> active_target_joints_;
     int wait_motion_timeout_ms_ = 15000;
     float empty_closed_position_ = NAN;
     ExecutorDiagnostics diagnostics_;
@@ -273,16 +336,64 @@ private:
                         const std::string& detail = "");
     GraspResult CheckGripperHolding(const char* phase, bool after_lift);
     void CaptureEmptyClosedPosition();
+    bool WaitGripperOpening(float target_position);
     GraspResult MoveToJoints(const std::vector<float>& joints);
+    GraspResult MoveToJointsCoordinated(
+        const std::vector<float>& joints);
     GraspResult MoveToJointsCollisionSafe(const std::vector<float>& joints);
     GraspResult MoveToPoseWithIKJoints(const Pose3D& pose, float speed);
+    GraspResult MoveToPoseSide(const Pose3D& pose, float speed);
+    GraspResult MoveToSidePreGrasp(const Pose3D& pose, float speed);
+    GraspResult MoveToSideLift(const Pose3D& retreat_pose,
+                                const Pose3D& lift_pose,
+                                float speed);
     GraspResult MoveToPoseConstrained(const Pose3D& pose, float speed);
     GraspResult MoveToPoseWithYaw(const Pose3D& pose, float speed,
                                     float yaw_rad);
     GraspResult SolveIKConstrained(const Pose3D& pose, std::vector<float>& joints);
+    GraspResult SolveIKSide(const Pose3D& pose,
+                            int timeout_ms,
+                            std::vector<float>& joints,
+                            std::string* detail = nullptr,
+                            const std::vector<float>* path_start = nullptr);
+    GraspResult PlanSideJoint0Sweep(
+        const Pose3D& pre_grasp_pose,
+        float entry_clearance_z_m,
+        int timeout_ms,
+        std::vector<float>& staging_joints,
+        std::vector<float>& sweep_joints,
+        std::string* detail);
+    std::vector<Pose3D> BuildSideLiftPath(const Pose3D& retreat_pose,
+                                            const Pose3D& lift_pose) const;
+    std::vector<Pose3D> BuildSideCartesianPath(
+        const Pose3D& start_pose,
+        const Pose3D& end_pose,
+        float maximum_step_m) const;
+    GraspResult PlanSideJointPath(
+        const std::vector<Pose3D>& poses,
+        int timeout_ms,
+        std::vector<std::vector<float>>& joint_path,
+        std::string* detail,
+        const std::vector<float>* start_joints = nullptr);
+    GraspResult ExecuteContinuousJointPath(
+        const std::vector<std::vector<float>>& joint_path,
+        float first_speed,
+        float remaining_speed,
+        float final_tolerance_rad,
+        int completion_timeout_ms = -1);
+    GraspResult CorrectSidePose(
+        const Pose3D& pose, float speed, const char* action);
+    bool TakeValidatedSidePath(
+        const std::vector<Pose3D>& poses,
+        std::vector<std::vector<float>>& joint_path);
+    GraspResult SolveIKFast(const Pose3D& pose,
+                            bool use_top_constraints,
+                            int timeout_ms,
+                            std::vector<float>& joints);
     GraspResult MoveToPose(const Pose3D& pose, float speed);
     GraspResult MoveLinear(const Pose3D& pose, float speed);
-    bool WaitMotionDone(int timeout_ms = -1);
+    bool WaitMotionDone(int timeout_ms = -1,
+                        float target_tolerance_rad = 0.060f);
     bool VerifyPoseReached(const char* action, const Pose3D& target_pose);
     bool GetCurrentJoints(std::vector<float>& joints);
     bool NeedsCollisionAvoidance(const std::vector<float>& current_joints,

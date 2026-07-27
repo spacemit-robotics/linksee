@@ -1,6 +1,6 @@
 # 硬件部署
 
-本文说明 perceptive grasp 在 Linksee 机器人上的硬件连接和设备权限设置。
+本文说明 perceptive grasp 在 linksee 机器人上的硬件连接和设备权限设置。
 
 ## 1. 硬件清单
 

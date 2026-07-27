@@ -40,6 +40,13 @@ namespace {
 
 namespace fs = std::filesystem;
 
+constexpr int kMaxGeometryAttempts = 12;
+constexpr int kGeometryRefreshAttempt = 6;
+constexpr int kTopGeometryRecoveryAttempt = 2;
+constexpr int kMotionGeometryRequiredConsistentPairs = 2;
+constexpr int kMotionGeometryMaxSamples = 15;
+constexpr int kMotionGeometryMaxRefreshes = 1;
+
 void WriteStructuredLine(const std::string& text) {
     const std::string line = text + "\n";
     ssize_t written;
@@ -84,6 +91,7 @@ const char* PipelineStateName(PipelineState state) {
         case PipelineState::LIFTING: return "LIFTING";
         case PipelineState::PLACING: return "PLACING";
         case PipelineState::HOMING: return "HOMING";
+        case PipelineState::RECOVERING: return "RECOVERING";
         case PipelineState::DONE: return "DONE";
         case PipelineState::ERROR: return "ERROR";
     }
@@ -186,8 +194,7 @@ bool ForegroundDepthFromMask(const cv::Mat& depth, const cv::Mat& input_mask,
         return false;
     }
 
-    // The lower quartile favors the object surface over the farther floor,
-    // while remaining robust against isolated near-depth outliers.
+    // Favor the object surface over the farther support plane.
     std::sort(depth_values.begin(), depth_values.end());
     sample_count = depth_values.size();
     depth_mm = depth_values[depth_values.size() / 4];
@@ -267,6 +274,7 @@ GraspPipeline::~GraspPipeline() {
     // teardown deadlocks.
     mobile_base_.reset();
     executor_.reset();
+    geometry_planner_.reset();
     planner_.reset();
     std::cout << "[Pipeline] Releasing camera..." << std::endl;
     camera_.reset();
@@ -373,6 +381,8 @@ bool GraspPipeline::Init() {
 
     // 初始化抓取规划器
     planner_ = std::make_unique<GraspPlanner>(config_.planner);
+    geometry_planner_ = std::make_unique<GraspGeometryPlanner>(
+        config_.geometry, config_.planner);
 
     // 初始化执行器
     std::cout << "[Init] START module=executor" << std::endl;
@@ -418,20 +428,46 @@ bool GraspPipeline::TriggerGrasp() {
         std::cerr << "[Pipeline] Cannot trigger: not idle" << std::endl;
         return false;
     }
+    if (object_may_be_held_.load()) {
+        std::cerr << "[Pipeline] Cannot trigger: gripper may still hold an "
+                    "object; remove it before starting another task"
+                << std::endl;
+        return false;
+    }
     target_label_.clear();
     retry_count_ = 0;
     stable_count_ = 0;
     missing_count_ = 0;
+    geometry_retry_count_ = 0;
     base_align_attempts_ = 0;
+    motion_geometry_confirmation_pending_ = false;
+    motion_geometry_reference_valid_ = false;
+    motion_geometry_sample_count_ = 0;
+    motion_geometry_consistent_count_ = 0;
+    motion_geometry_refresh_count_ = 0;
+    motion_geometry_reference_ = ObjectGeometry3D{};
     have_previous_base_alignment_point_ = false;
     previous_base_alignment_command_ = MobileBaseAlignmentCommand{};
     base_align_commanded_travel_m_ = 0.0f;
     task_id_.clear();
+    grasp_strategy_ = GraspStrategy::TOP;
+    observation_strategy_selected_ = false;
+    grasp_opening_ = NAN;
     last_debug_image_path_.clear();
     last_debug_json_path_.clear();
     last_status_message_.clear();
+    perception_cycle_active_ = false;
+    auto_loop_target_label_.clear();
+    auto_loop_iteration_ = config_.auto_loop ? 1 : 0;
+    last_valid_geometry_ = ObjectGeometry3D{};
+    last_valid_geometry_available_ = false;
+    top_geometry_recovery_active_ = false;
     BeginTaskTiming();
-    SetState(PipelineState::OBSERVING, "Moving to observe position");
+    if (config_.auto_loop) {
+        std::cout << "\n[Loop] START iteration=1 target=auto" << std::endl;
+    }
+    SetState(PipelineState::DETECTING,
+            "Detecting target before selecting observation pose");
     return true;
 }
 
@@ -440,21 +476,47 @@ bool GraspPipeline::TriggerGrasp(const std::string& target_label) {
         std::cerr << "[Pipeline] Cannot trigger: not idle" << std::endl;
         return false;
     }
+    if (object_may_be_held_.load()) {
+        std::cerr << "[Pipeline] Cannot trigger: gripper may still hold an "
+                    "object; remove it before starting another task"
+                << std::endl;
+        return false;
+    }
     target_label_ = target_label;
     retry_count_ = 0;
     stable_count_ = 0;
     missing_count_ = 0;
+    geometry_retry_count_ = 0;
     base_align_attempts_ = 0;
+    motion_geometry_confirmation_pending_ = false;
+    motion_geometry_reference_valid_ = false;
+    motion_geometry_sample_count_ = 0;
+    motion_geometry_consistent_count_ = 0;
+    motion_geometry_refresh_count_ = 0;
+    motion_geometry_reference_ = ObjectGeometry3D{};
     have_previous_base_alignment_point_ = false;
     previous_base_alignment_command_ = MobileBaseAlignmentCommand{};
     base_align_commanded_travel_m_ = 0.0f;
     task_id_.clear();
+    grasp_strategy_ = GraspStrategy::TOP;
+    observation_strategy_selected_ = false;
+    grasp_opening_ = NAN;
     last_debug_image_path_.clear();
     last_debug_json_path_.clear();
     last_status_message_.clear();
+    perception_cycle_active_ = false;
+    auto_loop_target_label_ = target_label;
+    auto_loop_iteration_ = config_.auto_loop ? 1 : 0;
+    last_valid_geometry_ = ObjectGeometry3D{};
+    last_valid_geometry_available_ = false;
+    top_geometry_recovery_active_ = false;
     BeginTaskTiming();
-    SetState(PipelineState::OBSERVING,
-            "Moving to observe, target: " + target_label);
+    if (config_.auto_loop) {
+        std::cout << "\n[Loop] START iteration=1 target="
+                    << target_label << std::endl;
+    }
+    SetState(PipelineState::DETECTING,
+            "Detecting target before observation, target: " + target_label);
     return true;
 }
 
@@ -610,6 +672,22 @@ void GraspPipeline::Stop() {
     std::cout << std::flush;
 }
 
+void GraspPipeline::RequestGracefulShutdown() {
+    if (graceful_shutdown_requested_.exchange(true)) return;
+
+    {
+        std::lock_guard<std::mutex> lock(voice_queue_mutex_);
+        waiting_voice_target_ = false;
+        while (!voice_queue_.empty()) {
+            voice_queue_.pop();
+        }
+    }
+    cancel_requested_.store(true);
+    std::cout << "[Pipeline] Graceful shutdown requested; stopping loop after "
+                "the current action and returning home"
+                << std::endl;
+}
+
 void GraspPipeline::SetCallback(PipelineCallback callback) {
     std::lock_guard<std::mutex> lock(callback_mutex_);
     callback_ = std::move(callback);
@@ -620,7 +698,14 @@ void GraspPipeline::ResetTaskState() {
     retry_count_ = 0;
     stable_count_ = 0;
     missing_count_ = 0;
+    geometry_retry_count_ = 0;
     base_align_attempts_ = 0;
+    motion_geometry_confirmation_pending_ = false;
+    motion_geometry_reference_valid_ = false;
+    motion_geometry_sample_count_ = 0;
+    motion_geometry_consistent_count_ = 0;
+    motion_geometry_refresh_count_ = 0;
+    motion_geometry_reference_ = ObjectGeometry3D{};
     have_previous_base_alignment_point_ = false;
     previous_base_alignment_command_ = MobileBaseAlignmentCommand{};
     base_align_commanded_travel_m_ = 0.0f;
@@ -631,9 +716,18 @@ void GraspPipeline::ResetTaskState() {
     return_to_observe_pending_ = false;
     return_to_home_pending_ = false;
     grasp_yaw_rad_ = NAN;
+    grasp_opening_ = NAN;
     current_target_ = DetectionTarget{};
     grasp_pose_ = Pose3D{};
     pre_grasp_pose_ = Pose3D{};
+    retreat_pose_ = Pose3D{};
+    lift_pose_ = Pose3D{};
+    grasp_strategy_ = GraspStrategy::TOP;
+    observation_strategy_selected_ = false;
+    grasp_geometry_result_ = GraspGeometryResult{};
+    last_valid_geometry_ = ObjectGeometry3D{};
+    last_valid_geometry_available_ = false;
+    top_geometry_recovery_active_ = false;
     base_alignment_command_ = MobileBaseAlignmentCommand{};
     last_candidates_.clear();
     current_color_.release();
@@ -642,6 +736,34 @@ void GraspPipeline::ResetTaskState() {
     last_debug_image_path_.clear();
     last_debug_json_path_.clear();
     last_status_message_.clear();
+    failure_recovery_active_ = false;
+    failure_recovery_succeeded_ = false;
+    pending_failure_message_.clear();
+}
+
+void GraspPipeline::RestartAutoLoop(const char* previous_result) {
+    const std::string target = auto_loop_target_label_;
+    const bool observation_strategy_selected =
+        observation_strategy_selected_;
+    const GraspStrategy grasp_strategy = grasp_strategy_;
+    ResetTaskState();
+    target_label_ = target;
+    observation_strategy_selected_ = observation_strategy_selected;
+    grasp_strategy_ = grasp_strategy;
+    ++auto_loop_iteration_;
+    BeginTaskTiming();
+
+    std::cout << "\n[Loop] START iteration=" << auto_loop_iteration_
+                << " previous_result=" << previous_result
+                << " target=" << (target_label_.empty() ? "auto"
+                                                        : target_label_)
+                << std::endl;
+    SetState(
+        PipelineState::DETECTING,
+        target_label_.empty()
+            ? "Loop: detecting before selecting observation pose"
+            : "Loop: detecting target before observation, target: " +
+                target_label_);
 }
 
 bool GraspPipeline::StartAction(PipelineState owner, const std::string& name,
@@ -752,7 +874,7 @@ std::string GraspPipeline::ResultMessage(const std::string& phase,
             oss << "IK failed";
             break;
         case GraspResult::OUT_OF_RANGE:
-            oss << "target out of workspace";
+            oss << "motion outside configured joint or Cartesian limits";
             break;
         case GraspResult::TIMEOUT:
             oss << "timeout";
@@ -773,7 +895,42 @@ std::string GraspPipeline::ResultMessage(const std::string& phase,
     return oss.str();
 }
 
+bool GraspPipeline::RetryRecoverableMotion(
+    const std::string& phase, GraspResult result) {
+    if (result != GraspResult::OUT_OF_RANGE &&
+        result != GraspResult::IK_FAILED) {
+        return false;
+    }
+
+    retry_count_++;
+    if (retry_count_ >= config_.max_retries) {
+        return false;
+    }
+
+    stable_count_ = 0;
+    missing_count_ = 0;
+    geometry_retry_count_ = 0;
+    current_color_.release();
+    current_depth_.release();
+    perception_cycle_active_ = false;
+
+    std::ostringstream message;
+    message << phase << " was not reachable; returning to the "
+            << (grasp_strategy_ == GraspStrategy::SIDE ? "side" : "top")
+            << " observation pose for re-detection and replanning (retry "
+            << retry_count_ << "/" << config_.max_retries - 1 << ")";
+    SetState(PipelineState::OBSERVING, message.str());
+    return true;
+}
+
 bool GraspPipeline::FlushCameraAfterMotion(const char* reason) {
+    motion_geometry_confirmation_pending_ = true;
+    motion_geometry_reference_valid_ = false;
+    motion_geometry_sample_count_ = 0;
+    motion_geometry_consistent_count_ = 0;
+    motion_geometry_reference_ = ObjectGeometry3D{};
+    camera_->ResetAfterMotion();
+
     if (config_.camera.type == "spacemit_las2") {
         const auto start = std::chrono::steady_clock::now();
         const std::int64_t previous_frame_id = camera_->LastFrameId();
@@ -834,11 +991,42 @@ bool GraspPipeline::FlushCameraAfterMotion(const char* reason) {
     return true;
 }
 
+bool GraspPipeline::SaveStepCameraDebug(const char* phase) {
+    if (!config_.step_mode || !config_.save_debug_data) return true;
+
+    cv::Mat color;
+    cv::Mat depth;
+    if (!camera_->GetFrames(color, depth)) return false;
+
+    try {
+        fs::path out_dir(config_.debug_output_dir);
+        fs::create_directories(out_dir);
+        if (task_id_.empty()) task_id_ = TimestampString();
+        const std::string stem = "grasp_" + task_id_ + "_" + phase;
+        const fs::path color_path = out_dir / (stem + ".png");
+        const fs::path depth_path = out_dir / (stem + "_depth.png");
+        cv::imwrite(color_path.string(), color);
+
+        cv::Mat depth_8u;
+        cv::Mat depth_color;
+        depth.convertTo(depth_8u, CV_8UC1, 255.0 / 1000.0);
+        cv::applyColorMap(depth_8u, depth_color, cv::COLORMAP_TURBO);
+        depth_color.setTo(cv::Scalar(0, 0, 0), depth == 0);
+        cv::imwrite(depth_path.string(), depth_color);
+        std::cout << "[Pipeline] Step camera debug saved: "
+                    << color_path << ", " << depth_path << std::endl;
+    } catch (const std::exception& error) {
+        std::cerr << "[Pipeline] Failed to save step camera debug: "
+                    << error.what() << std::endl;
+        return false;
+    }
+    return true;
+}
+
 void GraspPipeline::SaveGraspDebug(float grasp_px, float grasp_py,
                                     uint16_t depth_mm,
                                     const float cam_point[3],
-                                    const float base_point[3],
-                                    float offset_dir_angle) {
+                                    const float base_point[3]) {
     if (!config_.save_debug_data) return;
 
     try {
@@ -888,21 +1076,44 @@ void GraspPipeline::SaveGraspDebug(float grasp_px, float grasp_py,
         ofs << "  \"pixel_center\": [" << current_target_.center.x << ", "
             << current_target_.center.y << "],\n";
         ofs << "  \"pixel_grasp\": [" << grasp_px << ", " << grasp_py << "],\n";
-        ofs << "  \"depth_mm\": " << depth_mm << ",\n";
-        ofs << "  \"camera_point_m\": [" << cam_point[0] << ", "
-            << cam_point[1] << ", " << cam_point[2] << "],\n";
+        ofs << "  \"depth_mm\": ";
+        if (depth_mm != 0) {
+            ofs << depth_mm;
+        } else {
+            ofs << "null";
+        }
+        ofs << ",\n";
+        ofs << "  \"camera_point_m\": ";
+        if (depth_mm != 0) {
+            ofs << "[" << cam_point[0] << ", "
+                << cam_point[1] << ", " << cam_point[2] << "]";
+        } else {
+            ofs << "null";
+        }
+        ofs << ",\n";
         ofs << "  \"base_point_m\": [" << base_point[0] << ", "
             << base_point[1] << ", " << base_point[2] << "],\n";
-        ofs << "  \"offset_dir_angle_rad\": " << offset_dir_angle << ",\n";
-        ofs << "  \"grasp_yaw_rad\": " << grasp_yaw_rad_ << ",\n";
-        ofs << "  \"offset_dir_angle_deg\": "
-            << offset_dir_angle * 180.0f / M_PI << ",\n";
-        ofs << "  \"grasp_yaw_deg\": "
-            << grasp_yaw_rad_ * 180.0f / M_PI << ",\n";
+        ofs << "  \"grasp_strategy\": \""
+            << GraspStrategyName(grasp_strategy_) << "\",\n";
+        ofs << "  \"object_dimensions_m\": ["
+            << grasp_geometry_result_.geometry.length_m << ", "
+            << grasp_geometry_result_.geometry.width_m << ", "
+            << grasp_geometry_result_.geometry.height_m << "],\n";
+        ofs << "  \"geometry_elapsed_ms\": "
+            << grasp_geometry_result_.elapsed_ms << ",\n";
+        ofs << "  \"grasp_yaw_rad\": ";
+        if (std::isfinite(grasp_yaw_rad_)) {
+            ofs << grasp_yaw_rad_;
+        } else {
+            ofs << "null";
+        }
+        ofs << ",\n";
         ofs << "  \"candidates\": \"" << JsonEscape(FormatCandidates())
             << "\",\n";
         WritePoseJson(ofs, "pre_grasp_pose", pre_grasp_pose_, true);
-        WritePoseJson(ofs, "grasp_pose", grasp_pose_, false);
+        WritePoseJson(ofs, "grasp_pose", grasp_pose_, true);
+        WritePoseJson(ofs, "retreat_pose", retreat_pose_, true);
+        WritePoseJson(ofs, "lift_pose", lift_pose_, false);
         ofs << "}\n";
 
         std::cout << "[Pipeline] Debug saved: " << image_path
@@ -1098,7 +1309,13 @@ bool GraspPipeline::WaitForConfirm(const std::string& prompt) {
                 << std::flush;
 
     std::string input;
-    if (!std::getline(std::cin, input) || input.empty()) {
+    if (!std::getline(std::cin, input)) {
+        std::cerr << "[Step] Input closed; aborting the task and returning home"
+                << std::endl;
+        RequestGracefulShutdown();
+        return false;
+    }
+    if (input.empty()) {
         // 默认回车 = 继续
         return true;
     }
@@ -1106,7 +1323,7 @@ bool GraspPipeline::WaitForConfirm(const std::string& prompt) {
     char c = input[0];
     if (c == 'n' || c == 'N') {
         std::cout << "[Step] 用户中止" << std::endl;
-        Stop();
+        RequestGracefulShutdown();
         return false;
     }
     if (c == 's' || c == 'S') {
@@ -1117,9 +1334,14 @@ bool GraspPipeline::WaitForConfirm(const std::string& prompt) {
     return true;
 }
 
-void GraspPipeline::Run() {
+void GraspPipeline::Run(
+        const std::function<bool()>& external_shutdown_requested) {
     std::cout << "[Pipeline] Running main loop..." << std::endl;
     while (true) {
+        if (external_shutdown_requested &&
+            external_shutdown_requested()) {
+            RequestGracefulShutdown();
+        }
         SpinOnce(0.05f);
 
         // 非循环/非语音常驻模式下，完成或出错即退出。
@@ -1142,15 +1364,37 @@ void GraspPipeline::SpinOnce(float dt_s) {
     if (executor_ && !action_.active) executor_->Tick(dt_s);
 
     if (cancel_requested_.exchange(false)) {
-        SetState(PipelineState::IDLE, "Cancelling; keeping observe pose");
+        const bool graceful_shutdown =
+            graceful_shutdown_requested_.load();
+        const bool return_home =
+            graceful_shutdown || object_may_be_held_.load();
+        SetState(
+            PipelineState::IDLE,
+            graceful_shutdown
+                ? "Shutdown requested; waiting for current action"
+                : (return_home
+                    ? "Cancelling while gripper may hold an object; "
+                        "returning home"
+                    : "Cancelling; keeping observe pose"));
         std::cout << std::flush;
         if (action_.active) {
             action_.cancelling = true;
-            return_to_observe_pending_ = true;
+            if (return_home) {
+                return_to_home_pending_ = true;
+            } else {
+                return_to_observe_pending_ = true;
+            }
         } else {
-            SaveTaskResultDebug(PipelineState::IDLE, "Cancelled");
+            SaveTaskResultDebug(
+                PipelineState::IDLE,
+                graceful_shutdown ? "Graceful shutdown requested"
+                                    : "Cancelled");
             ResetTaskState();
-            return_to_observe_pending_ = true;
+            if (return_home) {
+                return_to_home_pending_ = true;
+            } else {
+                return_to_observe_pending_ = true;
+            }
         }
         return;
     }
@@ -1186,22 +1430,27 @@ void GraspPipeline::SpinOnce(float dt_s) {
         case PipelineState::HOMING:
             HandleHoming();
             break;
+        case PipelineState::RECOVERING:
+            HandleRecovering();
+            break;
         case PipelineState::DONE:
             if (config_.voice.enabled) {
                 ResetTaskState();
                 SetState(PipelineState::IDLE,
                         "Voice: waiting for next command");
             } else if (config_.auto_loop) {
-                ResetTaskState();
-                SetState(PipelineState::OBSERVING,
-                        "Loop: restarting from observe position");
+                RestartAutoLoop("success");
             }
             break;
         case PipelineState::ERROR:
-            if (config_.voice.enabled) {
-                ResetTaskState();
-                SetState(PipelineState::IDLE,
-                        "Voice: waiting for next command");
+            if (!object_may_be_held_.load()) {
+                if (config_.voice.enabled) {
+                    ResetTaskState();
+                    SetState(PipelineState::IDLE,
+                            "Voice: waiting for next command");
+                } else if (config_.auto_loop) {
+                    RestartAutoLoop("failure");
+                }
             }
             break;
     }
@@ -1220,6 +1469,12 @@ void GraspPipeline::HandleIdle() {
                                     "Returned to observe after cancel: " +
                                         std::string(GraspResultName(*result)));
                 ResetTaskState();
+                if (graceful_shutdown_requested_.load()) {
+                    return_to_home_pending_ = true;
+                    SetState(PipelineState::IDLE,
+                            "Shutdown requested; returning home");
+                    return;
+                }
                 const char* next_message = config_.voice.enabled
                     ? "Voice: waiting for next command"
                     : "Cancelled";
@@ -1230,9 +1485,19 @@ void GraspPipeline::HandleIdle() {
                 SaveTaskResultDebug(PipelineState::IDLE,
                                     "Returned home on command: " +
                                         std::string(GraspResultName(*result)));
+                const bool home_succeeded =
+                    *result == GraspResult::SUCCESS;
                 ResetTaskState();
                 shutdown_requested_.store(true);
-                SetState(PipelineState::IDLE, "Home position reached; exiting");
+                if (home_succeeded) {
+                    SetState(PipelineState::IDLE,
+                            "Home position reached; exiting");
+                } else {
+                    SetState(
+                        PipelineState::ERROR,
+                        "Home return failed during shutdown: " +
+                            std::string(GraspResultName(*result)));
+                }
                 return;
             }
             SaveTaskResultDebug(PipelineState::IDLE,
@@ -1240,7 +1505,12 @@ void GraspPipeline::HandleIdle() {
                                     std::string(GraspResultName(*result)));
             ResetTaskState();
             if (was_cancelling) {
-                return_to_observe_pending_ = true;
+                if (graceful_shutdown_requested_.load() ||
+                    object_may_be_held_.load()) {
+                    return_to_home_pending_ = true;
+                } else {
+                    return_to_observe_pending_ = true;
+                }
             } else {
                 SetState(PipelineState::IDLE, "Cancelled");
             }
@@ -1252,6 +1522,10 @@ void GraspPipeline::HandleIdle() {
         SetState(PipelineState::IDLE, "Cancelled; returning to observe position");
         StartAction(PipelineState::IDLE, "return_to_observe_after_cancel",
                     [this]() {
+                        if (observation_strategy_selected_ &&
+                            grasp_strategy_ == GraspStrategy::SIDE) {
+                            return executor_->MoveToSideObserve();
+                        }
                         return executor_->MoveToObserve();
         });
         return;
@@ -1269,13 +1543,32 @@ void GraspPipeline::HandleIdle() {
 }
 
 void GraspPipeline::HandleObserving() {
+    if (config_.plan_only) {
+        SetState(PipelineState::DETECTING,
+                "Plan-only: using current arm pose without motion");
+        return;
+    }
+    if (!observation_strategy_selected_) {
+        SetState(PipelineState::ERROR,
+                "Observation strategy was not selected before arm motion");
+        return;
+    }
+    const bool use_side_observation =
+        grasp_strategy_ == GraspStrategy::SIDE;
     if (!action_.active) {
-        // 将臂收到观察姿态:
-        // Linksee 结构中立体相机在机身顶部面朝前方，
-        // 臂需要收起/侧收，避免遮挡相机前方视野
-        if (!WaitForConfirm("即将移动到观察位 (observe_joints)")) return;
-        StartAction(PipelineState::OBSERVING, "move_to_observe", [this]() {
-            auto result = executor_->MoveToObserve();
+        const char* prompt = use_side_observation
+            ? "即将移动到侧抓观察位 (side_ready_joints)"
+            : "即将移动到顶抓观察位 (observe_joints)";
+        if (!WaitForConfirm(prompt)) return;
+        const char* action_name = use_side_observation
+            ? "move_to_side_observe"
+            : "move_to_top_observe";
+        StartAction(
+            PipelineState::OBSERVING, action_name,
+            [this, use_side_observation]() {
+            auto result = use_side_observation
+                ? executor_->MoveToSideObserve()
+                : executor_->MoveToObserve();
             if (result != GraspResult::SUCCESS) return result;
             std::this_thread::sleep_for(std::chrono::milliseconds(
                 config_.executor.timing.observe_settle_ms));
@@ -1287,12 +1580,20 @@ void GraspPipeline::HandleObserving() {
     auto result = PollAction(PipelineState::OBSERVING);
     if (!result.has_value()) return;
     if (*result == GraspResult::SUCCESS) {
-        if (!FlushCameraAfterMotion("observe motion")) {
+        const char* motion_name = use_side_observation
+            ? "side observation motion"
+            : "top observation motion";
+        if (!FlushCameraAfterMotion(motion_name)) {
             SetState(PipelineState::ERROR,
                     "Failed to refresh camera after observe motion");
             return;
         }
-        SetState(PipelineState::DETECTING, "Arm retracted, detecting targets...");
+        stable_count_ = 0;
+        SetState(
+            PipelineState::DETECTING,
+            use_side_observation
+                ? "Side observation pose reached; detecting target again"
+                : "Top observation pose reached; detecting target again");
     } else {
         SetState(PipelineState::ERROR,
                 ResultMessage("Observe move failed", *result));
@@ -1301,6 +1602,8 @@ void GraspPipeline::HandleObserving() {
 
 void GraspPipeline::HandleDetecting() {
     const auto detection_stage_start = std::chrono::steady_clock::now();
+    perception_cycle_started_at_ = detection_stage_start;
+    perception_cycle_active_ = true;
     const auto detection_stage_cpu_start = ProcessCpuMillis();
     cv::Mat color, depth;
     if (!camera_->GetFrames(color, depth)) {
@@ -1371,9 +1674,17 @@ void GraspPipeline::HandleDetecting() {
                         << ", candidates: " << FormatCandidates()
                         << std::endl;
             if (missing_count_ >= config_.target_missing_frames) {
-                SetState(PipelineState::ERROR,
-                        "Target not found: " + target_label_ +
-                        "; candidates: " + FormatCandidates());
+                if (config_.auto_loop) {
+                    missing_count_ = 0;
+                    std::cout
+                        << "[Loop] Waiting for next " << target_label_
+                        << "; staying in DETECTING without returning home"
+                        << std::endl;
+                } else {
+                    SetState(PipelineState::ERROR,
+                            "Target not found: " + target_label_ +
+                            "; candidates: " + FormatCandidates());
+                }
             }
         } else {
             std::cout << "[Pipeline] No target detected, retrying..." << std::endl;
@@ -1400,105 +1711,795 @@ void GraspPipeline::HandleDetecting() {
     SetState(PipelineState::PLANNING, "Target stable, planning grasp...");
 }
 
-void GraspPipeline::HandlePlanning() {
+bool GraspPipeline::BuildMaskTopGrasp(
+    GraspCandidate& candidate,
+    float& grasp_px,
+    float& grasp_py,
+    uint16_t& depth_mm,
+    float cam_point[3],
+    float base_point[3],
+    std::string& error) {
+    float offset_dir_angle = NAN;
+    if (!ComputeGraspPixel(
+            current_target_, grasp_px, grasp_py,
+            config_.top_grasp_point_x_ratio,
+            config_.orientation, &offset_dir_angle)) {
+        grasp_px = current_target_.center.x;
+        grasp_py = current_target_.center.y;
+    }
+
+    int cx = ClampPixel(
+        static_cast<int>(std::lround(grasp_px)), current_depth_.cols);
+    int cy = ClampPixel(
+        static_cast<int>(std::lround(grasp_py)), current_depth_.rows);
+    constexpr int kDepthRoiSize = 5;
+    size_t mask_depth_samples = 0;
+    if (ForegroundDepthFromMask(
+            current_depth_, current_target_.mask, depth_mm,
+            mask_depth_samples)) {
+        std::cout << "[Pipeline] Top-grasp depth "
+                    "source=mask_foreground_q25 value="
+                    << depth_mm << "mm samples=" << mask_depth_samples
+                    << std::endl;
+    } else if (!MedianDepthAtPixel(
+                    current_depth_, cx, cy, kDepthRoiSize, depth_mm)) {
+        cx = ClampPixel(
+            static_cast<int>(std::lround(current_target_.center.x)),
+            current_depth_.cols);
+        cy = ClampPixel(
+            static_cast<int>(std::lround(current_target_.center.y)),
+            current_depth_.rows);
+        if (!MedianDepthAtPixel(
+                current_depth_, cx, cy, kDepthRoiSize, depth_mm)) {
+            error = "top-grasp depth is invalid at grasp pixel and center";
+            return false;
+        }
+        std::cout << "[Pipeline] Top-grasp depth "
+                    "source=target_center_roi value="
+                    << depth_mm << "mm" << std::endl;
+    } else {
+        std::cout << "[Pipeline] Top-grasp depth "
+                    "source=grasp_pixel_roi value="
+                    << depth_mm << "mm" << std::endl;
+    }
+
+    if (!camera_->Deproject(cx, cy, depth_mm, cam_point)) {
+        error = "top-grasp camera deprojection failed";
+        return false;
+    }
+    planner_->CameraToBase(cam_point, base_point);
+    grasp_px = static_cast<float>(cx);
+    grasp_py = static_cast<float>(cy);
+    std::cout << "[Pipeline] Top-grasp pixel (offset_ratio="
+                << config_.top_grasp_point_x_ratio << "): ["
+                << cx << ", " << cy << "]" << std::endl;
+
+    Pose3D grasp_pose;
+    Pose3D pre_grasp_pose;
+    if (!planner_->PlanTopGrasp(
+            base_point, grasp_pose, pre_grasp_pose, false)) {
+        std::ostringstream message;
+        message << "top-grasp pose generation failed for point ["
+                << base_point[0] << "," << base_point[1] << ","
+                << base_point[2] << "]";
+        error = message.str();
+        return false;
+    }
+
+    float grasp_yaw = NAN;
+    if (config_.auto_orient && std::isfinite(offset_dir_angle)) {
+        grasp_yaw = ImageLineAngleFromHorizontal(offset_dir_angle);
+        std::cout << "[Pipeline] Top-grasp yaw source=2d_mask value="
+                    << grasp_yaw << std::endl;
+    } else if (config_.auto_orient) {
+        grasp_yaw = ComputeGraspYaw(
+            current_target_, config_.orientation);
+    }
+
+    const float top_offset = config_.planner.gripper_offset;
+    if (top_offset != 0.0f) {
+        const float yaw = std::isnan(grasp_yaw) ? 0.0f : grasp_yaw;
+        const float dx = -top_offset * std::sin(yaw);
+        const float dy = top_offset * std::cos(yaw);
+        grasp_pose.x += dx;
+        grasp_pose.y += dy;
+        pre_grasp_pose.x += dx;
+        pre_grasp_pose.y += dy;
+        std::cout << "[Pipeline] Top-grasp jaw offset="
+                    << top_offset << "m dx=" << dx << " dy=" << dy
+                    << std::endl;
+    }
+
+    candidate.grasp_pose = grasp_pose;
+    candidate.pre_grasp_pose = pre_grasp_pose;
+    candidate.retreat_pose = pre_grasp_pose;
+    candidate.lift_pose = pre_grasp_pose;
+    candidate.grasp_yaw_rad = grasp_yaw;
+    candidate.geometry_valid = true;
+    candidate.rejection_reason.clear();
+    std::cout << "[Pipeline] Top-grasp plan: target=["
+                << grasp_pose.x << "," << grasp_pose.y << ","
+                << grasp_pose.z << "] yaw=" << grasp_yaw << std::endl;
+    error.clear();
+    return true;
+}
+
+void GraspPipeline::HandleTopPlanning() {
     const auto planning_start = std::chrono::steady_clock::now();
     const auto planning_cpu_start = ProcessCpuMillis();
 
+    GraspCandidate candidate;
+    float grasp_px = current_target_.center.x;
+    float grasp_py = current_target_.center.y;
+    uint16_t depth_mm = 0;
+    float cam_point[3] = {};
+    float base_point[3] = {};
+    std::string error;
+    if (!BuildMaskTopGrasp(
+            candidate, grasp_px, grasp_py, depth_mm,
+            cam_point, base_point, error)) {
+        SetState(PipelineState::ERROR,
+                "Top-grasp planning failed: " + error);
+        return;
+    }
+
+    std::cout << "[Pipeline] 3D position (base): [" << base_point[0] << ", "
+                << base_point[1] << ", " << base_point[2] << "]" << std::endl;
+
+    float alignment_point[3] = {
+        base_point[0], base_point[1], base_point[2]};
+    const int center_x = ClampPixel(
+        static_cast<int>(std::lround(current_target_.center.x)),
+        current_depth_.cols);
+    const int center_y = ClampPixel(
+        static_cast<int>(std::lround(current_target_.center.y)),
+        current_depth_.rows);
+    uint16_t center_depth_mm = 0;
+    constexpr int kCenterDepthRoiSize = 5;
+    if (MedianDepthAtPixel(
+            current_depth_, center_x, center_y,
+            kCenterDepthRoiSize, center_depth_mm)) {
+        float center_cam_point[3] = {};
+        if (camera_->Deproject(
+                center_x, center_y, center_depth_mm,
+                center_cam_point)) {
+            planner_->CameraToBase(center_cam_point, alignment_point);
+        }
+    }
+    std::cout << "[Pipeline] Mobile base alignment target center: ["
+                << alignment_point[0] << ", " << alignment_point[1] << ", "
+                << alignment_point[2] << "]" << std::endl;
+
+    base_alignment_command_ = PlanMobileBaseAlignment(
+        config_.mobile_base, alignment_point, base_align_attempts_);
+
+    if (have_previous_base_alignment_point_) {
+        const float progress = MeasureMobileBaseAlignmentProgress(
+            previous_base_alignment_point_.data(), alignment_point,
+            previous_base_alignment_command_);
+        const float required_progress = RequiredMobileBaseAlignmentProgress(
+            config_.mobile_base, previous_base_alignment_point_.data(),
+            previous_base_alignment_command_);
+        std::cout << "[Pipeline] Mobile base visual progress: "
+                    << progress << "m (required >= "
+                    << required_progress << "m)" << std::endl;
+        const bool still_needs_alignment =
+            base_alignment_command_.type !=
+                MobileBaseAlignmentCommand::Type::NONE ||
+            base_alignment_command_.max_attempts_reached;
+        if (still_needs_alignment && progress < required_progress) {
+            stable_count_ = 0;
+            std::ostringstream message;
+            message << "Base alignment stopped: visual progress "
+                    << progress << "m below required " << required_progress
+                    << "m after chassis motion; check depth and motion "
+                        "direction";
+            SetState(PipelineState::ERROR, message.str());
+            return;
+        }
+        have_previous_base_alignment_point_ = false;
+    }
+
+    if (base_alignment_command_.type !=
+        MobileBaseAlignmentCommand::Type::NONE) {
+        if (base_alignment_command_.type ==
+            MobileBaseAlignmentCommand::Type::DRIVE) {
+            const float next_travel =
+                std::fabs(base_alignment_command_.linear_x) *
+                static_cast<float>(base_alignment_command_.duration_ms) /
+                1000.0f;
+            if (base_align_commanded_travel_m_ + next_travel >
+                config_.mobile_base.max_total_travel_m + 1e-6f) {
+                stable_count_ = 0;
+                SetState(
+                    PipelineState::ERROR,
+                    "Base alignment stopped: cumulative travel safety "
+                    "limit reached");
+                return;
+            }
+        }
+        std::copy_n(
+            alignment_point, 3, previous_base_alignment_point_.begin());
+        previous_base_alignment_command_ = base_alignment_command_;
+        have_previous_base_alignment_point_ = true;
+        std::cout << "[Pipeline] Mobile base alignment needed: "
+                    << base_alignment_command_.reason << " (attempt "
+                    << base_align_attempts_ + 1 << "/"
+                    << config_.mobile_base.max_align_attempts << ")"
+                    << std::endl;
+        std::ostringstream message;
+        message << "Target center=[" << alignment_point[0] << ", "
+                << alignment_point[1]
+                << "]m; " << base_alignment_command_.reason << "; ";
+        if (base_alignment_command_.type ==
+            MobileBaseAlignmentCommand::Type::ROTATE) {
+            message << "rotate wz=" << base_alignment_command_.angular_z;
+        } else {
+            message << "drive vx=" << base_alignment_command_.linear_x;
+        }
+        message << " duration_ms=" << base_alignment_command_.duration_ms;
+        SetState(PipelineState::BASE_ALIGNING, message.str());
+        return;
+    }
+    if (base_alignment_command_.max_attempts_reached) {
+        stable_count_ = 0;
+        SetState(
+            PipelineState::ERROR,
+            "Base alignment failed: max attempts reached while target "
+            "remains outside the comfortable range");
+        return;
+    }
+    if (config_.mobile_base.enabled) {
+        const float stable_x_limit =
+            config_.mobile_base.x_tolerance +
+            std::max(0.0f, config_.mobile_base.x_hysteresis);
+        const float stable_y_limit =
+            config_.mobile_base.y_tolerance +
+            std::max(0.0f, config_.mobile_base.y_hysteresis);
+        std::cout << "[Pipeline] Mobile base target in comfortable range: "
+                    << "x=" << alignment_point[0] << "m in ["
+                    << config_.mobile_base.target_x -
+                        stable_x_limit
+                    << ", "
+                    << config_.mobile_base.target_x +
+                        stable_x_limit
+                    << "]m, y=" << alignment_point[1]
+                    << "m within stable +/-" << stable_y_limit << "m"
+                    << std::endl;
+    }
+
+    if (!planner_->InWorkspace(
+            candidate.grasp_pose.x, candidate.grasp_pose.y,
+            candidate.grasp_pose.z)) {
+        SetState(
+            PipelineState::ERROR,
+            "Top-grasp pose out of workspace: pose=[" +
+                std::to_string(candidate.grasp_pose.x) + ", " +
+                std::to_string(candidate.grasp_pose.y) + ", " +
+                std::to_string(candidate.grasp_pose.z) + "]");
+        return;
+    }
+    if (!planner_->InWorkspace(
+            candidate.pre_grasp_pose.x, candidate.pre_grasp_pose.y,
+            candidate.pre_grasp_pose.z)) {
+        SetState(
+            PipelineState::ERROR,
+            "Adjusted grasp pose out of workspace after gripper_offset: "
+            "pose=[" + std::to_string(candidate.pre_grasp_pose.x) + ", " +
+                std::to_string(candidate.pre_grasp_pose.y) + ", " +
+                std::to_string(candidate.pre_grasp_pose.z) + "], offset=" +
+                std::to_string(config_.planner.gripper_offset));
+        return;
+    }
+
+    grasp_strategy_ = GraspStrategy::TOP;
+    grasp_pose_ = candidate.grasp_pose;
+    pre_grasp_pose_ = candidate.pre_grasp_pose;
+    retreat_pose_ = candidate.retreat_pose;
+    lift_pose_ = candidate.lift_pose;
+    grasp_yaw_rad_ = candidate.grasp_yaw_rad;
+    grasp_opening_ = NAN;
+    perception_cycle_active_ = false;
+    motion_geometry_confirmation_pending_ = false;
+    motion_geometry_reference_valid_ = false;
+    motion_geometry_sample_count_ = 0;
+    motion_geometry_consistent_count_ = 0;
+    motion_geometry_refresh_count_ = 0;
+
+    SaveGraspDebug(
+        grasp_px, grasp_py, depth_mm, cam_point, base_point);
+
+    if (config_.plan_only) {
+        std::string validation_detail;
+        const GraspResult validation_result = executor_->ValidateGraspPoses(
+            candidate.pre_grasp_pose, candidate.grasp_pose,
+            candidate.retreat_pose, candidate.lift_pose,
+            candidate.entry_clearance_z_m,
+            candidate.grasp_yaw_rad, true,
+            config_.geometry.planning_timeout_ms, &validation_detail);
+        if (validation_result != GraspResult::SUCCESS) {
+            std::string message = "Top-grasp plan validation failed";
+            if (!validation_detail.empty()) {
+                message += ": " + validation_detail;
+            } else {
+                message += ": ";
+                message += GraspResultName(validation_result);
+            }
+            SetState(PipelineState::ERROR, message);
+            return;
+        }
+        SetState(PipelineState::DONE,
+                "Plan validated without motion: strategy=top");
+        return;
+    }
+
+    if (config_.performance_log_enabled) {
+        const auto planning_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - planning_start)
+                .count();
+        std::cout << "[Timing] stage=PLANNING"
+                    << " elapsed_ms=" << planning_ms
+                    << " cpu_ms="
+                    << ProcessCpuMillis() - planning_cpu_start
+                    << " stable_count=" << stable_count_
+                    << " result=GRASP_READY" << std::endl;
+    }
+
+    SetState(PipelineState::APPROACHING, "Moving to pre-grasp...");
+}
+
+void GraspPipeline::HandlePlanning() {
     if (current_depth_.empty()) {
         stable_count_ = 0;
         SetState(PipelineState::DETECTING, "No cached depth, detecting again");
         return;
     }
 
-    // 计算抓取像素坐标:
-    // 沿物体短轴方向偏移，方向由 yaw 约束自动选择
-    // offset_ratio 控制偏移程度: 0=中心, 1=短轴边缘
-    float grasp_px, grasp_py;
-    float offset_dir_angle = NAN;
-    float offset_ratio = config_.grasp_point_x_ratio;  // 复用此参数作为短轴偏移比例
-    if (!ComputeGraspPixel(current_target_, grasp_px, grasp_py, offset_ratio,
-                            config_.orientation, &offset_dir_angle)) {
-        grasp_px = current_target_.center.x;
-        grasp_py = current_target_.center.y;
-    }
-
-    int cx = ClampPixel(static_cast<int>(std::lround(grasp_px)),
-                        current_depth_.cols);
-    int cy = ClampPixel(static_cast<int>(std::lround(grasp_py)),
-                        current_depth_.rows);
-
-    std::cout << "[Pipeline] Grasp pixel (offset_ratio=" << offset_ratio << "): ["
-                << cx << ", " << cy << "]";
-    if (cx != static_cast<int>(std::lround(grasp_px)) ||
-        cy != static_cast<int>(std::lround(grasp_py))) {
-        std::cout << " clamped from [" << grasp_px << ", " << grasp_py << "]";
-    }
-    std::cout << std::endl;
-
-    // 优先使用分割 mask 内的近景稳健深度。低矮物体的抓取点靠近边缘时，
-    // 局部中值容易被地面深度主导，导致底盘误判目标始终距离不变。
-    constexpr int roi_size = 5;
-    uint16_t depth_mm = 0;
-    uint16_t mask_depth_mm = 0;
-    size_t mask_depth_samples = 0;
-    const bool have_mask_depth = ForegroundDepthFromMask(
-        current_depth_, current_target_.mask, mask_depth_mm,
-        mask_depth_samples);
-    if (have_mask_depth) {
-        depth_mm = mask_depth_mm;
-        std::cout << "[Pipeline] Depth source=mask_foreground_q25 value="
-                    << depth_mm << "mm samples=" << mask_depth_samples
-                    << std::endl;
-    } else if (!MedianDepthAtPixel(
-                current_depth_, cx, cy, roi_size, depth_mm)) {
-        const int fallback_cx = ClampPixel(
-            static_cast<int>(std::lround(current_target_.center.x)),
-            current_depth_.cols);
-        const int fallback_cy = ClampPixel(
-            static_cast<int>(std::lround(current_target_.center.y)),
-            current_depth_.rows);
-        std::cout << "[Pipeline] No valid depth at grasp pixel, fallback to "
-                << "target center [" << fallback_cx << ", " << fallback_cy
-                << "]" << std::endl;
-        cx = fallback_cx;
-        cy = fallback_cy;
-        if (!MedianDepthAtPixel(current_depth_, cx, cy, roi_size, depth_mm)) {
-            std::cerr << "[Pipeline] No valid depth at grasp pixel or target "
-                    << "center" << std::endl;
+    const bool explicit_top_strategy =
+        config_.geometry.strategy == "top";
+    const bool auto_selects_top =
+        config_.geometry.strategy == "auto" &&
+        current_target_.label_name != "cup" &&
+        current_target_.label_name != "bottle";
+    if (!observation_strategy_selected_ &&
+        (explicit_top_strategy || auto_selects_top)) {
+        grasp_strategy_ = GraspStrategy::TOP;
+        observation_strategy_selected_ = true;
+        std::cout << "[Pipeline] Top-grasp strategy selected from target "
+                    "class before arm motion: "
+                    << current_target_.label_name << std::endl;
+        if (!config_.plan_only) {
             stable_count_ = 0;
-            SetState(PipelineState::ERROR,
-                    "Target depth invalid at grasp pixel and center");
+            perception_cycle_active_ = false;
+            SetState(
+                PipelineState::OBSERVING,
+                "Strategy selected: top; moving to matching observation pose");
             return;
         }
-        std::cout << "[Pipeline] Depth source=target_center_roi value="
-                    << depth_mm << "mm" << std::endl;
-    } else {
-        std::cout << "[Pipeline] Depth source=grasp_pixel_roi value="
-                    << depth_mm << "mm" << std::endl;
     }
 
-    // 反投影到 3D
-    float cam_point[3];
-    if (!camera_->Deproject(cx, cy, depth_mm, cam_point)) {
-        std::cerr << "[Pipeline] Deproject failed" << std::endl;
-        stable_count_ = 0;
-        SetState(PipelineState::ERROR, "Camera deprojection failed");
+    if (observation_strategy_selected_ &&
+        grasp_strategy_ == GraspStrategy::TOP) {
+        HandleTopPlanning();
         return;
     }
 
-    // 转换到基坐标系
-    float base_point[3];
-    planner_->CameraToBase(cam_point, base_point);
+    const auto planning_start = std::chrono::steady_clock::now();
+    const auto planning_cpu_start = ProcessCpuMillis();
+
+    bool geometry_from_point_cloud = geometry_planner_->Plan(
+        current_depth_, current_target_, *camera_, *planner_,
+        grasp_geometry_result_);
+    bool geometry_recovered = false;
+    if (!geometry_from_point_cloud) {
+        stable_count_ = 0;
+        geometry_retry_count_++;
+        const bool can_recover_top_geometry =
+            observation_strategy_selected_ &&
+            grasp_strategy_ == GraspStrategy::TOP &&
+            last_valid_geometry_available_ &&
+            grasp_geometry_result_.geometry.table.inlier_count > 0 &&
+            (top_geometry_recovery_active_ ||
+            geometry_retry_count_ >= kTopGeometryRecoveryAttempt);
+        if (can_recover_top_geometry) {
+            const TablePlane current_table =
+                grasp_geometry_result_.geometry.table;
+            const std::string point_cloud_error =
+                grasp_geometry_result_.error;
+            GraspCandidate candidate;
+            float grasp_px = current_target_.center.x;
+            float grasp_py = current_target_.center.y;
+            uint16_t depth_mm = 0;
+            float camera_point[3] = {};
+            float base_point[3] = {};
+            std::string recovery_error;
+            if (BuildMaskTopGrasp(
+                    candidate, grasp_px, grasp_py, depth_mm,
+                    camera_point, base_point, recovery_error)) {
+                ObjectGeometry3D recovered = last_valid_geometry_;
+                recovered.table = current_table;
+                const cv::Point3f measured(
+                    base_point[0], base_point[1], base_point[2]);
+                const float signed_table_distance =
+                    current_table.normal.x * measured.x +
+                    current_table.normal.y * measured.y +
+                    current_table.normal.z * measured.z +
+                    current_table.d;
+                recovered.table_center = cv::Point3f(
+                    measured.x -
+                        current_table.normal.x * signed_table_distance,
+                    measured.y -
+                        current_table.normal.y * signed_table_distance,
+                    measured.z -
+                        current_table.normal.z * signed_table_distance);
+                recovered.center = cv::Point3f(
+                    recovered.table_center.x +
+                        current_table.normal.x * recovered.height_m * 0.5f,
+                    recovered.table_center.y +
+                        current_table.normal.y * recovered.height_m * 0.5f,
+                    recovered.table_center.z +
+                        current_table.normal.z * recovered.height_m * 0.5f);
+                recovered.valid = true;
+
+                GraspGeometryResult recovery_result;
+                recovery_result.geometry = recovered;
+                recovery_result.candidates.push_back(candidate);
+                recovery_result.foreground_depth_mm =
+                    static_cast<float>(depth_mm);
+                recovery_result.center_depth_mm =
+                    grasp_geometry_result_.center_depth_mm;
+                recovery_result.elapsed_ms =
+                    grasp_geometry_result_.elapsed_ms;
+                recovery_result.error =
+                    "top geometry recovered after point-cloud failure: " +
+                    point_cloud_error;
+                grasp_geometry_result_ = std::move(recovery_result);
+                geometry_retry_count_ = 0;
+                top_geometry_recovery_active_ = true;
+                geometry_recovered = true;
+                std::cout
+                    << "[Pipeline] Recovered low-profile top-grasp geometry "
+                        "using the current support plane and the last "
+                        "confirmed object dimensions"
+                    << std::endl;
+            }
+        }
+    }
+
+    if (!geometry_from_point_cloud && !geometry_recovered) {
+        if (motion_geometry_confirmation_pending_ &&
+            geometry_retry_count_ >= kGeometryRefreshAttempt &&
+            motion_geometry_refresh_count_ <
+                kMotionGeometryMaxRefreshes) {
+            geometry_retry_count_ = 0;
+            motion_geometry_refresh_count_++;
+            perception_cycle_active_ = false;
+            if (!FlushCameraAfterMotion(
+                    "geometry estimation retry")) {
+                SetState(PipelineState::ERROR,
+                    "Failed to refresh camera after invalid "
+                    "post-motion 3D geometry");
+                return;
+            }
+            SetState(PipelineState::DETECTING,
+                "Refreshed camera after transient post-motion "
+                "3D geometry");
+            return;
+        }
+        if (geometry_retry_count_ < kMaxGeometryAttempts) {
+            perception_cycle_active_ = false;
+            std::ostringstream retry_message;
+            retry_message << "3D geometry unavailable, retrying frame "
+                            << geometry_retry_count_ + 1 << "/"
+                            << kMaxGeometryAttempts;
+            SetState(PipelineState::DETECTING, retry_message.str());
+            return;
+        }
+        SetState(PipelineState::ERROR,
+                "3D grasp geometry failed: " +
+                    grasp_geometry_result_.error);
+        return;
+    }
+    if (geometry_from_point_cloud) {
+        top_geometry_recovery_active_ = false;
+    }
+    geometry_retry_count_ = 0;
+
+    if (motion_geometry_confirmation_pending_) {
+        const ObjectGeometry3D& current_geometry =
+            grasp_geometry_result_.geometry;
+        motion_geometry_sample_count_++;
+        bool consistent = false;
+        std::string consistency_detail;
+        if (motion_geometry_reference_valid_) {
+            consistent = AreObjectGeometriesConsistent(
+                motion_geometry_reference_, current_geometry,
+                &consistency_detail);
+            motion_geometry_consistent_count_ = consistent
+                ? motion_geometry_consistent_count_ + 1
+                : 0;
+        }
+        motion_geometry_reference_ = current_geometry;
+        motion_geometry_reference_valid_ = true;
+
+        if (motion_geometry_consistent_count_ <
+            kMotionGeometryRequiredConsistentPairs) {
+            stable_count_ = 0;
+            perception_cycle_active_ = false;
+            if (motion_geometry_sample_count_ >=
+                kMotionGeometryMaxSamples) {
+                if (motion_geometry_refresh_count_ <
+                    kMotionGeometryMaxRefreshes) {
+                    motion_geometry_refresh_count_++;
+                    if (!FlushCameraAfterMotion(
+                            "geometry confirmation retry")) {
+                        SetState(PipelineState::ERROR,
+                            "Failed to refresh camera while confirming "
+                            "3D geometry");
+                        return;
+                    }
+                    SetState(PipelineState::DETECTING,
+                        "Refreshing transient 3D geometry after motion");
+                    return;
+                }
+                SetState(PipelineState::ERROR,
+                    "3D geometry remained unstable after robot motion: " +
+                        consistency_detail);
+                return;
+            }
+            std::ostringstream confirmation_message;
+            confirmation_message << "Confirming 3D geometry after motion "
+                                << motion_geometry_sample_count_ << "/"
+                                << kMotionGeometryMaxSamples;
+            if (!consistency_detail.empty()) {
+                confirmation_message << "; "
+                                    << (consistent ? "stable" : "changed");
+            }
+            SetState(PipelineState::DETECTING,
+                    confirmation_message.str());
+            return;
+        }
+
+        std::cout << "[Pipeline] Post-motion 3D geometry confirmed with "
+                    << motion_geometry_sample_count_ << " samples: "
+                    << consistency_detail << std::endl;
+        motion_geometry_confirmation_pending_ = false;
+        motion_geometry_reference_valid_ = false;
+        motion_geometry_sample_count_ = 0;
+        motion_geometry_consistent_count_ = 0;
+        motion_geometry_refresh_count_ = 0;
+    }
+
+    if (geometry_from_point_cloud) {
+        last_valid_geometry_ = grasp_geometry_result_.geometry;
+        last_valid_geometry_available_ = true;
+    }
+
+    SupportPlane support_plane;
+    support_plane.normal_x = grasp_geometry_result_.geometry.table.normal.x;
+    support_plane.normal_y = grasp_geometry_result_.geometry.table.normal.y;
+    support_plane.normal_z = grasp_geometry_result_.geometry.table.normal.z;
+    support_plane.d = grasp_geometry_result_.geometry.table.d;
+    support_plane.valid = true;
+    support_plane.min_x = grasp_geometry_result_.geometry.table.min_x;
+    support_plane.max_x = grasp_geometry_result_.geometry.table.max_x;
+    support_plane.min_y = grasp_geometry_result_.geometry.table.min_y;
+    support_plane.max_y = grasp_geometry_result_.geometry.table.max_y;
+    support_plane.bounds_valid =
+        grasp_geometry_result_.geometry.table.bounds_valid;
+    executor_->SetSupportPlane(support_plane);
+
+    const auto matches_observation_strategy =
+        [this](const GraspCandidate& candidate) {
+            return !observation_strategy_selected_ ||
+                candidate.strategy == grasp_strategy_;
+        };
+    GraspCandidate* preferred_candidate = nullptr;
+    for (GraspCandidate& candidate : grasp_geometry_result_.candidates) {
+        if (candidate.geometry_valid &&
+            matches_observation_strategy(candidate)) {
+            preferred_candidate = &candidate;
+            break;
+        }
+    }
+    if (!preferred_candidate) {
+        std::ostringstream message;
+        if (observation_strategy_selected_) {
+            message << "Selected observation strategy "
+                    << GraspStrategyName(grasp_strategy_)
+                    << " is unavailable after re-detection";
+        } else {
+            message << "No geometry-valid grasp strategy before observation";
+        }
+        for (const GraspCandidate& candidate :
+            grasp_geometry_result_.candidates) {
+            if (matches_observation_strategy(candidate)) {
+                message << "; " << GraspStrategyName(candidate.strategy)
+                        << "=" << candidate.rejection_reason;
+            }
+        }
+        SetState(PipelineState::ERROR, message.str());
+        return;
+    }
+    if (!observation_strategy_selected_) {
+        grasp_strategy_ = preferred_candidate->strategy;
+        observation_strategy_selected_ = true;
+        std::cout << "[Pipeline] Observation strategy selected before arm "
+                    "motion: "
+                    << GraspStrategyName(grasp_strategy_) << std::endl;
+        if (!config_.plan_only) {
+            stable_count_ = 0;
+            perception_cycle_active_ = false;
+            SetState(
+                PipelineState::OBSERVING,
+                "Strategy selected: " +
+                    std::string(GraspStrategyName(grasp_strategy_)) +
+                    "; moving to matching observation pose");
+            return;
+        }
+    }
+
+    std::cout << "[Pipeline] Object geometry: dimensions=["
+                << grasp_geometry_result_.geometry.length_m << ", "
+                << grasp_geometry_result_.geometry.width_m << ", "
+                << grasp_geometry_result_.geometry.height_m << "]m"
+                << " points="
+                << grasp_geometry_result_.geometry.object_point_count
+                << " table_inliers="
+                << grasp_geometry_result_.geometry.table.inlier_count
+                << " elapsed_ms=" << grasp_geometry_result_.elapsed_ms
+                << std::endl;
+
+    float debug_grasp_px = current_target_.center.x;
+    float debug_grasp_py = current_target_.center.y;
+    int cx = ClampPixel(static_cast<int>(std::lround(debug_grasp_px)),
+                        current_depth_.cols);
+    int cy = ClampPixel(static_cast<int>(std::lround(debug_grasp_py)),
+                        current_depth_.rows);
+
+    std::cout << "[Pipeline] Geometry reference pixel: ["
+                << cx << ", " << cy << "]" << std::endl;
+
+    // Keep a representative camera point in the debug record. Base alignment
+    // and grasp planning use the table-relative point-cloud center below.
+    constexpr int roi_size = 5;
+    uint16_t depth_mm = 0;
+    float cam_point[3] = {0.0f, 0.0f, 0.0f};
+    if (std::isfinite(grasp_geometry_result_.foreground_depth_mm) &&
+        grasp_geometry_result_.foreground_depth_mm > 0.0f) {
+        depth_mm = static_cast<uint16_t>(std::clamp(
+            std::lround(grasp_geometry_result_.foreground_depth_mm),
+            1L, static_cast<long>(UINT16_MAX)));
+        std::cout << "[Pipeline] Depth source=geometry_foreground_cluster"
+                    << " value=" << depth_mm << "mm samples="
+                    << grasp_geometry_result_.geometry.source_point_count
+                    << " center_depth="
+                    << grasp_geometry_result_.center_depth_mm << "mm"
+                    << std::endl;
+    } else if (MedianDepthAtPixel(
+                    current_depth_, cx, cy, roi_size, depth_mm)) {
+        std::cout << "[Pipeline] Depth source=target_center_roi value="
+                    << depth_mm << "mm" << std::endl;
+    } else {
+        std::cout << "[Pipeline] Depth source=geometry_silhouette"
+                    << " value=unavailable" << std::endl;
+    }
+
+    if (depth_mm != 0 &&
+        !camera_->Deproject(cx, cy, depth_mm, cam_point)) {
+        std::cout << "[Pipeline] Representative camera point unavailable"
+                    << std::endl;
+        depth_mm = 0;
+        cam_point[0] = 0.0f;
+        cam_point[1] = 0.0f;
+        cam_point[2] = 0.0f;
+    }
+
+    // Keep the table-relative object center for diagnostics. Base alignment
+    // below uses the selected candidate's actual grasp or pre-grasp point.
+    float base_point[3] = {
+        grasp_geometry_result_.geometry.center.x,
+        grasp_geometry_result_.geometry.center.y,
+        grasp_geometry_result_.geometry.center.z};
+
+    if (preferred_candidate &&
+        preferred_candidate->strategy == GraspStrategy::TOP) {
+        std::string top_error;
+        if (!BuildMaskTopGrasp(
+                *preferred_candidate, debug_grasp_px, debug_grasp_py,
+                depth_mm, cam_point, base_point, top_error)) {
+            SetState(PipelineState::ERROR,
+                    "Top-grasp planning failed: " + top_error);
+            return;
+        }
+        cx = ClampPixel(
+            static_cast<int>(std::lround(debug_grasp_px)),
+            current_depth_.cols);
+        cy = ClampPixel(
+            static_cast<int>(std::lround(debug_grasp_py)),
+            current_depth_.rows);
+    }
 
     std::cout << "[Pipeline] 3D position (base): [" << base_point[0] << ", "
                 << base_point[1] << ", " << base_point[2] << "]" << std::endl;
 
+    MobileBaseAlignmentConfig alignment_config = config_.mobile_base;
+    float alignment_point[3] = {
+        base_point[0], base_point[1], base_point[2]};
+    for (const GraspCandidate& candidate :
+            grasp_geometry_result_.candidates) {
+        if (!candidate.geometry_valid ||
+            !matches_observation_strategy(candidate)) {
+            continue;
+        }
+        if (candidate.strategy == GraspStrategy::TOP) {
+            alignment_point[0] = candidate.grasp_pose.x;
+            alignment_point[1] = candidate.grasp_pose.y;
+            alignment_point[2] = candidate.grasp_pose.z;
+            std::cout << "[Pipeline] Top-grasp alignment point: ["
+                        << alignment_point[0] << ", "
+                        << alignment_point[1] << "]m"
+                        << std::endl;
+            break;
+        }
+
+        // The UART chassis moves about 20-30 mm per minimum effective pulse.
+        // Align to a window instead of a single point so one minimum pulse
+        // cannot overshoot and immediately request motion in reverse.
+        constexpr float kSidePreGraspAlignmentWindowM = 0.030f;
+        constexpr float kSidePreGraspUpperHysteresisM = 0.005f;
+        const float minimum_pregrasp_x =
+            config_.geometry.side_pregrasp_min_x_m;
+        const float maximum_pregrasp_x =
+            minimum_pregrasp_x + kSidePreGraspAlignmentWindowM;
+        const float preferred_pregrasp_x =
+            0.5f * (minimum_pregrasp_x + maximum_pregrasp_x);
+        float required_shift = 0.0f;
+        if (candidate.pre_grasp_pose.x < minimum_pregrasp_x ||
+            candidate.pre_grasp_pose.x >
+                maximum_pregrasp_x +
+                    kSidePreGraspUpperHysteresisM) {
+            required_shift =
+                preferred_pregrasp_x - candidate.pre_grasp_pose.x;
+            const float minimum_target_x =
+                config_.planner.workspace.x_min + 0.01f;
+            const float maximum_target_x =
+                config_.planner.workspace.x_max - 0.01f;
+            alignment_config.target_x = std::clamp(
+                base_point[0] + required_shift,
+                minimum_target_x, maximum_target_x);
+            alignment_config.x_tolerance = std::min(
+                alignment_config.x_tolerance,
+                kSidePreGraspUpperHysteresisM);
+            std::cout << "[Pipeline] Aligning closed-gripper side sweep: "
+                        << "pre_grasp_x="
+                        << candidate.pre_grasp_pose.x
+                        << "m desired_range=[" << minimum_pregrasp_x
+                        << "," << maximum_pregrasp_x
+                        << "]m; requesting base target_x="
+                        << alignment_config.target_x << "m"
+                        << std::endl;
+        } else {
+            // Keep the current longitudinal distance once the closed gripper
+            // is aligned with the horizontal side-ready sweep radius.
+            alignment_config.target_x = base_point[0];
+            alignment_config.x_tolerance = std::max(
+                alignment_config.x_tolerance, 0.005f);
+            std::cout << "[Pipeline] Side pre-grasp distance is aligned: x="
+                        << candidate.pre_grasp_pose.x
+                        << "m; preserving current base distance"
+                        << std::endl;
+        }
+        break;
+    }
+
     base_alignment_command_ = PlanMobileBaseAlignment(
-        config_.mobile_base, base_point, base_align_attempts_);
+        alignment_config, alignment_point, base_align_attempts_);
 
     if (have_previous_base_alignment_point_) {
         const float progress = MeasureMobileBaseAlignmentProgress(
-            previous_base_alignment_point_.data(), base_point,
+            previous_base_alignment_point_.data(), alignment_point,
             previous_base_alignment_command_);
         const float required_progress =
             RequiredMobileBaseAlignmentProgress(
@@ -1513,17 +2514,25 @@ void GraspPipeline::HandlePlanning() {
             base_alignment_command_.type !=
                 MobileBaseAlignmentCommand::Type::NONE ||
             base_alignment_command_.max_attempts_reached;
+        const float maximum_regression =
+            std::max(0.0f,
+                    config_.mobile_base.max_visual_regression_m);
         if (still_needs_alignment &&
-            progress < required_progress) {
+            progress < -maximum_regression) {
             stable_count_ = 0;
             std::ostringstream message;
             message << "Base alignment stopped: visual progress "
-                    << progress << "m below required "
-                    << required_progress
+                    << progress << "m exceeded allowed regression "
+                    << maximum_regression
                     << "m after chassis motion; check depth and motion "
-                    << "direction";
+                        "direction";
             SetState(PipelineState::ERROR, message.str());
             return;
+        }
+        if (still_needs_alignment && progress < required_progress) {
+            std::cout << "[Pipeline] Mobile base made limited but valid "
+                        "progress; continuing closed-loop alignment"
+                        << std::endl;
         }
         have_previous_base_alignment_point_ = false;
     }
@@ -1545,7 +2554,8 @@ void GraspPipeline::HandlePlanning() {
                 return;
             }
         }
-        std::copy_n(base_point, 3, previous_base_alignment_point_.begin());
+        std::copy_n(
+            alignment_point, 3, previous_base_alignment_point_.begin());
         previous_base_alignment_command_ = base_alignment_command_;
         have_previous_base_alignment_point_ = true;
         std::cout << "[Pipeline] Mobile base alignment needed: "
@@ -1554,7 +2564,8 @@ void GraspPipeline::HandlePlanning() {
                     << "/" << config_.mobile_base.max_align_attempts << ")"
                     << std::endl;
         std::ostringstream message;
-        message << "Target=[" << base_point[0] << ", " << base_point[1]
+        message << "Target=[" << alignment_point[0] << ", "
+                << alignment_point[1]
                 << "]m; " << base_alignment_command_.reason << "; ";
         if (base_alignment_command_.type ==
             MobileBaseAlignmentCommand::Type::ROTATE) {
@@ -1574,79 +2585,142 @@ void GraspPipeline::HandlePlanning() {
         return;
     }
     if (config_.mobile_base.enabled) {
+        const float stable_x_tolerance =
+            alignment_config.x_tolerance +
+            std::max(0.0f, alignment_config.x_hysteresis);
         const float stable_y_limit =
             config_.mobile_base.y_tolerance +
             std::max(0.0f, config_.mobile_base.y_hysteresis);
         std::cout << "[Pipeline] Mobile base target in comfortable range: "
-                    << "x=" << base_point[0] << "m in ["
-                    << config_.mobile_base.target_x -
-                        config_.mobile_base.x_tolerance
+                    << "x=" << alignment_point[0] << "m in ["
+                    << alignment_config.target_x -
+                        stable_x_tolerance
                     << ", "
-                    << config_.mobile_base.target_x +
-                        config_.mobile_base.x_tolerance
-                    << "]m, y=" << base_point[1] << "m within stable +/-"
+                    << alignment_config.target_x +
+                        stable_x_tolerance
+                    << "]m, y=" << alignment_point[1]
+                    << "m within stable +/-"
                     << stable_y_limit << "m"
                     << std::endl;
     }
 
-    // 规划抓取
-    if (!planner_->PlanTopGrasp(base_point, grasp_pose_, pre_grasp_pose_)) {
-        SetState(PipelineState::ERROR,
-                "Target out of workspace: base_point=[" +
-                    std::to_string(base_point[0]) + ", " +
-                    std::to_string(base_point[1]) + ", " +
-                    std::to_string(base_point[2]) + "]");
+    const auto planning_deadline = planning_start + std::chrono::milliseconds(
+        config_.geometry.planning_timeout_ms);
+    GraspCandidate* selected_candidate = nullptr;
+    for (GraspCandidate& candidate : grasp_geometry_result_.candidates) {
+        if (!matches_observation_strategy(candidate)) continue;
+        if (!candidate.geometry_valid) {
+            std::cout << "[Pipeline] Candidate rejected: strategy="
+                        << GraspStrategyName(candidate.strategy)
+                        << " reason=" << candidate.rejection_reason
+                        << std::endl;
+            continue;
+        }
+        if (!planner_->InWorkspace(
+                candidate.grasp_pose.x,
+                candidate.grasp_pose.y,
+                candidate.grasp_pose.z)) {
+            candidate.rejection_reason =
+                "grasp pose remains outside workspace after base alignment";
+            std::cout << "[Pipeline] Candidate requires additional base "
+                        "alignment: strategy="
+                        << GraspStrategyName(candidate.strategy)
+                        << " pose=[" << candidate.grasp_pose.x << ","
+                        << candidate.grasp_pose.y << ","
+                        << candidate.grasp_pose.z << "]"
+                        << std::endl;
+            continue;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= planning_deadline) {
+            candidate.rejection_reason = "planning deadline exceeded";
+            break;
+        }
+        const int remaining_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                planning_deadline - now)
+                .count());
+        std::string ik_detail;
+        const bool use_top_constraints =
+            candidate.strategy == GraspStrategy::TOP;
+        const GraspResult ik_result = executor_->ValidateGraspPoses(
+            candidate.pre_grasp_pose, candidate.grasp_pose,
+            candidate.retreat_pose, candidate.lift_pose,
+            candidate.entry_clearance_z_m,
+            candidate.grasp_yaw_rad,
+            use_top_constraints, remaining_ms, &ik_detail);
+        if (ik_result == GraspResult::SUCCESS) {
+            selected_candidate = &candidate;
+            break;
+        }
+        candidate.rejection_reason = ik_detail.empty()
+            ? "IK validation failed"
+            : ik_detail;
+        std::cout << "[Pipeline] Candidate rejected: strategy="
+                    << GraspStrategyName(candidate.strategy)
+                    << " reason=" << candidate.rejection_reason
+                    << std::endl;
+    }
+
+    if (!selected_candidate) {
+        std::ostringstream message;
+        message << "No safe 3D grasp candidate";
+        for (const GraspCandidate& candidate :
+            grasp_geometry_result_.candidates) {
+            if (!matches_observation_strategy(candidate)) continue;
+            message << "; " << GraspStrategyName(candidate.strategy)
+                    << "=" << candidate.rejection_reason;
+        }
+        SetState(PipelineState::ERROR, message.str());
         return;
     }
 
-    // 计算基座系目标夹爪方向 (根据偏移方向自动对齐)
-    // 偏移方向角由 ComputeGraspPixel 输出；executor 会再根据 IK 解的 joint0
-    // 转换成实际 wrist_roll(joint5) 命令。
-    if (config_.auto_orient && !std::isnan(offset_dir_angle)) {
-        // 夹爪角度直接使用黄色检测线与图像水平线的夹角。
-        // OpenCV 图像坐标 y 轴向下，因此需对 offset_dir_angle 取反后
-        // 归一化到 [0, pi)。例如 offset_dir=76° 时，夹角为 104°。
-        float yaw = ImageLineAngleFromHorizontal(offset_dir_angle);
-        grasp_yaw_rad_ = yaw;
-        std::cout << "[Pipeline] Yaw from offset_dir: offset_dir_angle="
-                    << offset_dir_angle * 180.0f / M_PI << "° -> yaw="
-                    << grasp_yaw_rad_ * 180.0f / M_PI << "°" << std::endl;
-    } else if (config_.auto_orient) {
-        // 物体接近圆形时回退到长轴方向
-        grasp_yaw_rad_ = ComputeGraspYaw(current_target_, config_.orientation);
-    } else {
-        grasp_yaw_rad_ = NAN;
-    }
+    grasp_strategy_ = selected_candidate->strategy;
+    grasp_pose_ = selected_candidate->grasp_pose;
+    pre_grasp_pose_ = selected_candidate->pre_grasp_pose;
+    retreat_pose_ = selected_candidate->retreat_pose;
+    lift_pose_ = selected_candidate->lift_pose;
+    grasp_yaw_rad_ = selected_candidate->grasp_yaw_rad;
+    grasp_opening_ = grasp_strategy_ == GraspStrategy::SIDE
+        ? 1.0f
+        : NAN;
+    std::cout << "[Pipeline] Selected 3D grasp: strategy="
+                << GraspStrategyName(grasp_strategy_)
+                << " score=" << selected_candidate->score
+                << " required_width_m="
+                << selected_candidate->required_width_m
+                << " gripper_opening=" << grasp_opening_ << std::endl;
 
-    // 沿夹爪方向偏移: SO101 左爪固定，抓取点需往固定爪方向偏移
-    // gripper_offset > 0 表示往固定爪侧偏移
-    float offset = config_.planner.gripper_offset;
-    if (offset != 0.0f) {
-        float yaw = std::isnan(grasp_yaw_rad_) ? 0.0f : grasp_yaw_rad_;
-        // 夹爪方向垂直于张开方向，偏移沿张开方向 (垂直于夹爪轴)
-        // 在基座标系中: yaw=0 时夹爪张开方向为 Y 轴
-        float dx = -offset * std::sin(yaw);
-        float dy =  offset * std::cos(yaw);
-        grasp_pose_.x += dx;
-        grasp_pose_.y += dy;
-        pre_grasp_pose_.x += dx;
-        pre_grasp_pose_.y += dy;
-        std::cout << "[Pipeline] Gripper offset (along jaw dir): "
-                    << offset << "m, yaw=" << yaw << " rad"
-                    << " -> dx=" << dx << " dy=" << dy << std::endl;
-    }
-
-    SaveGraspDebug(static_cast<float>(cx), static_cast<float>(cy), depth_mm,
-                    cam_point, base_point, offset_dir_angle);
-
-    if (!planner_->InWorkspace(pre_grasp_pose_.x, pre_grasp_pose_.y,
-                                base_point[2])) {
+    const auto perception_elapsed_ms = perception_cycle_active_
+        ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() -
+                perception_cycle_started_at_)
+                .count()
+        : 0;
+    const bool within_perception_budget =
+        !perception_cycle_active_ ||
+        perception_elapsed_ms <= config_.geometry.perception_budget_ms;
+    std::cout << "[Timing] stage=PERCEPTION_PLANNING"
+                << " elapsed_ms=" << perception_elapsed_ms
+                << " budget_ms=" << config_.geometry.perception_budget_ms
+                << " result="
+                << (within_perception_budget ? "SUCCESS" : "TIMEOUT")
+                << std::endl;
+    perception_cycle_active_ = false;
+    if (!within_perception_budget) {
         SetState(PipelineState::ERROR,
-            "Adjusted grasp pose out of workspace after gripper_offset: "
-            "pose=[" + std::to_string(pre_grasp_pose_.x) + ", " +
-            std::to_string(pre_grasp_pose_.y) + ", " +
-            std::to_string(pre_grasp_pose_.z) + "], offset=" +
-            std::to_string(config_.planner.gripper_offset));
+                "Perception and planning exceeded the configured budget");
+        return;
+    }
+
+    SaveGraspDebug(debug_grasp_px, debug_grasp_py, depth_mm,
+                    cam_point, base_point);
+
+    if (config_.plan_only) {
+        SetState(PipelineState::DONE,
+                "Plan validated without motion: strategy=" +
+                    std::string(GraspStrategyName(grasp_strategy_)));
         return;
     }
 
@@ -1696,6 +2770,7 @@ void GraspPipeline::HandleBaseAligning() {
         missing_count_ = 0;
         current_color_.release();
         current_depth_.release();
+        motion_geometry_refresh_count_ = 0;
         if (!FlushCameraAfterMotion("base motion")) {
             SetState(PipelineState::ERROR,
                     "Failed to refresh camera after base motion");
@@ -1711,9 +2786,14 @@ void GraspPipeline::HandleBaseAligning() {
 
 void GraspPipeline::HandleApproaching() {
     if (!action_.active) {
-        if (!WaitForConfirm("即将移动到预抓取位 (pre_grasp)")) return;
+        const char* prompt = grasp_strategy_ == GraspStrategy::SIDE
+            ? "即将移动到目标上方安全预抓取位 (safe_pre_grasp)"
+            : "即将移动到预抓取位 (pre_grasp)";
+        if (!WaitForConfirm(prompt)) return;
         StartAction(PipelineState::APPROACHING, "move_to_pre_grasp", [this]() {
-            return executor_->MoveToPreGrasp(pre_grasp_pose_, grasp_yaw_rad_);
+            return executor_->MoveToPreGrasp(
+                pre_grasp_pose_, grasp_yaw_rad_,
+                grasp_strategy_ == GraspStrategy::TOP);
         });
         return;
     }
@@ -1721,8 +2801,35 @@ void GraspPipeline::HandleApproaching() {
     auto result = PollAction(PipelineState::APPROACHING);
     if (!result.has_value()) return;
     if (*result == GraspResult::SUCCESS) {
-        SetState(PipelineState::GRASPING, "At pre-grasp, executing grasp...");
+        const char* debug_name = grasp_strategy_ == GraspStrategy::SIDE
+            ? "safe_pre_grasp"
+            : "pre_grasp";
+        if (config_.step_mode &&
+            (!FlushCameraAfterMotion("pre-grasp motion") ||
+            !SaveStepCameraDebug(debug_name))) {
+            SetState(PipelineState::ERROR,
+                    "Failed to capture pre-grasp camera verification");
+            return;
+        }
+        if (grasp_strategy_ == GraspStrategy::SIDE) {
+            const float dx = grasp_pose_.x - pre_grasp_pose_.x;
+            const float dy = grasp_pose_.y - pre_grasp_pose_.y;
+            const float dz = grasp_pose_.z - pre_grasp_pose_.z;
+            std::ostringstream message;
+            message << "At safe pre-grasp above target; open gripper, "
+                    << "descend, then advance distance="
+                    << std::sqrt(dx * dx + dy * dy + dz * dz)
+                    << "m dx=" << dx
+                    << "m dy=" << dy
+                    << "m dz=" << dz << "m";
+            SetState(PipelineState::GRASPING, message.str());
+        } else {
+            SetState(
+                PipelineState::GRASPING,
+                "At pre-grasp, executing grasp...");
+        }
     } else {
+        if (RetryRecoverableMotion("Pre-grasp motion", *result)) return;
         SetState(PipelineState::ERROR,
                 ResultMessage("Pre-grasp move failed", *result));
     }
@@ -1730,12 +2837,24 @@ void GraspPipeline::HandleApproaching() {
 
 void GraspPipeline::HandleGrasping() {
     if (!action_.active) {
-        if (!WaitForConfirm("即将张开夹爪、下探并闭合抓取")) return;
+        if (!WaitForConfirm(
+                "即将张开夹爪、下降、水平进给并闭合抓取")) return;
         StartAction(PipelineState::GRASPING, "open_move_close_gripper", [this]() {
-            auto result = executor_->OpenGripperForGrasp();
+            auto result = executor_->OpenGripperForGrasp(grasp_opening_);
             if (result != GraspResult::SUCCESS) return result;
-            result = executor_->MoveToGrasp(grasp_pose_, grasp_yaw_rad_);
+            object_may_be_held_.store(false);
+            result = executor_->MoveToGrasp(
+                grasp_pose_, grasp_yaw_rad_,
+                grasp_strategy_ == GraspStrategy::TOP);
             if (result != GraspResult::SUCCESS) return result;
+            if (config_.step_mode &&
+                (!FlushCameraAfterMotion("grasp motion") ||
+                !SaveStepCameraDebug("grasp_pose"))) {
+                return GraspResult::MOVE_FAILED;
+            }
+            // Once closing starts, retain a conservative held-object state
+            // until the executor explicitly reports EMPTY or release succeeds.
+            object_may_be_held_.store(true);
             return executor_->CloseGripperAndCheck();
         });
         return;
@@ -1746,10 +2865,12 @@ void GraspPipeline::HandleGrasping() {
 
     switch (*result) {
         case GraspResult::SUCCESS:
+            object_may_be_held_.store(true);
             SetState(PipelineState::LIFTING, "Object held, lifting...");
             break;
 
         case GraspResult::EMPTY:
+            object_may_be_held_.store(false);
             retry_count_++;
             if (retry_count_ < config_.max_retries) {
                 std::cout << "[Pipeline] Retry " << retry_count_ << "/"
@@ -1767,6 +2888,8 @@ void GraspPipeline::HandleGrasping() {
             break;
 
         case GraspResult::IK_FAILED:
+        case GraspResult::OUT_OF_RANGE:
+            if (RetryRecoverableMotion("Grasp motion", *result)) break;
             SetState(PipelineState::ERROR,
                     ResultMessage("Grasp move failed", *result));
             break;
@@ -1792,7 +2915,9 @@ void GraspPipeline::HandleLifting() {
     if (!action_.active) {
         if (!WaitForConfirm("抓取成功，即将抬起到预抓取位")) return;
         StartAction(PipelineState::LIFTING, "lift_from_grasp", [this]() {
-            return executor_->LiftFromGrasp(pre_grasp_pose_, grasp_yaw_rad_);
+            return executor_->LiftFromGrasp(
+                retreat_pose_, lift_pose_, grasp_yaw_rad_,
+                grasp_strategy_ == GraspStrategy::TOP);
         });
         return;
     }
@@ -1803,6 +2928,7 @@ void GraspPipeline::HandleLifting() {
         SetState(PipelineState::PLACING,
                 "Lift completed and object holding confirmed; placing...");
     } else if (*result == GraspResult::EMPTY) {
+        object_may_be_held_.store(false);
         retry_count_++;
         if (retry_count_ < config_.max_retries) {
             stable_count_ = 0;
@@ -1825,6 +2951,9 @@ void GraspPipeline::HandlePlacing() {
             auto result = executor_->MoveToPlace();
             if (result == GraspResult::SUCCESS) {
                 result = executor_->ReleaseObject();
+                if (result == GraspResult::SUCCESS) {
+                    object_may_be_held_.store(false);
+                }
             }
             if (result == GraspResult::SUCCESS) {
                 result = executor_->CloseGripper();
@@ -1837,8 +2966,10 @@ void GraspPipeline::HandlePlacing() {
     auto result = PollAction(PipelineState::PLACING);
     if (!result.has_value()) return;
     if (*result == GraspResult::SUCCESS) {
-        const char* target_pose = config_.voice.enabled ? "observe position"
-                                                        : "home position";
+        const bool return_to_observe =
+            config_.voice.enabled || config_.auto_loop;
+        const char* target_pose =
+            return_to_observe ? "observe position" : "home position";
         SetState(PipelineState::HOMING,
                 std::string("Object released, returning to ") +
                     target_pose + "...");
@@ -1849,17 +2980,26 @@ void GraspPipeline::HandlePlacing() {
 }
 
 void GraspPipeline::HandleHoming() {
+    const bool return_to_observe =
+        config_.voice.enabled || config_.auto_loop;
     if (!action_.active) {
-        if (!WaitForConfirm(config_.voice.enabled ? "即将回到观察位"
-                                                : "即将回到 Home 位")) {
+        if (!WaitForConfirm(return_to_observe ? "即将回到观察位"
+                                            : "即将回到 Home 位")) {
             return;
         }
-        const std::string action_name = config_.voice.enabled
+        const std::string action_name = return_to_observe
             ? "move_to_observe_after_place"
             : "move_to_home_after_place";
-        StartAction(PipelineState::HOMING, action_name, [this]() {
-            return config_.voice.enabled ? executor_->MoveToObserve()
-                                        : executor_->MoveToHome();
+        StartAction(PipelineState::HOMING, action_name,
+                    [this, return_to_observe]() {
+            if (!return_to_observe) {
+                return executor_->MoveToHome();
+            }
+            if (observation_strategy_selected_ &&
+                grasp_strategy_ == GraspStrategy::SIDE) {
+                return executor_->MoveToSideObserve();
+            }
+            return executor_->MoveToObserve();
         });
         return;
     }
@@ -1874,7 +3014,82 @@ void GraspPipeline::HandleHoming() {
     }
 }
 
+void GraspPipeline::HandleRecovering() {
+    const bool carrying_object = object_may_be_held_.load();
+    const bool return_to_observe = config_.auto_loop && !carrying_object;
+    const bool use_side_observation =
+        observation_strategy_selected_ &&
+        grasp_strategy_ == GraspStrategy::SIDE;
+    const char* recovery_target =
+        return_to_observe ? "observation position" : "home position";
+    if (!action_.active) {
+        const char* action_name = return_to_observe
+            ? "return_observe_after_failure"
+            : "return_home_after_failure";
+        if (!StartAction(
+                PipelineState::RECOVERING, action_name,
+                [this, return_to_observe, use_side_observation]() {
+                    if (!return_to_observe) {
+                        return executor_->MoveToHome();
+                    }
+                    return use_side_observation
+                        ? executor_->MoveToSideObserve()
+                        : executor_->MoveToObserve();
+                })) {
+            failure_recovery_succeeded_ = false;
+            const std::string message =
+                pending_failure_message_ +
+                "; failed to start recovery action for " +
+                recovery_target;
+            if (return_to_observe) {
+                observation_strategy_selected_ = false;
+            }
+            if (carrying_object) {
+                shutdown_requested_.store(true);
+            }
+            SetState(PipelineState::ERROR, message);
+            failure_recovery_active_ = false;
+            pending_failure_message_.clear();
+        }
+        return;
+    }
+
+    auto result = PollAction(PipelineState::RECOVERING);
+    if (!result.has_value()) return;
+
+    failure_recovery_succeeded_ = *result == GraspResult::SUCCESS;
+    std::string message = pending_failure_message_;
+    if (failure_recovery_succeeded_) {
+        message += "; returned to ";
+        message += recovery_target;
+    } else {
+        if (return_to_observe) {
+            observation_strategy_selected_ = false;
+        }
+        message += "; " +
+            ResultMessage(
+                return_to_observe
+                    ? "Observation recovery failed"
+                    : "Home recovery failed",
+                *result);
+    }
+
+    if (carrying_object) {
+        message +=
+            "; automatic restart disabled because the gripper may hold an "
+            "object";
+        shutdown_requested_.store(true);
+    }
+    SetState(PipelineState::ERROR, message);
+    failure_recovery_active_ = false;
+    failure_recovery_succeeded_ = false;
+    pending_failure_message_.clear();
+}
+
 void GraspPipeline::BeginTaskTiming() {
+    failure_recovery_active_ = false;
+    failure_recovery_succeeded_ = false;
+    pending_failure_message_.clear();
     task_timing_active_ = true;
     stage_timing_active_ = false;
     stage_sequence_ = 0;
@@ -1918,9 +3133,27 @@ void GraspPipeline::PrintTaskSummary(PipelineState terminal_state,
 
 void GraspPipeline::SetState(PipelineState new_state,
                             const std::string& msg) {
+    const PipelineState requested_state = new_state;
     const PipelineState previous_state = state_.load();
-    if (!msg.empty()) {
-        last_status_message_ = msg;
+    std::string state_message = msg;
+    const bool start_failure_recovery =
+        requested_state == PipelineState::ERROR &&
+        task_timing_active_ && executor_ && !config_.plan_only &&
+        !failure_recovery_active_;
+    if (start_failure_recovery) {
+        pending_failure_message_ =
+            msg.empty() ? last_status_message_ : msg;
+        failure_recovery_active_ = true;
+        failure_recovery_succeeded_ = false;
+        new_state = PipelineState::RECOVERING;
+        state_message =
+            config_.auto_loop && !object_may_be_held_.load()
+            ? "Task failed; returning to observation position"
+            : "Task failed; returning to home position";
+    }
+
+    if (!state_message.empty()) {
+        last_status_message_ = state_message;
     }
 
     if (task_timing_active_ && stage_timing_active_ &&
@@ -1929,9 +3162,17 @@ void GraspPipeline::SetState(PipelineState new_state,
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - stage_started_at_)
                 .count();
-        const char* result = new_state == PipelineState::ERROR
-            ? "FAILED"
-            : (new_state == PipelineState::IDLE ? "CANCELLED" : "SUCCESS");
+        const bool recovery_completed =
+            previous_state == PipelineState::RECOVERING &&
+            requested_state == PipelineState::ERROR &&
+            failure_recovery_succeeded_;
+        const char* result = recovery_completed
+            ? "SUCCESS"
+            : (requested_state == PipelineState::ERROR
+                ? "FAILED"
+                : (new_state == PipelineState::IDLE
+                    ? "CANCELLED"
+                    : "SUCCESS"));
         stage_timings_.push_back({
             stage_sequence_, previous_state, elapsed_ms, result,
         });
@@ -1954,31 +3195,34 @@ void GraspPipeline::SetState(PipelineState new_state,
         std::ostringstream stage_log;
         stage_log << "\n[Stage " << stage_sequence_ << "] START "
                 << PipelineStateName(new_state);
-        if (!msg.empty()) {
-            stage_log << " | " << msg;
+        if (!state_message.empty()) {
+            stage_log << " | " << state_message;
         }
         WriteStructuredLine(stage_log.str());
-    } else if (!task_timing_active_ && !msg.empty()) {
+    } else if (!task_timing_active_ && !state_message.empty()) {
         std::ostringstream pipeline_log;
         pipeline_log << "[Pipeline] " << PipelineStateName(new_state)
-                    << " | " << msg;
+                    << " | " << state_message;
         WriteStructuredLine(pipeline_log.str());
     }
 
     if (IsTerminalState(new_state)) {
-        SaveTaskResultDebug(new_state, msg.empty() ? last_status_message_ : msg);
+        SaveTaskResultDebug(
+            new_state,
+            state_message.empty() ? last_status_message_ : state_message);
     }
 
     if (task_timing_active_ &&
         (IsTerminalState(new_state) || new_state == PipelineState::IDLE)) {
-        PrintTaskSummary(new_state,
-                        msg.empty() ? last_status_message_ : msg);
+        PrintTaskSummary(
+            new_state,
+            state_message.empty() ? last_status_message_ : state_message);
     }
 
     // 通知回调
     std::lock_guard<std::mutex> lock(callback_mutex_);
     if (callback_) {
-        callback_(new_state, msg);
+        callback_(new_state, state_message);
     }
 }
 

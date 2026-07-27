@@ -38,7 +38,7 @@ python3 scripts/check_runtime_env.py \
   --target banana
 ```
 
-`--debug` 显示完整模块日志。默认模式只保留 pipeline 的结构化日志和模块错误。
+`--debug` 显示完整模块日志。默认模式输出 pipeline 结构化日志和模块错误。
 
 ## 2. 排查立体相机取图
 
@@ -113,34 +113,50 @@ python3 scripts/check_runtime_env.py \
 
 ### 3.4 区分检测误差和手眼标定误差
 
-先查看定位工具生成的标注图。如果检测框、分割区域和抓取像素都位于目标可夹取区域，而 `base_point_m` 与目标相对机械臂的实测位置不一致，问题来自深度或手眼标定，不应通过修改检测阈值补偿。
+先查看定位工具生成的标注图和目标点云。如果检测框、分割区域和三维目标中心均合理，而 `base_point_m` 与目标相对机械臂的实测位置不一致，问题来自深度或手眼标定，不应通过修改检测阈值补偿。
 
 将同一目标放在工作区的左、中、右位置并分别定位：
 
 - 图像中的抓取点随目标稳定移动，但基座坐标始终存在近似固定偏差时，重新标定或检查标定结果是否已写回配置。
 - 偏差随目标位置明显变化时，检查立体相机标定、深度图与彩色图对齐以及相机固定结构。
-- 基座坐标合理，但抓取点落在目标边缘或背景时，调整分割质量、`grasp_point_x_ratio` 或 `gripper_offset`。
+- 顶抓基座坐标合理但抓取点存在固定偏差时，先检查分割掩码和手眼标定，再调整 `top.gripper_offset` 或 `top.grasp_point_x_ratio`。
+- 侧抓三维中心或水平轮廓偏离目标时，检查目标点云和桌面平面；仅在存在稳定机械偏差时调整 `side.gripper_offset_m`。
 
 ## 4. 排查抓取规划和 ik
 
-realsense 后端可使用 `debug_grasp` 执行不移动机械臂的规划检查：
+两种立体相机后端均可使用 `debug_localize` 执行不移动机械臂的三维几何检查：
 
 ```bash
-./build/debug_grasp \
+./build/debug_localize \
   --config config/grasp_pipeline.yaml \
   --target banana \
-  --output /tmp/debug_grasp
+  --frames 5 \
+  --output /tmp/debug_localize
 ```
 
 重点检查：
 
-- `pixel_grasp` 是否位于目标可夹取区域。
-- `base_point_m` 是否与目标实际位置一致。
-- `pre_grasp_m` 和 `grasp_m` 是否处于机械臂前方。
-- `ik_pre_grasp` 和 `ik_grasp` 是否成功。
-- `debug_grasp_annotated.png` 中的目标轴和夹爪方向是否合理。
+- `geometry_result` 是否为 `valid`。
+- `dimensions_m` 是否接近目标实测长、宽、高。
+- `selected` 是 `top` 还是 `side`，是否符合目标形状和现场空间。
+- `required_width_m` 是否小于实际夹爪开口。
+- `base_point_m`、`pre_grasp_m` 和 `grasp_m` 是否与现场位置一致。
+- `frame_*_object_*.ply` 中是否只包含目标，没有大面积桌面或背景点。
 
-`debug_grasp` 仅打开 realsense 后端。使用 spacemit_las2 时，先通过 `debug_localize` 验证定位，再使用主程序单步模式检查完整规划：
+`debug_localize` 不连接机械臂，因此不执行 ik。需要继续验证候选位姿时，使用输出的位姿运行 `debug_ik`；该工具只求解运动学，不发送运动命令。
+
+需要使用机械臂当前关节角验证完整候选和运动路径，但不允许机械臂或底盘运动时，运行：
+
+```bash
+./build/perceptive_grasp \
+  --config config/grasp_pipeline.yaml \
+  --target cup \
+  --plan-only
+```
+
+`--plan-only` 会初始化当前配置中的硬件并读取机械臂状态，但不发送机械臂或底盘运动命令。普通顶抓完成目标检测、深度定位以及预抓取位和抓取位的 ik 检查后退出。杯、瓶和显式侧抓还会检查三维几何、桌面间隙和完整关节路径。直立目标的成功结果应包含 `strategy=side`；侧抓路径不满足安全间隙或可达性约束时，任务直接失败，不回退到顶抓。
+
+需要检查完整状态机时，可使用主程序单步模式：
 
 **单步模式仍会移动机械臂到观察姿态，并可能请求底盘对齐。只确认诊断所需的动作，出现预抓取提示时停止。**
 
@@ -152,7 +168,7 @@ realsense 后端可使用 `debug_grasp` 执行不移动机械臂的规划检查�
   --target banana
 ```
 
-单步模式会在每次真实动作前等待确认。程序完成规划并提示“即将移动到预抓取位”时输入 `n`，可在不执行接近和抓取动作的情况下结束检查。
+单步模式会在每次真实动作前等待确认。程序完成规划并提示“即将移动到预抓取位”时输入 `n`，可在不执行接近和抓取动作的情况下结束检查，机械臂随后返回 home 位。输入流意外关闭时，程序同样中止任务并执行安全归位。
 
 出现 `out of workspace` 时，先检查手眼标定和目标深度，再核对 `grasp.workspace`。出现 `IK failed` 时，检查 `manipulator.urdf_path`、机械臂当前姿态和目标位姿；不要通过扩大工作空间绕过机械结构限制。
 
@@ -180,7 +196,7 @@ realsense 后端可使用 `debug_grasp` 执行不移动机械臂的规划检查�
   --yaw 90
 ```
 
-首次测试保留交互确认，不要增加 `--yes`。工具先移动到观察姿态，再移动到指定位置；不会下探，也不会闭合夹爪。
+首次测试使用交互确认，不要增加 `--yes`。工具先移动到观察姿态，再移动到指定位置；不会下探，也不会闭合夹爪。
 
 如果 ik 成功但机械臂不动，使用主程序 `--debug` 日志检查串口、舵机响应和动作超时。机械臂运动方向或关节姿态异常时，停止运行并重新核对 urdf、关节零位和预定义姿态。
 
@@ -207,7 +223,7 @@ realsense 后端可使用 `debug_grasp` 执行不移动机械臂的规划检查�
 [Pipeline] Mobile base visual progress: ...m (required >= ...m)
 ```
 
-重新定位后的目标框、深度和 `base_point_m` 应随底盘动作变化。目标进入 `target_x ± x_tolerance` 定义的前向舒适区，且横向偏移进入 `y_tolerance` 的稳定范围后，pipeline 才进入机械臂抓取阶段。
+重新定位后的目标框、深度和 `base_point_m` 应随底盘动作变化。目标进入 `target_x ± x_tolerance` 定义的前向舒适区，且横向偏移进入 `y_tolerance` 的稳定范围后，pipeline 才进入机械臂抓取阶段。视觉进展低于期望值但高于停滞门限时，pipeline 会继续重新检测并执行下一次小步对齐。
 
 底盘越过目标时检查：
 
@@ -217,7 +233,7 @@ realsense 后端可使用 `debug_grasp` 执行不移动机械臂的规划检查�
 - `mobile_base.max_step_m` 是否过大。
 - `mobile_base.linear_speed` 是否超过现场底盘可稳定控制的速度。
 
-pipeline 内置视觉进展门限、最大对齐次数和累计直行距离限制。出现 `target distance did not improve` 或 `cumulative travel safety limit reached` 时，应修正深度和标定，不要绕过安全限制。
+pipeline 允许单次复检出现小幅视觉回退，并通过最大对齐次数和累计直行距离限制约束后续动作。出现 `visual progress ... exceeded allowed regression` 或 `cumulative travel safety limit reached` 时，应修正深度和标定，不要绕过安全限制。
 
 ## 7. 排查语音交互
 
@@ -253,11 +269,11 @@ VOICE_STATUS	state=IDLE;message=Ready
 - `last_executor_detail`：驱动、ik 或动作超时详情。
 - `gripper_check`：夹爪位置、负载、空夹爪全闭基线和持物判断结果。`phase=after_lift` 表示抬起后的二次确认结果。
 
-结合对应的标注图确认目标框、分割 mask 和抓取像素是否落在同一目标上。
+结合对应的标注图和目标点云确认检测框、分割 mask 与三维几何结果是否属于同一目标。
 
 ## 9. 分析 pipeline 性能
 
-临时在 `config/grasp_pipeline.yaml` 中启用详细性能日志：
+在 `config/grasp_pipeline.yaml` 中启用详细性能日志：
 
 ```yaml
 logging:

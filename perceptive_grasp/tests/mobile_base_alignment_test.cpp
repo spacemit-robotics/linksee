@@ -33,6 +33,7 @@ MobileBaseAlignmentConfig TestConfig() {
     config.enabled = true;
     config.target_x = 0.30f;
     config.x_tolerance = 0.05f;
+    config.x_hysteresis = 0.0f;
     config.y_tolerance = 0.08f;
     config.y_hysteresis = 0.0f;
     config.max_step_m = 0.12f;
@@ -50,11 +51,24 @@ void TestDefaultComfortRangeIsTightForLinkseeArm() {
     const MobileBaseAlignmentConfig config;
     assert(Near(config.target_x, 0.275f));
     assert(Near(config.x_tolerance, 0.025f));
+    assert(Near(config.x_hysteresis, 0.005f));
     assert(Near(config.yaw_gain, 8.0f));
+    assert(config.min_cmd_duration_ms == 350);
     assert(Near(config.min_progress_ratio, 0.15f));
     assert(config.min_rotation_duration_ms == 1000);
     assert(Near(config.y_hysteresis, 0.025f));
     assert(Near(config.min_progress_floor_m, 0.003f));
+    assert(Near(config.max_visual_regression_m, 0.010f));
+}
+
+void TestLongitudinalNoiseDoesNotTriggerMinimumDrivePulse() {
+    MobileBaseAlignmentConfig config;
+    config.enabled = true;
+    const float base_point[3] = {0.3045f, 0.0f, 0.05f};
+
+    const auto command = PlanMobileBaseAlignment(config, base_point, 0);
+
+    assert(command.type == MobileBaseAlignmentCommand::Type::NONE);
 }
 
 void TestNoMotionWhenTargetIsComfortable() {
@@ -99,6 +113,25 @@ void TestDriveBackwardWhenTargetIsTooClose() {
     assert(Near(command.linear_x, -config.linear_speed));
     assert(Near(command.angular_z, 0.0f));
     assert(NearMs(command.duration_ms, 600));
+}
+
+void TestShortDriveStaysAboveLinkseeMotorDeadZone() {
+    MobileBaseAlignmentConfig config;
+    config.enabled = true;
+    config.target_x = 0.294f;
+    config.x_tolerance = 0.005f;
+    const float base_point[3] = {0.269f, 0.0f, 0.05f};
+
+    const auto command = PlanMobileBaseAlignment(config, base_point, 0);
+
+    assert(command.type == MobileBaseAlignmentCommand::Type::DRIVE);
+    assert(command.linear_x < 0.0f);
+    assert(Near(std::fabs(command.linear_x), 0.15f));
+    assert(command.duration_ms == config.min_cmd_duration_ms);
+    const float commanded_distance = std::fabs(command.linear_x) *
+        static_cast<float>(command.duration_ms) / 1000.0f;
+    assert(commanded_distance >= 0.050f);
+    assert(commanded_distance <= 0.055f);
 }
 
 void TestRotateCounterClockwiseWhenTargetIsLeft() {
@@ -292,9 +325,11 @@ void TestLargeCorrectionKeepsFullProgressRequirement() {
 int main() {
     TestDefaultComfortRangeIsTightForLinkseeArm();
     TestNoMotionWhenTargetIsComfortable();
+    TestLongitudinalNoiseDoesNotTriggerMinimumDrivePulse();
     TestNoMotionForReachableSmallLateralOffset();
     TestDriveForwardWhenTargetIsTooFar();
     TestDriveBackwardWhenTargetIsTooClose();
+    TestShortDriveStaysAboveLinkseeMotorDeadZone();
     TestRotateCounterClockwiseWhenTargetIsLeft();
     TestRotateClockwiseWhenTargetIsRight();
     TestRotationUsesMinimumAngleForCurrentTargetGeometry();

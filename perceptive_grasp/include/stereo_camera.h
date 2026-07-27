@@ -24,10 +24,10 @@ struct RealSenseCameraConfig {
     int width = 640;
     int height = 480;
     int fps = 30;
-    int motion_flush_frames = 16;
+    int motion_flush_frames = 30;
     bool align_depth = true;
     bool spatial_filter = true;
-    bool temporal_filter = true;
+    bool temporal_filter = false;
     bool hole_filling = true;
 };
 
@@ -68,6 +68,9 @@ public:
 
     /** Return the backend frame identifier from the last successful capture. */
     virtual std::int64_t LastFrameId() const = 0;
+
+    /** Reset stateful processing after the robot changes the camera pose. */
+    virtual void ResetAfterMotion() {}
 
     /** Convert one depth pixel into camera-frame coordinates in meters. */
     virtual bool Deproject(int pixel_x, int pixel_y, uint16_t depth_mm,

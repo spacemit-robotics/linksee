@@ -221,6 +221,12 @@ static ExecutorConfig LoadExecutorConfig(const std::string& config_path) {
             cfg.observe_joints.clear();
             for (size_t i = 0; i < oj.size(); ++i) cfg.observe_joints.push_back(oj[i].as<float>());
         }
+        if (auto srj = m["side_ready_joints"]) {
+            cfg.side_ready_joints.clear();
+            for (size_t i = 0; i < srj.size(); ++i) {
+                cfg.side_ready_joints.push_back(srj[i].as<float>());
+            }
+        }
 
         cfg.ik_max_trials = m["ik_max_trials"].as<int>(cfg.ik_max_trials);
         cfg.wrist_yaw_scale = m["wrist_yaw_scale"].as<float>(cfg.wrist_yaw_scale);
@@ -234,6 +240,18 @@ static ExecutorConfig LoadExecutorConfig(const std::string& config_path) {
                 c.max_rad = jc[i]["max"].as<float>(0.0f);
                 if (c.joint_index >= 0) {
                     cfg.joint_constraints.push_back(c);
+                }
+            }
+        }
+        if (auto jl = m["joint_limits"]) {
+            cfg.joint_limits.clear();
+            for (size_t i = 0; i < jl.size(); ++i) {
+                JointConstraint limit;
+                limit.joint_index = jl[i]["joint"].as<int>(-1);
+                limit.min_rad = jl[i]["min"].as<float>(0.0f);
+                limit.max_rad = jl[i]["max"].as<float>(0.0f);
+                if (limit.joint_index >= 0) {
+                    cfg.joint_limits.push_back(limit);
                 }
             }
         }

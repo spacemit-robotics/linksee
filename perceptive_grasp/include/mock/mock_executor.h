@@ -29,15 +29,30 @@ public:
 
     bool Init() override;
     GraspResult MoveToObserve() override;
+    GraspResult MoveToSideObserve() override;
     GraspResult MoveToHome() override;
     GraspResult MoveToPreGrasp(const Pose3D& pre_grasp_pose,
-                                float grasp_yaw_rad = NAN) override;
-    GraspResult OpenGripperForGrasp() override;
+                                float grasp_yaw_rad = NAN,
+                                bool use_top_constraints = true) override;
+    GraspResult OpenGripperForGrasp(float minimum_opening = NAN) override;
     GraspResult MoveToGrasp(const Pose3D& grasp_pose,
-                            float grasp_yaw_rad = NAN) override;
+                            float grasp_yaw_rad = NAN,
+                            bool use_top_constraints = true) override;
     GraspResult CloseGripperAndCheck() override;
-    GraspResult LiftFromGrasp(const Pose3D& pre_grasp_pose,
-                                float grasp_yaw_rad = NAN) override;
+    GraspResult LiftFromGrasp(const Pose3D& retreat_pose,
+                                const Pose3D& lift_pose,
+                                float grasp_yaw_rad = NAN,
+                                bool use_top_constraints = true) override;
+    GraspResult ValidateGraspPoses(const Pose3D& pre_grasp_pose,
+                                    const Pose3D& grasp_pose,
+                                    const Pose3D& retreat_pose,
+                                    const Pose3D& lift_pose,
+                                    float entry_clearance_z_m,
+                                    float grasp_yaw_rad,
+                                    bool use_top_constraints,
+                                    int timeout_ms,
+                                    std::string* detail) override;
+    void SetSupportPlane(const SupportPlane& support_plane) override;
     GraspResult MoveToPlace() override;
     GraspResult ReleaseObject() override;
     GraspResult CloseGripper() override;

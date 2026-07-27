@@ -54,11 +54,9 @@ sudo apt install -y \
   liburdfdom-dev
 ```
 
-`meson` 和 `ninja-build` 用于构建语音桥的 webrtc 软件回声消除模块。只使用硬件回声消除或 `half_duplex` 模式时，可以在 cmake 配置阶段设置 `-DENABLE_WEBRTC_AEC=OFF`。
-
 ### 2.2 安装 pinocchio
 
-Linksee 机械臂使用 pinocchio 完成正运动学和逆运动学计算。
+linksee 机械臂使用 pinocchio 完成正运动学和逆运动学计算。
 
 ```bash
 cd ~
@@ -151,7 +149,7 @@ ls ~/spacemit_robot/output/staging/lib/libgrasp.so
 
 ### 4.4 构建机械臂控制组件
 
-机械臂组件提供 Linksee 机械臂驱动、关节运动、直线运动以及基于 pinocchio 的正逆运动学接口。
+机械臂组件提供 linksee 机械臂驱动、关节运动、直线运动以及基于 pinocchio 的正逆运动学接口。
 
 ```bash
 cd ~/spacemit_robot/components/control/manipulator

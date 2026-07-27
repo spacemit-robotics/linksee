@@ -13,14 +13,15 @@
     * 功能:
     *   1. 根据主配置打开立体相机后端
     *   2. 运行 VisionService 检测
-    *   3. 对每个检测目标计算中心点附近 5x5 深度中值
-    *   4. 反投影到相机坐标系
-    *   5. 通过手眼标定变换到机械臂基座坐标系
-    *   6. 输出定位结果并保存可视化图片
+    *   3. 使用分割 mask 和对齐深度构建稀疏目标点云
+    *   4. 估计桌面平面和目标三维尺寸
+    *   5. 生成顶抓/侧抓候选
+    *   6. 输出定位结果、点云和可视化图片
     */
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
@@ -38,6 +39,7 @@
 #include <opencv2/imgproc.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include "grasp_geometry.h"
 #include "grasp_planner.h"
 #include "stereo_camera.h"
 #include "vision_service.h"
@@ -46,8 +48,13 @@
 namespace fs = std::filesystem;
 using perceptive_grasp::GraspPlanner;
 using perceptive_grasp::GraspPlannerConfig;
+using perceptive_grasp::GraspGeometryConfig;
+using perceptive_grasp::GraspGeometryPlanner;
+using perceptive_grasp::GraspGeometryResult;
+using perceptive_grasp::GraspStrategyName;
 using perceptive_grasp::Pose3D;
 using perceptive_grasp::StereoCameraConfig;
+using perceptive_grasp::DetectionTarget;
 
 static constexpr const char* kDefaultConfigPath = "../config/grasp_pipeline.yaml";
 
@@ -93,6 +100,58 @@ static std::optional<uint16_t> MedianDepth5x5(const cv::Mat& depth, int cx, int 
     if (vals.empty()) return std::nullopt;
     std::sort(vals.begin(), vals.end());
     return vals[vals.size() / 2];
+}
+
+static cv::Mat NormalizeDetectionMask(
+    const cv::Mat& detection_mask,
+    const cv::Size& image_size) {
+    if (detection_mask.empty()) return {};
+
+    cv::Mat single_channel;
+    if (detection_mask.channels() == 1) {
+        single_channel = detection_mask;
+    } else {
+        cv::cvtColor(
+            detection_mask, single_channel, cv::COLOR_BGR2GRAY);
+    }
+
+    double max_value = 0.0;
+    cv::minMaxLoc(single_channel, nullptr, &max_value);
+    cv::Mat normalized;
+    single_channel.convertTo(
+        normalized, CV_8UC1, max_value <= 1.0 ? 255.0 : 1.0);
+    if (normalized.size() != image_size) {
+        cv::resize(
+            normalized, normalized, image_size, 0.0, 0.0,
+            cv::INTER_NEAREST);
+    }
+    cv::threshold(normalized, normalized, 0, 255, cv::THRESH_BINARY);
+    return normalized;
+}
+
+static uint16_t DepthPercentile(
+    std::vector<uint16_t> values,
+    float quantile) {
+    if (values.empty()) return 0;
+    quantile = std::clamp(quantile, 0.0f, 1.0f);
+    const size_t index = static_cast<size_t>(std::lround(
+        quantile * static_cast<float>(values.size() - 1)));
+    std::nth_element(values.begin(), values.begin() + index, values.end());
+    return values[index];
+}
+
+static void SaveObjectPointCloud(
+    const fs::path& path,
+    const std::vector<cv::Point3f>& points) {
+    std::ofstream output(path);
+    output << "ply\nformat ascii 1.0\n"
+            << "element vertex " << points.size() << "\n"
+            << "property float x\nproperty float y\nproperty float z\n"
+            << "end_header\n";
+    output << std::fixed << std::setprecision(6);
+    for (const cv::Point3f& point : points) {
+        output << point.x << " " << point.y << " " << point.z << "\n";
+    }
 }
 
 static AppConfig ParseArgs(int argc, char* argv[]) {
@@ -233,9 +292,16 @@ static GraspPlannerConfig LoadPlannerConfig(const std::string& pipeline_config) 
         cfg.r_base_camera[i] = r[i].as<float>();
     }
 
-    auto grasp = root["grasp"];
-    cfg.approach_height = grasp["approach_height"].as<float>();
-    cfg.grasp_depth = grasp["grasp_depth"].as<float>();
+    const YAML::Node grasp = root["grasp"];
+    const YAML::Node top = grasp["top"];
+    if (!top) {
+        throw std::runtime_error("grasp.top configuration is required");
+    }
+    cfg.approach_height = top["approach_height"].as<float>(
+        cfg.approach_height);
+    cfg.grasp_depth = top["grasp_depth"].as<float>(cfg.grasp_depth);
+    cfg.gripper_offset = top["gripper_offset"].as<float>(
+        cfg.gripper_offset);
 
     auto ws = grasp["workspace"];
     cfg.workspace.x_min = ws["x_min"].as<float>();
@@ -246,6 +312,64 @@ static GraspPlannerConfig LoadPlannerConfig(const std::string& pipeline_config) 
     cfg.workspace.z_max = ws["z_max"].as<float>();
 
     return cfg;
+}
+
+static GraspGeometryConfig LoadGeometryConfig(
+    const std::string& pipeline_config) {
+    const YAML::Node root = YAML::LoadFile(pipeline_config);
+    const YAML::Node grasp = root["grasp"];
+    const YAML::Node geometry = grasp["geometry"];
+    const YAML::Node side = grasp["side"];
+    GraspGeometryConfig config;
+
+    config.strategy = grasp["strategy"].as<std::string>(config.strategy);
+    if (geometry) {
+        config.sample_stride = geometry["sample_stride"].as<int>(
+            config.sample_stride);
+        config.max_object_points = geometry["max_object_points"].as<int>(
+            config.max_object_points);
+        config.min_object_points = geometry["min_object_points"].as<int>(
+            config.min_object_points);
+        config.plane_distance_threshold_m =
+            geometry["plane_distance_threshold_m"].as<float>(
+                config.plane_distance_threshold_m);
+        config.table_clearance_m = geometry["table_clearance_m"].as<float>(
+            config.table_clearance_m);
+        config.footprint_padding_m =
+            geometry["footprint_padding_m"].as<float>(
+                config.footprint_padding_m);
+        config.gripper_max_width_m =
+            geometry["gripper_max_width_m"].as<float>(
+                config.gripper_max_width_m);
+        config.planning_timeout_ms = geometry["planning_timeout_ms"].as<int>(
+            config.planning_timeout_ms);
+        config.perception_budget_ms =
+            geometry["perception_budget_ms"].as<int>(
+                config.perception_budget_ms);
+    }
+    if (side) {
+        config.side_min_height_m = side["min_height_m"].as<float>(
+            config.side_min_height_m);
+        config.side_approach_distance_m =
+            side["approach_distance_m"].as<float>(
+                config.side_approach_distance_m);
+        config.side_pregrasp_min_x_m =
+            side["pregrasp_min_x_m"].as<float>(
+                config.side_pregrasp_min_x_m);
+        config.side_gripper_offset_m = side["gripper_offset_m"].as<float>(
+            config.side_gripper_offset_m);
+        config.side_grasp_forward_offset_m =
+            side["grasp_forward_offset_m"].as<float>(
+                config.side_grasp_forward_offset_m);
+        config.side_grasp_height_ratio =
+            side["grasp_height_ratio"].as<float>(
+                config.side_grasp_height_ratio);
+        config.side_initial_lift_m = side["initial_lift_m"].as<float>(
+            config.side_initial_lift_m);
+        config.side_lift_retreat_m = side["lift_retreat_m"].as<float>(
+            config.side_lift_retreat_m);
+    }
+    return config;
 }
 
 int main(int argc, char* argv[]) {
@@ -268,10 +392,12 @@ int main(int argc, char* argv[]) {
     StereoCameraConfig camera_config;
     std::string detect_config;
     GraspPlannerConfig planner_config;
+    GraspGeometryConfig geometry_config;
     try {
         camera_config = LoadCameraConfig(app.config_path);
         detect_config = ResolveDetectConfig(app.config_path);
         planner_config = LoadPlannerConfig(app.config_path);
+        geometry_config = LoadGeometryConfig(app.config_path);
     } catch (const std::exception& e) {
         std::cerr << "[debug_localize] Config error: " << e.what()
                 << std::endl;
@@ -304,6 +430,7 @@ int main(int argc, char* argv[]) {
     }
 
     GraspPlanner planner(planner_config);
+    GraspGeometryPlanner geometry_planner(geometry_config, planner_config);
 
     auto vision = VisionService::Create(detect_config, "", false);
     if (!vision) {
@@ -322,12 +449,17 @@ int main(int argc, char* argv[]) {
             << " frame(s)..." << std::endl;
 
     for (int frame_idx = 1; frame_idx <= app.num_frames; ++frame_idx) {
+        const auto capture_started_at = std::chrono::steady_clock::now();
         if (!camera->GetFrames(color, depth) || color.empty() ||
             depth.empty()) {
             std::cerr << "[debug_localize] Failed to acquire frame "
                     << frame_idx << std::endl;
             return 1;
         }
+        const double capture_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - capture_started_at)
+                .count();
         cv::Mat annotated = color.clone();
 
         std::vector<VisionServiceResult> results;
@@ -338,9 +470,14 @@ int main(int argc, char* argv[]) {
 
         std::ostringstream prefix;
         prefix << app.output_dir << "/frame_" << std::setw(3) << std::setfill('0') << frame_idx;
+        cv::imwrite(prefix.str() + "_color.png", color);
+        cv::imwrite(prefix.str() + "_depth_mm.png", depth);
         std::ofstream out(prefix.str() + "_localize.txt");
-        out << "# Frame " << frame_idx << " | Inference: " << std::fixed << std::setprecision(1)
-            << infer_ms << " ms\n";
+        out << "# Frame " << frame_idx
+            << " | Capture: " << std::fixed << std::setprecision(1)
+            << capture_ms
+            << " ms | Inference: " << infer_ms
+            << " ms | Perception: " << capture_ms + infer_ms << " ms\n";
 
         if (status != VISION_SERVICE_OK) {
             out << "Detection failed, status=" << status << "\n";
@@ -380,9 +517,71 @@ int main(int argc, char* argv[]) {
             float base_point[3] = {0.0f, 0.0f, 0.0f};
             planner.CameraToBase(cam_point, base_point);
 
-            Pose3D grasp_pose{}, pre_grasp_pose{};
-            const bool in_workspace = planner.PlanTopGrasp(
-                base_point, grasp_pose, pre_grasp_pose);
+            DetectionTarget target{};
+            target.x1 = r.x1;
+            target.y1 = r.y1;
+            target.x2 = r.x2;
+            target.y2 = r.y2;
+            target.score = r.score;
+            target.label = r.label;
+            target.label_name = label;
+            target.center = cv::Point2f(
+                (r.x1 + r.x2) * 0.5f, (r.y1 + r.y2) * 0.5f);
+            target.mask = r.mask;
+            target.area = (r.x2 - r.x1) * (r.y2 - r.y1);
+
+            const cv::Mat normalized_mask =
+                NormalizeDetectionMask(target.mask, depth.size());
+            std::vector<uint16_t> mask_depths;
+            if (!normalized_mask.empty()) {
+                mask_depths.reserve(cv::countNonZero(normalized_mask));
+                for (int y = 0; y < depth.rows; ++y) {
+                    const uint8_t* mask_row =
+                        normalized_mask.ptr<uint8_t>(y);
+                    const uint16_t* depth_row = depth.ptr<uint16_t>(y);
+                    for (int x = 0; x < depth.cols; ++x) {
+                        if (mask_row[x] != 0 && depth_row[x] != 0) {
+                            mask_depths.push_back(depth_row[x]);
+                        }
+                    }
+                }
+                cv::imwrite(
+                    prefix.str() + "_mask_" +
+                        std::to_string(kept + 1) + ".png",
+                    normalized_mask);
+            }
+
+            GraspGeometryResult geometry_result;
+            const auto geometry_started_at = std::chrono::steady_clock::now();
+            const bool geometry_valid = geometry_planner.Plan(
+                depth, target, *camera, planner, geometry_result);
+            const double geometry_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - geometry_started_at)
+                    .count();
+            const auto candidate = std::find_if(
+                geometry_result.candidates.begin(),
+                geometry_result.candidates.end(),
+                [](const perceptive_grasp::GraspCandidate& value) {
+                    return value.geometry_valid;
+                });
+            const bool in_workspace = geometry_valid &&
+                candidate != geometry_result.candidates.end();
+            Pose3D grasp_pose{};
+            Pose3D pre_grasp_pose{};
+            if (geometry_result.geometry.valid) {
+                base_point[0] = geometry_result.geometry.center.x;
+                base_point[1] = geometry_result.geometry.center.y;
+                base_point[2] = geometry_result.geometry.center.z;
+                SaveObjectPointCloud(
+                    prefix.str() + "_object_" + std::to_string(kept + 1) +
+                        ".ply",
+                    geometry_result.object_points);
+            }
+            if (in_workspace) {
+                grasp_pose = candidate->grasp_pose;
+                pre_grasp_pose = candidate->pre_grasp_pose;
+            }
 
             const int color_index = std::max(0, r.label) % kNumColors;
             const cv::Scalar color = kColors[color_index];
@@ -395,8 +594,19 @@ int main(int argc, char* argv[]) {
             cv::circle(annotated, cv::Point(cx, cy), 4, color, -1);
 
             std::ostringstream text;
-            text << label << " z=" << std::fixed << std::setprecision(3)
-                << depth_m << "m";
+            text << label;
+            if (geometry_result.geometry.valid) {
+                text << (in_workspace
+                        ? std::string(" ") +
+                            GraspStrategyName(candidate->strategy) + " "
+                        : " no-grasp ")
+                    << std::fixed << std::setprecision(0)
+                    << geometry_result.geometry.length_m * 1000.0f << "x"
+                    << geometry_result.geometry.width_m * 1000.0f << "x"
+                    << geometry_result.geometry.height_m * 1000.0f << "mm";
+            } else {
+                text << " geometry failed";
+            }
             cv::putText(
                 annotated, text.str(),
                 cv::Point(static_cast<int>(r.x1),
@@ -412,16 +622,68 @@ int main(int argc, char* argv[]) {
                 << cam_point[1] << ", " << cam_point[2] << "]\n"
                 << "  base_point_m:   [" << base_point[0] << ", "
                 << base_point[1] << ", " << base_point[2] << "]\n"
+                << "  geometry_ms: " << geometry_ms << "\n"
+                << "  geometry_result: "
+                << (geometry_valid ? "valid" : geometry_result.error) << "\n"
                 << "  in_workspace: " << (in_workspace ? "yes" : "no") << "\n";
+            if (!mask_depths.empty()) {
+                out << "  mask_depth_samples: " << mask_depths.size() << "\n"
+                    << "  mask_depth_percentiles_mm: ["
+                    << DepthPercentile(mask_depths, 0.02f) << ", "
+                    << DepthPercentile(mask_depths, 0.10f) << ", "
+                    << DepthPercentile(mask_depths, 0.25f) << ", "
+                    << DepthPercentile(mask_depths, 0.50f) << ", "
+                    << DepthPercentile(mask_depths, 0.75f) << ", "
+                    << DepthPercentile(mask_depths, 0.90f) << ", "
+                    << DepthPercentile(mask_depths, 0.98f) << "]\n";
+            }
+            if (geometry_result.geometry.valid) {
+                out << "  dimensions_m:  ["
+                    << geometry_result.geometry.length_m << ", "
+                    << geometry_result.geometry.width_m << ", "
+                    << geometry_result.geometry.height_m << "]\n";
+            }
             if (in_workspace) {
+                out << "  selected: "
+                    << GraspStrategyName(candidate->strategy)
+                    << " score=" << candidate->score
+                    << " required_width_m="
+                    << candidate->required_width_m << "\n";
                 out << "  pre_grasp_m:    ["
                     << pre_grasp_pose.x << ", "
                     << pre_grasp_pose.y << ", "
                     << pre_grasp_pose.z << "]\n"
+                    << "  pre_grasp_quat: ["
+                    << pre_grasp_pose.qw << ", "
+                    << pre_grasp_pose.qx << ", "
+                    << pre_grasp_pose.qy << ", "
+                    << pre_grasp_pose.qz << "]\n"
                     << "  grasp_m:        ["
                     << grasp_pose.x << ", "
                     << grasp_pose.y << ", "
                     << grasp_pose.z << "]\n";
+                const float approach_dx =
+                    grasp_pose.x - pre_grasp_pose.x;
+                const float approach_dy =
+                    grasp_pose.y - pre_grasp_pose.y;
+                const float approach_dz =
+                    grasp_pose.z - pre_grasp_pose.z;
+                out << "  approach_delta_m: distance="
+                    << std::sqrt(
+                        approach_dx * approach_dx +
+                        approach_dy * approach_dy +
+                        approach_dz * approach_dz)
+                    << " dx=" << approach_dx
+                    << " dy=" << approach_dy
+                    << " dz=" << approach_dz << "\n";
+            }
+            for (const auto& value : geometry_result.candidates) {
+                out << "  candidate: strategy="
+                    << GraspStrategyName(value.strategy)
+                    << " score=" << value.score
+                    << " required_width_m=" << value.required_width_m
+                    << " valid=" << (value.geometry_valid ? "yes" : "no")
+                    << " reason=" << value.rejection_reason << "\n";
             }
             out << "\n";
             ++kept;

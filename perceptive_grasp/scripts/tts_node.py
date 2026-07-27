@@ -236,7 +236,10 @@ def status_to_speech(message: str, reverse_aliases: Dict[str, str],
         detail = event.get("message", "")
         target = label_to_spoken(event.get("target", ""), reverse_aliases)
 
-        if state == "OBSERVING":
+        if (state == "DETECTING"
+                and detail.startswith("Detecting target before")):
+            return f"收到，准备抓取{target}。" if target else "收到，准备抓取。"
+        if state == "OBSERVING" and detail.startswith("Moving to observe"):
             return f"收到，准备抓取{target}。" if target else "收到，准备抓取。"
         if reason == "target_not_found":
             return f"没有看到{target}。" if target else "没有看到指定物体。"
