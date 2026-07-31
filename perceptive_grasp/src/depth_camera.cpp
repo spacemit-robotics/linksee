@@ -116,6 +116,24 @@ bool DepthCamera::GetFrames(cv::Mat& color_frame, cv::Mat& depth_frame) {
     }
 }
 
+int DepthCamera::DiscardQueuedFrames(int max_frames) {
+    if (!initialized_ || max_frames <= 0) return 0;
+
+    try {
+        int discarded_frames = 0;
+        rs2::frameset queued_frames;
+        while (discarded_frames < max_frames &&
+            pipeline_.poll_for_frames(&queued_frames)) {
+            ++discarded_frames;
+        }
+        return discarded_frames;
+    } catch (const rs2::error& error) {
+        std::cerr << "[DepthCamera] Failed to discard queued frames: "
+            << error.what() << std::endl;
+        return -1;
+    }
+}
+
 void DepthCamera::ResetAfterMotion() {
     if (!initialized_) return;
     spatial_filter_ = rs2::spatial_filter();

@@ -24,9 +24,16 @@ namespace perceptive_grasp {
 
 namespace {
 
-// The Linksee UART chassis remains in its motor dead zone below this command.
+// The linksee UART chassis remains in its motor dead zone below this command.
 // Keep short corrections bounded by duration while using an effective speed.
 constexpr float kMinimumEffectiveLinearSpeedMps = 0.15f;
+constexpr float kPi = 3.14159265358979323846f;
+
+float NormalizeAngle(float angle) {
+    while (angle > kPi) angle -= 2.0f * kPi;
+    while (angle < -kPi) angle += 2.0f * kPi;
+    return angle;
+}
 
 int ClampDurationMs(int duration_ms, const MobileBaseAlignmentConfig& config) {
     return std::clamp(
@@ -180,6 +187,82 @@ float RequiredMobileBaseAlignmentProgress(
                             config.min_progress_m));
 }
 
+MobileBaseMotionReport EvaluateMobileBaseMotion(
+    const MobileBaseAlignmentConfig& config,
+    const MobileBaseAlignmentCommand& command,
+    const std::optional<MobileBaseOdometry>& before,
+    const std::optional<MobileBaseOdometry>& after) {
+    MobileBaseMotionReport report;
+    if (command.type == MobileBaseAlignmentCommand::Type::NONE) {
+        report.motion_confirmed = true;
+        report.detail = "no chassis motion requested";
+        return report;
+    }
+
+    const float duration_s =
+        static_cast<float>(command.duration_ms) / 1000.0f;
+    report.commanded_motion =
+        command.type == MobileBaseAlignmentCommand::Type::DRIVE
+        ? std::fabs(command.linear_x) * duration_s
+        : std::fabs(command.angular_z) * duration_s;
+
+    if (!before.has_value() || !after.has_value()) {
+        report.detail =
+            "odometry unavailable; waiting for visual confirmation";
+        return report;
+    }
+
+    report.odometry_available = true;
+    const float delta_x = after->x - before->x;
+    const float delta_y = after->y - before->y;
+    const float cos_yaw = std::cos(before->yaw);
+    const float sin_yaw = std::sin(before->yaw);
+    report.forward_m = cos_yaw * delta_x + sin_yaw * delta_y;
+    report.lateral_m = -sin_yaw * delta_x + cos_yaw * delta_y;
+    report.translation_m = std::hypot(delta_x, delta_y);
+    report.yaw_rad = NormalizeAngle(after->yaw - before->yaw);
+
+    const float command_ratio =
+        std::max(0.0f, config.odom_min_command_ratio);
+    if (command.type == MobileBaseAlignmentCommand::Type::DRIVE) {
+        report.signed_progress =
+            report.forward_m *
+            std::copysign(1.0f, command.linear_x);
+        report.required_progress = std::max(
+            std::max(0.0f, config.odom_min_translation_m),
+            report.commanded_motion * command_ratio);
+    } else {
+        report.signed_progress =
+            report.yaw_rad *
+            std::copysign(1.0f, command.angular_z);
+        report.required_progress = std::max(
+            std::max(0.0f, config.odom_min_rotation_rad),
+            report.commanded_motion * command_ratio);
+    }
+
+    report.motion_confirmed =
+        report.signed_progress >= report.required_progress;
+    if (report.motion_confirmed) {
+        report.detail = "odometry confirmed commanded motion";
+    } else {
+        report.detail = "odometry did not confirm commanded motion";
+    }
+    return report;
+}
+
+bool IsMobileBaseDirectionReversal(
+    const MobileBaseAlignmentCommand& previous,
+    const MobileBaseAlignmentCommand& current) {
+    if (previous.type != current.type ||
+        previous.type == MobileBaseAlignmentCommand::Type::NONE) {
+        return false;
+    }
+    if (current.type == MobileBaseAlignmentCommand::Type::DRIVE) {
+        return previous.linear_x * current.linear_x < 0.0f;
+    }
+    return previous.angular_z * current.angular_z < 0.0f;
+}
+
 MobileBaseController::MobileBaseController(
     const MobileBaseAlignmentConfig& config)
     : config_(config) {}
@@ -266,7 +349,12 @@ bool MobileBaseController::Init() {
 
 GraspResult MobileBaseController::Execute(
     const MobileBaseAlignmentCommand& command) {
+    SetLastMotionReport(MobileBaseMotionReport{});
     if (command.type == MobileBaseAlignmentCommand::Type::NONE) {
+        MobileBaseMotionReport report;
+        report.motion_confirmed = true;
+        report.detail = "no chassis motion requested";
+        SetLastMotionReport(report);
         return GraspResult::SUCCESS;
     }
     if (!config_.enabled) {
@@ -297,8 +385,11 @@ GraspResult MobileBaseController::Execute(
     chassis_pose_t before_pose = {};
     const bool have_before_odom =
         ReadOdom(chassis, before_velocity, before_pose);
+    std::optional<MobileBaseOdometry> before_odom;
     if (have_before_odom) {
         PrintOdom("before", before_velocity, before_pose);
+        before_odom = MobileBaseOdometry{
+            before_pose.x, before_pose.y, before_pose.yaw};
     }
 
     const auto deadline = std::chrono::steady_clock::now() +
@@ -327,8 +418,11 @@ GraspResult MobileBaseController::Execute(
 
     chassis_velocity_t after_velocity = {};
     chassis_pose_t after_pose = {};
+    std::optional<MobileBaseOdometry> after_odom;
     if (ReadOdom(chassis, after_velocity, after_pose)) {
         PrintOdom("after", after_velocity, after_pose);
+        after_odom = MobileBaseOdometry{
+            after_pose.x, after_pose.y, after_pose.yaw};
         if (have_before_odom) {
             std::cout << "[MobileBase] Odom delta: dx="
                     << after_pose.x - before_pose.x
@@ -338,8 +432,38 @@ GraspResult MobileBaseController::Execute(
         }
     }
 
+    const MobileBaseMotionReport report = EvaluateMobileBaseMotion(
+        config_, command, before_odom, after_odom);
+    SetLastMotionReport(report);
+    std::cout << "[MobileBase] Motion report: odom="
+            << (report.odometry_available ? "available" : "unavailable")
+            << " commanded=" << report.commanded_motion
+            << " measured=" << report.signed_progress
+            << " required=" << report.required_progress
+            << " result="
+            << (report.motion_confirmed ? "CONFIRMED" : "UNCONFIRMED")
+            << std::endl;
+    if (report.odometry_available && !report.motion_confirmed) {
+        std::cout
+            << "[MobileBase] " << report.detail
+            << "; continuing with visual confirmation after the chassis "
+            << "has stopped"
+            << std::endl;
+    }
+
     return GraspResult::SUCCESS;
 #endif
+}
+
+MobileBaseMotionReport MobileBaseController::LastMotionReport() const {
+    std::lock_guard<std::mutex> lock(motion_report_mutex_);
+    return last_motion_report_;
+}
+
+void MobileBaseController::SetLastMotionReport(
+    const MobileBaseMotionReport& report) {
+    std::lock_guard<std::mutex> lock(motion_report_mutex_);
+    last_motion_report_ = report;
 }
 
 void MobileBaseController::Brake() {

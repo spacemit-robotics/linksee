@@ -24,6 +24,62 @@ import check_runtime_env  # noqa: E402
 
 
 class RuntimeEnvDiagnosticsTest(unittest.TestCase):
+    def test_hand_eye_calibration_selects_camera_backend(self):
+        root = {
+            "calibration": {
+                "realsense": {
+                    "T_base_camera": {
+                        "translation": [0.1, 0.2, 0.3],
+                        "rotation": [0.4, 0.5, 0.6],
+                    },
+                },
+                "spacemit_las2": {
+                    "T_base_camera": {
+                        "translation": [1.1, 1.2, 1.3],
+                        "rotation": [1.4, 1.5, 1.6],
+                    },
+                },
+            },
+        }
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            ok = check_runtime_env.check_hand_eye_calibration(
+                root, "realsense")
+
+        self.assertTrue(ok)
+        self.assertIn(
+            "calibration.realsense.T_base_camera", output.getvalue())
+
+    def test_hand_eye_calibration_rejects_missing_backend(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            ok = check_runtime_env.check_hand_eye_calibration(
+                {"calibration": {}}, "spacemit_las2")
+
+        self.assertFalse(ok)
+        self.assertIn(
+            "calibration.spacemit_las2.T_base_camera",
+            output.getvalue())
+
+    def test_hand_eye_calibration_accepts_legacy_realsense_profile(self):
+        root = {
+            "calibration": {
+                "T_base_camera": {
+                    "translation": [0.1, 0.2, 0.3],
+                    "rotation": [0.4, 0.5, 0.6],
+                },
+            },
+        }
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            ok = check_runtime_env.check_hand_eye_calibration(
+                root, "realsense")
+
+        self.assertTrue(ok)
+        self.assertIn("legacy shared profile", output.getvalue())
+
     def test_hardware_aec_does_not_require_software_library(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -515,6 +571,14 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
                 "type": "spacemit_las2",
                 "spacemit_las2": {},
             },
+            "calibration": {
+                "spacemit_las2": {
+                    "T_base_camera": {
+                        "translation": [0.0, 0.0, 0.0],
+                        "rotation": [0.0, 0.0, 0.0],
+                    },
+                },
+            },
             "manipulator": {"uart_device": "/dev/ttyACM1"},
             "mobile_base": {"enabled": False},
         }
@@ -711,6 +775,14 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
     def test_main_checks_mobile_base_serial_device(self):
         config = {
             "camera": {"type": "realsense", "realsense": {}},
+            "calibration": {
+                "realsense": {
+                    "T_base_camera": {
+                        "translation": [0.0, 0.0, 0.0],
+                        "rotation": [0.0, 0.0, 0.0],
+                    },
+                },
+            },
             "manipulator": {"uart_device": "/dev/ttyACM2"},
             "mobile_base": {
                 "enabled": True,
@@ -760,6 +832,14 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
     def test_main_checks_rpmsg_base_without_serial_base_suggestion(self):
         config = {
             "camera": {"type": "realsense", "realsense": {}},
+            "calibration": {
+                "realsense": {
+                    "T_base_camera": {
+                        "translation": [0.0, 0.0, 0.0],
+                        "rotation": [0.0, 0.0, 0.0],
+                    },
+                },
+            },
             "manipulator": {"uart_device": "/dev/ttyACM2"},
             "mobile_base": {
                 "enabled": True,

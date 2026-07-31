@@ -14,9 +14,13 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 EXECUTOR_CPP = ROOT / "src" / "grasp_executor.cpp"
+EXECUTOR_GRIPPER_CPP = ROOT / "src" / "grasp_executor_gripper.cpp"
+EXECUTOR_RUNTIME_CPP = ROOT / "src" / "grasp_executor_runtime.cpp"
 EXECUTOR_HEADER = ROOT / "include" / "grasp_executor.h"
 GEOMETRY_HEADER = ROOT / "include" / "grasp_geometry.h"
 PIPELINE_CPP = ROOT / "src" / "grasp_pipeline.cpp"
+PIPELINE_EXECUTION_CPP = ROOT / "src" / "grasp_pipeline_execution.cpp"
+PIPELINE_DEBUG_WRITER_CPP = ROOT / "src" / "pipeline_debug_writer.cpp"
 GEOMETRY_CPP = ROOT / "src" / "grasp_geometry.cpp"
 MAIN_CPP = ROOT / "src" / "main.cpp"
 DEBUG_LOCALIZE_CPP = ROOT / "tools" / "debug_localize.cpp"
@@ -40,10 +44,20 @@ def _function_body(source: str, signature: str) -> str:
 class GripperSafetySourceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.executor = EXECUTOR_CPP.read_text(encoding="utf-8")
+        cls.executor = (
+            EXECUTOR_CPP.read_text(encoding="utf-8")
+            + EXECUTOR_GRIPPER_CPP.read_text(encoding="utf-8")
+            + EXECUTOR_RUNTIME_CPP.read_text(encoding="utf-8")
+        )
         cls.header = EXECUTOR_HEADER.read_text(encoding="utf-8")
         cls.geometry_header = GEOMETRY_HEADER.read_text(encoding="utf-8")
-        cls.pipeline = PIPELINE_CPP.read_text(encoding="utf-8")
+        cls.pipeline = (
+            PIPELINE_CPP.read_text(encoding="utf-8")
+            + PIPELINE_EXECUTION_CPP.read_text(encoding="utf-8")
+        )
+        cls.pipeline_debug_writer = PIPELINE_DEBUG_WRITER_CPP.read_text(
+            encoding="utf-8"
+        )
         cls.geometry = GEOMETRY_CPP.read_text(encoding="utf-8")
         cls.main = MAIN_CPP.read_text(encoding="utf-8")
         cls.debug_localize = DEBUG_LOCALIZE_CPP.read_text(encoding="utf-8")
@@ -51,7 +65,7 @@ class GripperSafetySourceTest(unittest.TestCase):
 
     def test_empty_closed_baseline_is_used(self):
         self.assertIn("CaptureEmptyClosedPosition()", self.executor)
-        self.assertIn("empty_closed_position_", self.executor)
+        self.assertIn("gripper_baseline_", self.executor)
         self.assertIn("gripper_empty_position_margin", self.executor)
         baseline = _function_body(
             self.executor,
@@ -59,22 +73,25 @@ class GripperSafetySourceTest(unittest.TestCase):
         )
         release = _function_body(
             self.executor, "GraspResult GraspExecutor::ReleaseObject")
-        self.assertIn("std::isfinite(empty_closed_position_)", baseline)
+        self.assertIn("std::vector<GripperFeedbackSample>", baseline)
+        self.assertIn("EstimateGripperBaseline(samples)", baseline)
+        self.assertIn("position_median", baseline)
+        self.assertIn("position_mad", baseline)
+        self.assertIn("load_median", baseline)
+        self.assertIn("load_mad", baseline)
         self.assertIn("gripper_hold_load_threshold", baseline)
-        self.assertIn("empty_closed_position_ = NAN", release)
+        self.assertIn(
+            "gripper_baseline_ = GripperBaseline{}", release)
 
     def test_grasp_confirmation_uses_sustained_contact_feedback(self):
         self.assertNotIn("Grasp inferred from sustained load", self.executor)
         self.assertNotIn("state_or_baseline_confirmed", self.executor)
-        self.assertIn("load_holding_count >= required_holding", self.executor)
-        self.assertIn("opening_indicates_object", self.executor)
+        self.assertIn("EvaluateGripperHolding(", self.executor)
+        self.assertIn("GripperHoldingConfig holding_config", self.executor)
         self.assertIn(
-            "if (cur_position > min_object_position &&",
-            self.executor,
-        )
-        self.assertNotIn(
-            "if (state == GRASP_STATE_HOLDING &&\n"
-            "                cur_position > min_object_position",
+            "GripperHoldingResult::HOLDING", self.executor)
+        self.assertIn(
+            "state == GRASP_STATE_HOLDING",
             self.executor,
         )
         self.assertIn("maximum_checks", self.executor)
@@ -91,12 +108,32 @@ class GripperSafetySourceTest(unittest.TestCase):
     def test_grasp_is_verified_after_lift(self):
         self.assertIn('CheckGripperHolding("after_lift", true)', self.executor)
         self.assertIn("Object lost after lift", self.pipeline)
-
-    def test_release_opening_uses_position_control(self):
         self.assertIn(
-            "grasp_set_position(gripper_, config_.place_release_open)",
+            "possible-object state for safe recovery",
             self.executor,
         )
+        self.assertNotIn(
+            'GraspResult::EMPTY, "verify_grasp_after_lift",\n'
+            '            "holding evidence was inconclusive after lift"',
+            self.executor,
+        )
+
+    def test_gripper_diagnostics_include_baseline_and_joint_evidence(self):
+        writer = self.pipeline_debug_writer
+        self.assertIn('\\"decision\\"', writer)
+        self.assertIn('\\"opening_count\\"', writer)
+        self.assertIn('\\"contact_count\\"', writer)
+        self.assertIn('\\"empty_count\\"', writer)
+        self.assertIn('\\"baseline_sample_count\\"', writer)
+        self.assertIn('\\"empty_closed_position_mad\\"', writer)
+        self.assertIn('\\"empty_closed_load\\"', writer)
+        self.assertIn('\\"empty_closed_load_mad\\"', writer)
+
+    def test_release_opening_uses_position_control(self):
+        release = _function_body(
+            self.executor, "GraspResult GraspExecutor::ReleaseObject")
+        self.assertIn("grasp_set_position(", release)
+        self.assertIn("config_.place_release_open", release)
 
     def test_gripper_controls_are_in_release_config(self):
         grasp = self.config["grasp"]
@@ -119,22 +156,64 @@ class GripperSafetySourceTest(unittest.TestCase):
         self.assertNotIn('geometry_node["side_', self.main)
         self.assertNotIn('geometry["side_', self.debug_localize)
 
-    def test_removed_side_config_aliases_are_not_parsed(self):
-        self.assertNotIn(
-            "side_pregrasp_clearance_m",
-            self.geometry_header,
-        )
-        self.assertNotIn("side_pregrasp_clearance_m", self.main)
-        self.assertNotIn(
-            "side_pregrasp_clearance_m",
-            self.debug_localize,
-        )
+    def test_side_entry_clearance_is_loaded_as_an_independent_parameter(self):
+        self.assertIn("side_entry_clearance_m", self.geometry_header)
+        self.assertIn('side["entry_clearance_m"]', self.main)
+        self.assertIn('side["entry_clearance_m"]', self.debug_localize)
         self.assertNotIn('geometry["strategy"]', self.debug_localize)
 
-    def test_top_grasp_uses_constrained_yaw_execution_path(self):
-        self.assertNotIn("validated_top_pre_grasp_joints_", self.executor)
-        self.assertNotIn("validated_top_grasp_joints_", self.executor)
-        self.assertNotIn("SolveTopIKWithYaw", self.executor)
+    def test_top_grasp_uses_prevalidated_cartesian_joint_path(self):
+        validate = _function_body(
+            self.executor, "GraspResult GraspExecutor::ValidateGraspPoses")
+        plan = _function_body(
+            self.executor, "GraspResult GraspExecutor::PlanTopJointPath")
+        solve = _function_body(
+            self.executor, "GraspResult GraspExecutor::SolveIKConstrained")
+        execute = _function_body(
+            self.executor,
+            "GraspResult GraspExecutor::MoveAlongValidatedTopPath",
+        )
+        self.assertIn("top grasp descent and lift must remain vertical",
+                      validate)
+        self.assertIn("kTopCartesianStepM", validate)
+        self.assertIn("PlanTopJointPath(", validate)
+        self.assertIn("validated_top_joint_path_", validate)
+        self.assertIn("SolveIKConstrained(", plan)
+        self.assertIn("ApplyWristYaw(", plan)
+        self.assertIn("BuildCollisionSafeJointPath(", plan)
+        self.assertIn("ValidateJointPathSafety(", plan)
+        self.assertIn("const int arm_joint_count", solve)
+        self.assertIn("j < arm_joint_count", solve)
+        self.assertIn("ExecuteContinuousJointPath(", execute)
+        self.assertIn("validated_top_path_index_", execute)
+        self.assertIn(
+            "accepted from measured pose despite joint",
+            execute,
+        )
+        self.assertIn(
+            "settling timeout",
+            execute,
+        )
+        self.assertIn(
+            "move_result == GraspResult::TIMEOUT",
+            execute,
+        )
+        self.assertIn("VerifyPoseReached(action, target_pose)", execute)
+        self.assertIn(
+            "kTopGraspJointToleranceRad = 0.020f",
+            self.executor,
+        )
+        self.assertIn("last_motion_wait_detail_", execute)
+        self.assertIn(
+            "kTopLiftJointToleranceRad = 0.060f",
+            self.executor,
+        )
+        move_to_grasp = _function_body(
+            self.executor, "GraspResult GraspExecutor::MoveToGrasp")
+        lift = _function_body(
+            self.executor, "GraspResult GraspExecutor::LiftFromGrasp")
+        self.assertIn("kTopGraspJointToleranceRad", move_to_grasp)
+        self.assertIn("kTopLiftJointToleranceRad", lift)
 
     def test_predefined_joint_poses_are_checked_against_limits(self):
         self.assertIn("validate_joint_pose", self.main)
@@ -252,6 +331,78 @@ class GripperSafetySourceTest(unittest.TestCase):
         self.assertIn("continuous synchronized progress", normalized)
         self.assertIn("ExecuteContinuousJointPath", coordinated)
         self.assertIn("kObserveFinalJointToleranceRad", coordinated)
+        self.assertNotIn("kFourthJointLeadProgress", coordinated)
+
+    def test_home_motion_skips_only_when_current_pose_is_already_home(self):
+        home = _function_body(
+            self.executor, "GraspResult GraspExecutor::MoveToHome")
+        current_index = home.find("GetCurrentJoints(current_joints)")
+        no_op_index = home.find("already within home tolerance")
+        safe_move_index = home.find("MoveToJointsCollisionSafe")
+        self.assertGreaterEqual(current_index, 0)
+        self.assertGreaterEqual(no_op_index, 0)
+        self.assertGreaterEqual(safe_move_index, 0)
+        self.assertLess(current_index, no_op_index)
+        self.assertLess(no_op_index, safe_move_index)
+        self.assertIn(
+            "config_.home_joints, true",
+            " ".join(home.split()),
+        )
+        self.assertIn("kHomeNoOpToleranceRad = 0.12f", home)
+
+    def test_unused_direct_cartesian_motion_interfaces_are_removed(self):
+        self.assertNotIn("GraspExecutor::MoveToPose(", self.executor)
+        self.assertNotIn("GraspExecutor::MoveLinear(", self.executor)
+        self.assertNotIn("manip_move_target(", self.executor)
+        self.assertNotIn("manip_move_line(", self.executor)
+
+    def test_top_ik_uses_five_arm_joint_seed_deterministically(self):
+        constrained = _function_body(
+            self.executor, "GraspResult GraspExecutor::SolveIKConstrained")
+        self.assertIn("std::mt19937 rng(0x5A17u)", constrained)
+        self.assertIn(
+            "static_cast<size_t>(arm_joint_count)",
+            constrained,
+        )
+        self.assertIn("trial <= 1", constrained)
+        self.assertIn("config_.observe_joints", constrained)
+        self.assertIn(
+            "config_.collision_avoidance.shoulder_threshold",
+            constrained,
+        )
+        self.assertNotIn(
+            "seed_joints->size() >= static_cast<size_t>(n_joints)",
+            constrained,
+        )
+        self.assertIn("candidate_validator(candidate)", constrained)
+
+        top_path = _function_body(
+            self.executor, "GraspResult GraspExecutor::PlanTopJointPath")
+        self.assertIn("const auto candidate_validator", top_path)
+        self.assertIn("BuildCollisionSafeJointPath(", top_path)
+        self.assertIn("ValidateJointPathSafety(", top_path)
+        self.assertIn("PosesMatch(poses[index]", top_path)
+        self.assertIn(
+            "solved_joints = joint_path[previous_index]",
+            top_path,
+        )
+        validator_index = top_path.find("const auto candidate_validator")
+        solve_index = top_path.find("SolveIKConstrained(")
+        continuity_index = top_path.find(
+            "kMaximumWaypointJointDeltaRad",
+            validator_index,
+        )
+        self.assertGreater(continuity_index, validator_index)
+        self.assertLess(continuity_index, solve_index)
+
+    def test_body_collision_route_rotates_before_folding_shoulder(self):
+        route = _function_body(
+            self.executor,
+            "GraspResult GraspExecutor::BuildCollisionSafeJointPath",
+        )
+        self.assertIn("rotate_base[0] = target_j0", route)
+        self.assertIn("lift_shoulder[0] = target_j0", route)
+        self.assertNotIn("safe_joint0", route)
 
     def test_side_observation_uses_continuous_fourth_joint_lead(self):
         side_observe = _function_body(
@@ -282,6 +433,9 @@ class GripperSafetySourceTest(unittest.TestCase):
         self.assertIn("PipelineState::OBSERVING", retry)
         self.assertIn("RetryRecoverableMotion", approaching)
         self.assertIn("RetryRecoverableMotion", grasping)
+        self.assertIn('"Grasp action timeout"', grasping)
+        self.assertIn('"Grasp action failed"', grasping)
+        self.assertNotIn('"Gripper close timeout"', grasping)
         self.assertNotIn("target out of workspace", self.pipeline)
 
     def test_workspace_filter_runs_after_mobile_base_alignment(self):
@@ -321,15 +475,20 @@ class GripperSafetySourceTest(unittest.TestCase):
 
         self.assertIn("SetState(PipelineState::DETECTING", trigger)
         self.assertNotIn("SetState(PipelineState::OBSERVING", trigger)
-        strategy_index = planning.find(
-            "observation_strategy_selected_ = true")
-        observe_index = planning.find("PipelineState::OBSERVING")
         base_alignment_index = planning.find("PlanMobileBaseAlignment")
+        strategy_index = planning.find(
+            "observation_strategy_selected_ = true",
+            base_alignment_index,
+        )
+        observe_index = planning.find(
+            "PipelineState::OBSERVING",
+            strategy_index,
+        )
         self.assertGreaterEqual(strategy_index, 0)
         self.assertGreaterEqual(observe_index, 0)
         self.assertGreaterEqual(base_alignment_index, 0)
+        self.assertLess(base_alignment_index, strategy_index)
         self.assertLess(strategy_index, observe_index)
-        self.assertLess(observe_index, base_alignment_index)
         self.assertIn("matches_observation_strategy", planning)
         self.assertIn("executor_->MoveToSideObserve()", observing)
         self.assertIn("executor_->MoveToObserve()", observing)
@@ -352,25 +511,35 @@ class GripperSafetySourceTest(unittest.TestCase):
         self.assertGreaterEqual(homing_index, 0)
         self.assertIn("config_.auto_loop", placing)
         self.assertIn("if (config_.auto_loop)", detecting)
-        self.assertIn("staying in DETECTING without returning home", detecting)
+        self.assertIn("is temporarily unavailable; waiting at the", detecting)
+        self.assertNotIn("Waiting for next", detecting)
         target_index = restart.find(
             "const std::string target = auto_loop_target_label_")
-        strategy_index = restart.find(
-            "const GraspStrategy grasp_strategy = grasp_strategy_")
         reset_index = restart.find("ResetTaskState()")
         restore_index = restart.find("target_label_ = target")
-        restore_strategy_index = restart.find(
-            "grasp_strategy_ = grasp_strategy")
         timing_index = restart.find("BeginTaskTiming()")
         detecting_index = restart.find("PipelineState::DETECTING")
         self.assertLess(target_index, reset_index)
-        self.assertLess(strategy_index, reset_index)
         self.assertLess(reset_index, restore_index)
-        self.assertLess(reset_index, restore_strategy_index)
         self.assertLess(restore_index, timing_index)
-        self.assertLess(restore_strategy_index, timing_index)
         self.assertLess(timing_index, detecting_index)
+        self.assertNotIn(
+            "const GraspStrategy grasp_strategy = grasp_strategy_", restart)
+        self.assertNotIn("grasp_strategy_ = grasp_strategy", restart)
         self.assertIn("[Loop] START iteration=", restart)
+        self.assertIn("Loop: detecting stable target", restart)
+        self.assertNotIn("auto_loop_rearm_required_", restart)
+        self.assertNotIn("auto_loop_rearm_required_", detecting)
+        self.assertNotIn("kAutoLoopRearmAbsentFrames", detecting)
+        self.assertNotIn("previous target cleared", detecting)
+
+    def test_candidate_score_records_ik_margin_after_validation(self):
+        planning = _function_body(
+            self.pipeline, "void GraspPipeline::HandlePlanning")
+        self.assertIn(
+            "diagnostics.validation_min_joint_margin_rad", planning)
+        self.assertIn("candidate.ik_margin_rad", planning)
+        self.assertIn("candidate.score += 0.10f", planning)
 
     def test_auto_loop_returns_to_matching_observation_pose(self):
         homing = _function_body(
@@ -384,6 +553,10 @@ class GripperSafetySourceTest(unittest.TestCase):
     def test_low_profile_top_recovery_keeps_side_geometry_strict(self):
         planning = _function_body(
             self.pipeline, "void GraspPipeline::HandlePlanning")
+        resolve_top_support = _function_body(
+            self.pipeline,
+            "bool GraspPipeline::ResolveTopSupportPlane",
+        )
 
         self.assertIn("kTopGeometryRecoveryAttempt", self.pipeline)
         self.assertIn(
@@ -397,11 +570,74 @@ class GripperSafetySourceTest(unittest.TestCase):
             "            last_valid_geometry_available_",
             planning,
         )
+        self.assertIn("BuildWorkspaceSupportPlane(", resolve_top_support)
+        self.assertIn(
+            '"3D grasp safety validation failed: support surface is invalid"',
+            planning,
+        )
         self.assertIn(
             "candidate_geometry.table.inlier_count >\n"
             "                result.geometry.table.inlier_count",
             self.geometry,
         )
+
+    def test_geometry_retry_limit_ends_the_current_iteration(self):
+        planning = _function_body(
+            self.pipeline, "void GraspPipeline::HandlePlanning")
+        error_index = planning.find(
+            '"3D grasp geometry failed: "')
+        self.assertGreaterEqual(error_index, 0)
+        self.assertNotIn(
+            '"No graspable 3D target; waiting at the observation "',
+            planning,
+        )
+        self.assertNotIn(
+            "config_.auto_loop &&\n"
+            "            !motion_geometry_confirmation_pending_",
+            planning,
+        )
+
+    def test_locked_observation_strategy_survives_geometry_noise(self):
+        planning = _function_body(
+            self.pipeline, "void GraspPipeline::HandlePlanning")
+
+        unavailable_index = planning.find("if (!preferred_candidate)")
+        retry_index = planning.find(
+            "strategy temporarily unavailable; retaining")
+        error_index = planning.find(
+            "SetState(PipelineState::ERROR, message.str())",
+            unavailable_index,
+        )
+
+        self.assertGreaterEqual(unavailable_index, 0)
+        self.assertGreater(retry_index, unavailable_index)
+        self.assertGreater(error_index, retry_index)
+        self.assertIn(
+            "if (geometry_retry_count_ < kMaxGeometryAttempts)",
+            planning,
+        )
+        self.assertNotIn(
+            "strategy remains unavailable; retaining the", planning)
+        self.assertIn("target_track_ = TargetTrack{}", planning)
+        reset_index = planning.find("geometry_retry_count_ = 0;")
+        selection_index = planning.find(
+            "Observation strategy selected after base ")
+        self.assertGreaterEqual(reset_index, 0)
+        self.assertGreater(selection_index, reset_index)
+
+    def test_strategy_selection_waits_for_stationary_visual_target(self):
+        detecting = _function_body(
+            self.pipeline, "void GraspPipeline::HandleDetecting")
+
+        stationary_index = detecting.find("AreTargetTracksStationary(")
+        planning_index = detecting.find(
+            "PipelineState::PLANNING", stationary_index)
+        self.assertGreaterEqual(stationary_index, 0)
+        self.assertGreater(planning_index, stationary_index)
+        self.assertIn("target_stationary_confirmed_", detecting)
+        self.assertIn("config_.detect_stable_frames", detecting)
+        self.assertIn("Target moved; waiting for it to settle", detecting)
+        self.assertNotIn("ConfirmStrategyGeometry(", self.pipeline)
 
     def test_side_approach_uses_cartesian_waypoints(self):
         validate = _function_body(
@@ -424,12 +660,8 @@ class GripperSafetySourceTest(unittest.TestCase):
             "                grasp_pose, retreat_pose",
             validate,
         )
-        self.assertIn(
-            "const Pose3D poses[] = {pre_grasp_pose, grasp_pose}",
-            validate,
-        )
-        self.assertIn("SolveIKConstrained(", validate)
-        self.assertNotIn("SolveIKFast(", validate)
+        self.assertIn("kTopVerticalToleranceM", validate)
+        self.assertIn("PlanTopJointPath(", validate)
 
         cached_path = _function_body(
             self.executor, "bool GraspExecutor::TakeValidatedSidePath")
@@ -452,7 +684,8 @@ class GripperSafetySourceTest(unittest.TestCase):
         )
         self.assertIn("kStreamIntervalMs", execute)
         self.assertIn("kStreamVelocityScale", execute)
-        self.assertIn("ClampJointsToLimits", execute)
+        self.assertIn("ValidateJointPathSafety(", execute)
+        self.assertNotIn("ClampJointsToLimits", execute)
         self.assertEqual(execute.count("WaitMotionDone("), 1)
 
         lift = _function_body(
@@ -468,14 +701,85 @@ class GripperSafetySourceTest(unittest.TestCase):
             lift,
         )
 
+    def test_side_staging_and_precise_entry_use_separate_tolerances(self):
+        pre_grasp = _function_body(
+            self.executor,
+            "GraspResult GraspExecutor::MoveToSidePreGrasp",
+        )
+        self.assertIn(
+            "kSideStagingJointToleranceRad = 0.080f",
+            self.executor,
+        )
+        staging_index = pre_grasp.find(
+            "{staging_joints, sweep_joints}")
+        staging_tolerance_index = pre_grasp.find(
+            "kSideStagingJointToleranceRad", staging_index)
+        entry_index = pre_grasp.find(
+            "{validated_side_entry_joints_}")
+        entry_tolerance_index = pre_grasp.find(
+            "config_.side_waypoint_joint_tolerance_rad",
+            entry_index,
+        )
+        self.assertGreaterEqual(staging_index, 0)
+        self.assertGreater(staging_tolerance_index, staging_index)
+        self.assertGreater(entry_index, staging_tolerance_index)
+        self.assertGreater(entry_tolerance_index, entry_index)
+        self.assertIn(
+            "side staging and joint0 sweep completion timeout",
+            pre_grasp,
+        )
+        self.assertIn(
+            "elevated side entry completion timeout",
+            pre_grasp,
+        )
+
+    def test_side_entry_timeout_requires_a_measured_safe_pose(self):
+        pre_grasp = _function_body(
+            self.executor,
+            "GraspResult GraspExecutor::MoveToSidePreGrasp",
+        )
+        self.assertIn(
+            "kMaximumEntryHeightShortfallM = 0.010f",
+            pre_grasp,
+        )
+        self.assertIn(
+            "kMaximumEntryPlanarErrorM = 0.030f",
+            pre_grasp,
+        )
+        self.assertIn(
+            "result == GraspResult::TIMEOUT",
+            pre_grasp,
+        )
+        self.assertIn("GetCurrentPose(actual_pose)", pre_grasp)
+        self.assertIn("actual_pose.z >= minimum_safe_z", pre_grasp)
+        self.assertIn(
+            "planar_error <= kMaximumEntryPlanarErrorM",
+            pre_grasp,
+        )
+        self.assertIn(
+            "side elevated entry accepted",
+            pre_grasp,
+        )
+        self.assertIn(
+            "for Cartesian correction despite joint",
+            pre_grasp,
+        )
+        correction_index = pre_grasp.find(
+            "CorrectSidePose(")
+        safe_acceptance_index = pre_grasp.find(
+            "side elevated entry accepted")
+        self.assertGreater(correction_index, safe_acceptance_index)
+
     def test_side_grasp_safety_controls_are_configurable(self):
         top = self.config["grasp"]["top"]
         side = self.config["grasp"]["side"]
         workspace = self.config["grasp"]["workspace"]
         manipulator = self.config["manipulator"]
-        self.assertEqual(side["approach_distance_m"], 0.03)
+        self.assertEqual(side["approach_distance_m"], 0.02)
+        self.assertEqual(side["entry_clearance_m"], 0.03)
         self.assertIn("pregrasp_min_x_m", side)
-        self.assertIn("gripper_offset_m", side)
+        self.assertEqual(side["gripper_offset_m"], 0.01)
+        self.assertEqual(side["grasp_forward_offset_m"], 0.02)
         self.assertIn("grasp_point_x_ratio", top)
         self.assertEqual(side["initial_lift_m"], 0.05)
         self.assertLess(workspace["z_min"], workspace["z_max"])
@@ -487,12 +791,68 @@ class GripperSafetySourceTest(unittest.TestCase):
         self.assertEqual(len(manipulator["side_ready_joints"]), 5)
         self.assertEqual(len(manipulator["joint_limits"]), 5)
 
+    def test_predefined_poses_are_inside_joint_limits(self):
+        manipulator = self.config["manipulator"]
+        limits = {
+            item["joint"]: (item["min"], item["max"])
+            for item in manipulator["joint_limits"]
+        }
+        poses = {
+            "home_joints": manipulator["home_joints"],
+            "observe_joints": manipulator["observe_joints"],
+            "side_ready_joints": manipulator["side_ready_joints"],
+            "place_joints": self.config["place"]["place_joints"],
+        }
+        for pose_name, joints in poses.items():
+            self.assertEqual(len(joints), len(limits), pose_name)
+            for joint, value in enumerate(joints):
+                lower, upper = limits[joint]
+                self.assertGreaterEqual(value, lower, f"{pose_name}[{joint}]")
+                self.assertLessEqual(value, upper, f"{pose_name}[{joint}]")
+
     def test_collision_avoidance_bounds_gravity_drift(self):
-        self.assertIn("ClampJointsToLimits", self.executor)
-        self.assertIn("bounded_current_joints", self.executor)
-        self.assertIn(
-            "std::vector<float> step1_joints = bounded_current_joints",
+        move = _function_body(
             self.executor,
+            "GraspResult GraspExecutor::MoveToJointsCollisionSafe",
+        )
+        build = _function_body(
+            self.executor,
+            "GraspResult GraspExecutor::BuildCollisionSafeJointPath",
+        )
+        unavailable_index = move.find(
+            "if (!GetCurrentJoints(current_joints))")
+        path_index = move.find("BuildCollisionSafeJointPath(")
+        validation_index = build.find("ValidateJointPathSafety(")
+        command_index = move.find("MoveToJoints(path[index])")
+        self.assertGreaterEqual(unavailable_index, 0)
+        self.assertLess(unavailable_index, path_index)
+        self.assertGreaterEqual(validation_index, 0)
+        self.assertGreaterEqual(command_index, 0)
+        self.assertIn("ClampJointsToLimits(", build)
+        self.assertNotIn("bounded_current_joints != start_joints", build)
+        self.assertNotIn(
+            "return MoveToJoints(target_joints)", move[:path_index])
+
+    def test_joint_commands_only_tolerate_motion_back_into_limits(self):
+        move = _function_body(
+            self.executor,
+            "GraspResult GraspExecutor::MoveToJoints("
+            "const std::vector<float>& joints)")
+        correction = _function_body(
+            self.executor, "bool JointCommandMovesTowardLimits")
+        self.assertIn("JointCommandMovesTowardLimits(", move)
+        self.assertIn(
+            "kMeasuredJointLimitToleranceRad = 0.05f", move)
+        self.assertIn('"move_to_joints"', move)
+        self.assertIn("target >= measured", correction)
+        self.assertIn("target <= measured", correction)
+        self.assertIn(
+            "measured >= limit.min_rad - measured_tolerance_rad",
+            correction,
+        )
+        self.assertIn(
+            "measured <= limit.max_rad + measured_tolerance_rad",
+            correction,
         )
 
     def test_small_base_correction_does_not_expand_to_collision_path(self):
@@ -520,14 +880,53 @@ class GripperSafetySourceTest(unittest.TestCase):
     def test_side_ik_keeps_bounded_orientation_error(self):
         solve = _function_body(
             self.executor, "GraspResult GraspExecutor::SolveIKSide")
-        self.assertIn("kMaxPositionErrorM = 0.004", solve)
-        self.assertIn("kMaxApproachErrorDeg = 25.0", solve)
-        self.assertIn("kMaxOpeningErrorDeg = 12.0", solve)
+        self.assertIn("kMaxPositionErrorM = 0.006", solve)
+        self.assertIn("kMaxApproachErrorDeg = 30.0", solve)
+        self.assertIn("kMaxOpeningErrorDeg = 15.0", solve)
+        self.assertIn("kOrientationBoundarySlackDeg = 0.5", solve)
+        self.assertIn(
+            "kMaxOpeningErrorDeg + kOrientationBoundarySlackDeg",
+            solve,
+        )
         self.assertIn("arm_path_safety_->CheckPath", solve)
+
+    def test_soft_timing_limits_do_not_reject_safe_motion(self):
+        self.assertIn(
+            "EffectiveMotionTargetToleranceRad",
+            self.executor,
+        )
+        self.assertIn(
+            "settled boundary slack",
+            self.executor,
+        )
+        self.assertIn(
+            'within_perception_budget ? "SUCCESS" : "OVERRUN"',
+            self.pipeline,
+        )
+        self.assertIn(
+            "continuing because workspace, IK and ",
+            self.pipeline,
+        )
+        self.assertNotIn(
+            "Perception and planning exceeded the configured budget",
+            self.pipeline,
+        )
+        self.assertIn(
+            "kMinimumCandidateValidationTimeoutMs = 750",
+            self.pipeline,
+        )
+        self.assertNotIn(
+            "planning deadline exceeded",
+            self.pipeline,
+        )
 
     def test_side_pose_correction_avoids_tolerance_edge_jitter(self):
         correction = _function_body(
             self.executor, "GraspResult GraspExecutor::CorrectSidePose")
+        self.assertIn(
+            "kSideCorrectionJointToleranceRad = 0.080f",
+            self.executor,
+        )
         self.assertIn("kCorrectionToleranceRatio", correction)
         self.assertIn("error <= correction_tolerance", correction)
         self.assertIn(
@@ -538,6 +937,10 @@ class GripperSafetySourceTest(unittest.TestCase):
         self.assertIn("pose.y - actual_pose.y", correction)
         self.assertIn("pose.z - actual_pose.z", correction)
         self.assertIn("{correction_pose}", correction)
+        self.assertIn(
+            "kSideCorrectionJointToleranceRad", correction)
+        self.assertIn("side correction ", correction)
+        self.assertIn("target_position_error=", correction)
 
     def test_top_and_side_pose_tolerances_are_isolated(self):
         self.assertIn(
@@ -566,9 +969,36 @@ class GripperSafetySourceTest(unittest.TestCase):
             "float place_joint_tolerance_rad = 0.080f", self.header)
         move_to_place = _function_body(
             self.executor, "GraspResult GraspExecutor::MoveToPlace")
+        self.assertRegex(
+            move_to_place,
+            r"WaitMotionDone\(\s*-1,\s*"
+            r"config_\.place_joint_tolerance_rad\)")
+
+    def test_top_path_accepts_settled_cartesian_target_without_timeout(self):
+        move = _function_body(
+            self.executor,
+            "GraspResult GraspExecutor::MoveAlongValidatedTopPath",
+        )
+        wait = _function_body(
+            self.executor,
+            "GraspResult GraspExecutor::WaitMotionDone",
+        )
         self.assertIn(
-            "WaitMotionDone(-1, config_.place_joint_tolerance_rad)",
-            move_to_place)
+            "VerifyPoseReached(action, target_pose)",
+            move,
+        )
+        self.assertIn(
+            "stable_counter == kStableCount",
+            wait,
+        )
+        self.assertIn(
+            "settled_acceptance()",
+            wait,
+        )
+        self.assertIn(
+            "motion_state=REACHED_BY_CARTESIAN_POSE",
+            wait,
+        )
 
 
 if __name__ == "__main__":

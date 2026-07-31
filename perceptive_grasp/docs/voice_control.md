@@ -8,7 +8,7 @@ perceptive grasp 通过本地语音桥接入自动语音识别（asr）和语音
 
 开始前完成以下准备工作：
 
-- 按[方案依赖](sdk_dependencies.md#7-准备语音模型可选)准备 vad、asr、tts和文本规范化资源。
+- 按[方案依赖](sdk_dependencies.md#7-准备语音模型可选)准备 vad、asr、tts 和文本规范化资源。
 - 完成 perceptive grasp 构建，并确认 `build/perceptive_grasp` 存在。
 - 连接麦克风和扬声器。
 

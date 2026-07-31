@@ -239,11 +239,14 @@ int main() {
         tall_geometry.center.x, tall_geometry.center.y);
     const float expected_approach_distance =
         config.side_approach_distance_m;
+    const float expected_lift_retreat_distance = std::max(
+        config.side_approach_distance_m,
+        config.side_lift_retreat_m);
     const float expected_entry_clearance_z =
         tall_geometry.table_center.z +
         tall_geometry.height_m +
         config.finger_half_height_m +
-        config.side_approach_distance_m;
+        config.side_entry_clearance_m;
     const cv::Point3f side_center =
         tall_geometry.table_center +
         tall_geometry.table.normal *
@@ -277,11 +280,25 @@ int main() {
         !Near(side.retreat_pose.y, side.grasp_pose.y, 1e-5f) ||
         !Near(side.retreat_pose.z,
             side.grasp_pose.z + config.side_initial_lift_m, 1e-5f) ||
-        !Near(side.lift_pose.x, side.pre_grasp_pose.x, 1e-5f) ||
-        !Near(side.lift_pose.y, side.pre_grasp_pose.y, 1e-5f) ||
+        !Near(side.lift_pose.x,
+            side.grasp_pose.x - side.approach_axis.x *
+                expected_lift_retreat_distance,
+            1e-5f) ||
+        !Near(side.lift_pose.y,
+            side.grasp_pose.y - side.approach_axis.y *
+                expected_lift_retreat_distance,
+            1e-5f) ||
         !Near(side.lift_pose.z,
             side.pre_grasp_pose.z + config.side_initial_lift_m, 1e-5f)) {
         std::cerr << "side grasp geometry is not radial or lift-safe"
+                    << std::endl;
+        return 1;
+    }
+    if (side.width_margin_m < 0.0f ||
+        side.depth_quality <= 0.0f ||
+        side.path_clearance_m <= 0.0f ||
+        !std::isfinite(side.workspace_margin_m)) {
+        std::cerr << "side candidate quality metrics are incomplete"
                     << std::endl;
         return 1;
     }
@@ -309,7 +326,7 @@ int main() {
         return 1;
     }
     GraspGeometryConfig changed_side_offset = config;
-    changed_side_offset.side_gripper_offset_m = 0.010f;
+    changed_side_offset.side_gripper_offset_m += 0.010f;
     const std::vector<GraspCandidate> shifted_side_candidates =
         GraspGeometryPlanner::GenerateCandidates(
             tall_geometry, tall_filtered, changed_side_offset,
@@ -344,6 +361,31 @@ int main() {
                     << std::endl;
         return 1;
     }
+    GraspGeometryConfig changed_entry_clearance = config;
+    changed_entry_clearance.side_entry_clearance_m += 0.020f;
+    const std::vector<GraspCandidate> elevated_side_candidates =
+        GraspGeometryPlanner::GenerateCandidates(
+            tall_geometry, tall_filtered, changed_entry_clearance,
+            planner_config);
+    if (elevated_side_candidates.empty() ||
+        elevated_side_candidates.front().strategy != GraspStrategy::SIDE ||
+        !Near(
+            elevated_side_candidates.front().entry_clearance_z_m,
+            side.entry_clearance_z_m + 0.020f, 1e-5f) ||
+        !Near(
+            elevated_side_candidates.front().pre_grasp_pose.x,
+            side.pre_grasp_pose.x, 1e-5f) ||
+        !Near(
+            elevated_side_candidates.front().pre_grasp_pose.y,
+            side.pre_grasp_pose.y, 1e-5f) ||
+        !Near(
+            elevated_side_candidates.front().grasp_pose.z,
+            side.grasp_pose.z, 1e-5f)) {
+        std::cerr
+            << "side entry clearance changed the grasp geometry contract"
+            << std::endl;
+        return 1;
+    }
 
     ObjectGeometry3D flat_geometry;
     std::vector<cv::Point3f> flat_filtered;
@@ -364,11 +406,18 @@ int main() {
         std::cerr << "flat object did not select top grasp only" << std::endl;
         return 1;
     }
-
+    if (flat_candidates.front().width_margin_m < 0.0f ||
+        flat_candidates.front().depth_quality <= 0.0f ||
+        flat_candidates.front().path_clearance_m <= 0.0f ||
+        !std::isfinite(flat_candidates.front().workspace_margin_m)) {
+        std::cerr << "top candidate quality metrics are incomplete"
+                    << std::endl;
+        return 1;
+    }
     ObjectGeometry3D cup_geometry;
     std::vector<cv::Point3f> cup_filtered;
     const std::vector<cv::Point3f> cup_box =
-        MakeBox(0.28f, 0.0f, 0.055f, 0.050f, 0.050f);
+        MakeBox(0.28f, 0.0f, 0.055f, 0.050f, 0.100f);
     if (!GraspGeometryPlanner::EstimateObjectGeometry(
             cup_box, table, config, cup_geometry, &cup_filtered, error)) {
         std::cerr << "cup geometry estimation failed: " << error
@@ -377,16 +426,15 @@ int main() {
     }
     const std::vector<GraspCandidate> cup_candidates =
         GraspGeometryPlanner::GenerateCandidates(
-            cup_geometry, cup_filtered, config, planner_config, "cup");
+            cup_geometry, cup_filtered, config, planner_config);
     if (cup_candidates.empty() ||
         cup_candidates.front().strategy != GraspStrategy::SIDE ||
         !cup_candidates.front().geometry_valid ||
         HasValidStrategy(cup_candidates, GraspStrategy::TOP)) {
-        std::cerr << "upright cup did not require a valid side grasp"
+        std::cerr << "upright geometry did not require a valid side grasp"
                     << std::endl;
         return 1;
     }
-
     ObjectGeometry3D far_cup_geometry = cup_geometry;
     far_cup_geometry.center.x += 0.35f;
     far_cup_geometry.table_center.x += 0.35f;
@@ -396,7 +444,7 @@ int main() {
     }
     const std::vector<GraspCandidate> far_cup_candidates =
         GraspGeometryPlanner::GenerateCandidates(
-            far_cup_geometry, far_cup_points, config, planner_config, "cup");
+            far_cup_geometry, far_cup_points, config, planner_config);
     if (far_cup_candidates.empty() ||
         far_cup_candidates.front().strategy != GraspStrategy::SIDE ||
         !far_cup_candidates.front().geometry_valid ||
@@ -641,6 +689,72 @@ int main() {
             sparse_container_result.candidates, GraspStrategy::SIDE)) {
         std::cerr << "sparse container silhouette geometry is invalid"
                     << std::endl;
+        return 1;
+    }
+
+    cv::Mat portrait_lie_depth(120, 160, CV_16UC1);
+    for (int y = 0; y < portrait_lie_depth.rows; ++y) {
+        const float ray_z =
+            0.8f + (static_cast<float>(y) - 60.0f) / 400.0f;
+        portrait_lie_depth.row(y).setTo(
+            static_cast<uint16_t>(std::lround(1000.0f / ray_z)));
+    }
+    cv::Mat portrait_lie_mask =
+        cv::Mat::zeros(portrait_lie_depth.size(), CV_8UC1);
+    const cv::Rect portrait_lie_region(64, 30, 33, 61);
+    portrait_lie_mask(portrait_lie_region).setTo(255);
+    for (int y = portrait_lie_region.y;
+        y < portrait_lie_region.y + portrait_lie_region.height; ++y) {
+        const float ray_z =
+            0.8f + (static_cast<float>(y) - 60.0f) / 400.0f;
+        portrait_lie_depth.row(y).colRange(
+            portrait_lie_region.x,
+            portrait_lie_region.x + portrait_lie_region.width).setTo(
+                static_cast<uint16_t>(std::lround(930.0f / ray_z)));
+    }
+    const cv::Rect portrait_lie_hollow(72, 48, 17, 25);
+    for (int y = portrait_lie_hollow.y;
+        y < portrait_lie_hollow.y + portrait_lie_hollow.height; ++y) {
+        const float ray_z =
+            0.8f + (static_cast<float>(y) - 60.0f) / 400.0f;
+        portrait_lie_depth.row(y).colRange(
+            portrait_lie_hollow.x,
+            portrait_lie_hollow.x + portrait_lie_hollow.width).setTo(
+                static_cast<uint16_t>(std::lround(1000.0f / ray_z)));
+    }
+
+    DetectionTarget portrait_lie_target;
+    portrait_lie_target.x1 =
+        static_cast<float>(portrait_lie_region.x);
+    portrait_lie_target.y1 =
+        static_cast<float>(portrait_lie_region.y);
+    portrait_lie_target.x2 = static_cast<float>(
+        portrait_lie_region.x + portrait_lie_region.width);
+    portrait_lie_target.y2 = static_cast<float>(
+        portrait_lie_region.y + portrait_lie_region.height);
+    portrait_lie_target.center = cv::Point2f(80.0f, 60.0f);
+    portrait_lie_target.label_name = "cup";
+    portrait_lie_target.mask = portrait_lie_mask;
+
+    GraspGeometryResult portrait_lie_result;
+    if (!sparse_container_planner.Plan(
+            portrait_lie_depth, portrait_lie_target,
+            oblique_camera, oblique_coordinate_planner,
+            portrait_lie_result)) {
+        std::cerr << "portrait lying-object planning failed: "
+                    << portrait_lie_result.error << std::endl;
+        return 1;
+    }
+    if (portrait_lie_result.geometry.length_m <=
+            portrait_lie_result.geometry.height_m ||
+        !HasValidStrategy(
+            portrait_lie_result.candidates, GraspStrategy::TOP) ||
+        HasValidStrategy(
+            portrait_lie_result.candidates, GraspStrategy::SIDE)) {
+        std::cerr
+            << "table-relative geometry did not override the upright "
+            << "silhouette"
+            << std::endl;
         return 1;
     }
 

@@ -46,6 +46,8 @@ public:
 
     std::int64_t LastFrameId() const override { return last_frame_id_; }
 
+    int DiscardQueuedFrames(int max_frames) override;
+
     void ResetAfterMotion() override;
 
     /**

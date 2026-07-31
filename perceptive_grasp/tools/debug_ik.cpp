@@ -27,7 +27,7 @@ struct Pose3D {
     float qw, qx, qy, qz;
 };
 
-struct AppConfig {
+struct DebugIkAppConfig {
     std::string config_path;
     Pose3D pose{0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
 };
@@ -46,8 +46,8 @@ struct ExecutorConfig {
     std::vector<JointConstraint> joint_constraints;
 };
 
-static AppConfig ParseArgs(int argc, char* argv[]) {
-    AppConfig cfg;
+static DebugIkAppConfig ParseArgs(int argc, char* argv[]) {
+    DebugIkAppConfig cfg;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if ((arg == "--help") || (arg == "-h")) {
@@ -106,7 +106,7 @@ static ExecutorConfig LoadExecutorConfig(const std::string& pipeline_config) {
 }
 
 int main(int argc, char* argv[]) {
-    AppConfig app = ParseArgs(argc, argv);
+    DebugIkAppConfig app = ParseArgs(argc, argv);
     if (app.config_path.empty()) {
         std::cerr << "[debug_ik] Error: --config is required" << std::endl;
         return 1;

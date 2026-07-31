@@ -13,6 +13,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 PIPELINE_CPP = ROOT / "src" / "grasp_pipeline.cpp"
+PIPELINE_EXECUTION_CPP = ROOT / "src" / "grasp_pipeline_execution.cpp"
+PIPELINE_RUNTIME_CPP = ROOT / "src" / "grasp_pipeline_runtime.cpp"
 
 
 def _function_body(source: str, signature: str) -> str:
@@ -32,7 +34,11 @@ def _function_body(source: str, signature: str) -> str:
 class PipelineVoiceReleaseOrderTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.source = PIPELINE_CPP.read_text(encoding="utf-8")
+        cls.source = (
+            PIPELINE_CPP.read_text(encoding="utf-8")
+            + PIPELINE_EXECUTION_CPP.read_text(encoding="utf-8")
+            + PIPELINE_RUNTIME_CPP.read_text(encoding="utf-8")
+        )
 
     def test_voice_cancel_queues_release_without_immediate_torque_drop(self):
         body = _function_body(
@@ -58,7 +64,7 @@ class PipelineVoiceReleaseOrderTest(unittest.TestCase):
         self.assertIn("return_to_home_pending_", cancel_body)
         self.assertNotIn("executor_->EmergencyStop()", cancel_body)
 
-    def test_cancel_while_holding_returns_home(self):
+    def test_cancel_while_holding_places_before_returning_home(self):
         body = _function_body(self.source, "void GraspPipeline::SpinOnce")
         cancel_match = re.search(
             r"if \(cancel_requested_\.exchange\(false\)\) "
@@ -68,12 +74,9 @@ class PipelineVoiceReleaseOrderTest(unittest.TestCase):
         )
         self.assertIsNotNone(cancel_match, "missing cancel branch")
         cancel_body = cancel_match.group("body")
-        self.assertIn(
-            "graceful_shutdown || object_may_be_held_.load()",
-            cancel_body,
-        )
-        self.assertIn("if (return_home)", cancel_body)
-        self.assertIn("return_to_home_pending_ = true", cancel_body)
+        self.assertIn("object_may_be_held_.load()", cancel_body)
+        self.assertIn("place_possible_object_pending_ = true", cancel_body)
+        self.assertIn("placing it before returning home", cancel_body)
 
     def test_stop_does_not_release_torque(self):
         body = _function_body(self.source, "void GraspPipeline::Stop")
@@ -151,10 +154,36 @@ class PipelineVoiceReleaseOrderTest(unittest.TestCase):
         self.assertNotIn("executor_->EmergencyStop()", request_body)
         self.assertIn("action_.cancelling = true", spin_body)
         self.assertIn("return_to_home_pending_", spin_body)
+        self.assertIn("place_possible_object_pending_", spin_body)
         self.assertIn("return_to_home_on_command", idle_body)
+        self.assertIn("place_possible_object_after_cancel", idle_body)
         self.assertIn("executor_->MoveToHome()", idle_body)
         self.assertIn("external_shutdown_requested()", run_body)
         self.assertIn("shutdown_requested_", run_body)
+
+    def test_plan_only_shutdown_never_sends_recovery_motion(self):
+        request_body = _function_body(
+            self.source,
+            "void GraspPipeline::RequestGracefulShutdown",
+        )
+        spin_body = _function_body(self.source, "void GraspPipeline::SpinOnce")
+        idle_body = _function_body(self.source, "void GraspPipeline::HandleIdle")
+
+        self.assertIn("config_.plan_only", request_body)
+        self.assertIn("plan-only mode without motion", request_body)
+        self.assertIn("if (config_.plan_only)", spin_body)
+        self.assertIn(
+            "Plan-only shutdown complete; exiting without motion",
+            spin_body,
+        )
+        self.assertIn("if (config_.plan_only)", idle_body)
+        home_pending = idle_body.find("if (return_to_home_pending_)")
+        plan_only_guard = idle_body.find("if (config_.plan_only)", home_pending)
+        return_home_action = idle_body.find(
+            "return_to_home_on_command", plan_only_guard)
+        self.assertGreaterEqual(home_pending, 0)
+        self.assertGreaterEqual(plan_only_guard, 0)
+        self.assertGreater(return_home_action, plan_only_guard)
 
     def test_home_failure_ends_with_error(self):
         idle_body = _function_body(self.source, "void GraspPipeline::HandleIdle")
@@ -187,7 +216,7 @@ class PipelineVoiceReleaseOrderTest(unittest.TestCase):
         self.assertIn("SetState(PipelineState::ERROR", recovery_body)
         self.assertNotIn("executor_->EmergencyStop()", recovery_body)
 
-    def test_held_object_failure_returns_home_and_stops_restart(self):
+    def test_held_object_failure_places_then_returns_home(self):
         grasp_body = _function_body(
             self.source,
             "void GraspPipeline::HandleGrasping",
@@ -200,6 +229,10 @@ class PipelineVoiceReleaseOrderTest(unittest.TestCase):
             self.source,
             "void GraspPipeline::HandleRecovering",
         )
+        safe_place_body = _function_body(
+            self.source,
+            "GraspResult GraspPipeline::PlacePossibleObjectAndReturnHome",
+        )
         spin_body = _function_body(self.source, "void GraspPipeline::SpinOnce")
 
         self.assertIn("object_may_be_held_.store(true)", grasp_body)
@@ -208,6 +241,17 @@ class PipelineVoiceReleaseOrderTest(unittest.TestCase):
         self.assertIn("const bool carrying_object", recovery_body)
         self.assertIn(
             "config_.auto_loop && !carrying_object", recovery_body)
+        self.assertIn("PlacePossibleObjectAndReturnHome()", recovery_body)
+        place_index = safe_place_body.find("executor_->MoveToPlace()")
+        release_index = safe_place_body.find("executor_->ReleaseObject()")
+        empty_index = safe_place_body.find(
+            "object_may_be_held_.store(false)")
+        close_index = safe_place_body.find("executor_->CloseGripper()")
+        home_index = safe_place_body.find("executor_->MoveToHome()")
+        self.assertLess(place_index, release_index)
+        self.assertLess(release_index, empty_index)
+        self.assertLess(empty_index, close_index)
+        self.assertLess(close_index, home_index)
         self.assertIn("shutdown_requested_.store(true)", recovery_body)
         self.assertIn("if (!object_may_be_held_.load())", spin_body)
 

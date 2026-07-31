@@ -39,6 +39,7 @@
 #include <opencv2/imgproc.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include "camera_calibration.h"
 #include "grasp_geometry.h"
 #include "grasp_planner.h"
 #include "stereo_camera.h"
@@ -64,7 +65,7 @@ static const cv::Scalar kColors[] = {
 };
 static constexpr int kNumColors = sizeof(kColors) / sizeof(kColors[0]);
 
-struct AppConfig {
+struct DebugLocalizeAppConfig {
     std::string config_path;
     std::string output_dir = "./debug_localize_output";
     std::string target_name;
@@ -154,8 +155,8 @@ static void SaveObjectPointCloud(
     }
 }
 
-static AppConfig ParseArgs(int argc, char* argv[]) {
-    AppConfig cfg;
+static DebugLocalizeAppConfig ParseArgs(int argc, char* argv[]) {
+    DebugLocalizeAppConfig cfg;
     cfg.config_path = kDefaultConfigPath;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -285,12 +286,9 @@ static GraspPlannerConfig LoadPlannerConfig(const std::string& pipeline_config) 
     YAML::Node root = YAML::LoadFile(pipeline_config);
     GraspPlannerConfig cfg;
 
-    auto t = root["calibration"]["T_base_camera"]["translation"];
-    auto r = root["calibration"]["T_base_camera"]["rotation"];
-    for (int i = 0; i < 3; ++i) {
-        cfg.t_base_camera[i] = t[i].as<float>();
-        cfg.r_base_camera[i] = r[i].as<float>();
-    }
+    const std::string camera_type =
+        root["camera"]["type"].as<std::string>("realsense");
+    perceptive_grasp::LoadCameraCalibration(root, camera_type, &cfg);
 
     const YAML::Node grasp = root["grasp"];
     const YAML::Node top = grasp["top"];
@@ -353,6 +351,9 @@ static GraspGeometryConfig LoadGeometryConfig(
         config.side_approach_distance_m =
             side["approach_distance_m"].as<float>(
                 config.side_approach_distance_m);
+        config.side_entry_clearance_m =
+            side["entry_clearance_m"].as<float>(
+                config.side_entry_clearance_m);
         config.side_pregrasp_min_x_m =
             side["pregrasp_min_x_m"].as<float>(
                 config.side_pregrasp_min_x_m);
@@ -372,8 +373,61 @@ static GraspGeometryConfig LoadGeometryConfig(
     return config;
 }
 
+static void SaveCaptureContext(
+    const DebugLocalizeAppConfig& app,
+    const StereoCameraConfig& camera_config) {
+    const fs::path output_dir = fs::absolute(app.output_dir);
+    const fs::path source_config = fs::absolute(app.config_path);
+    const fs::path config_snapshot =
+        output_dir / "pipeline_config_snapshot.yaml";
+    std::error_code copy_error;
+    fs::copy_file(
+        source_config, config_snapshot,
+        fs::copy_options::overwrite_existing, copy_error);
+    if (copy_error) {
+        throw std::runtime_error(
+            "failed to save pipeline config snapshot: " +
+            copy_error.message());
+    }
+
+    YAML::Node manifest;
+    manifest["format_version"] = 1;
+    manifest["camera_backend"] = camera_config.type;
+    manifest["source_config"] = source_config.string();
+    manifest["config_snapshot"] = config_snapshot.filename().string();
+    manifest["target_filter"] =
+        app.target_name.empty() ? "*" : app.target_name;
+    manifest["frames"] = app.num_frames;
+    manifest["warmup_frames"] = app.warmup_frames;
+    manifest["coordinate_frame"]["object_cloud"] = "manipulator_base";
+    manifest["units"]["depth"] = "millimeter";
+    manifest["units"]["point_cloud"] = "meter";
+    manifest["artifacts"]["color"] = "frame_NNN_color.png";
+    manifest["artifacts"]["depth"] = "frame_NNN_depth_mm.png";
+    manifest["artifacts"]["mask"] = "frame_NNN_mask_INDEX.png";
+    manifest["artifacts"]["object_cloud"] =
+        "frame_NNN_object_INDEX.ply";
+    manifest["artifacts"]["plan"] = "frame_NNN_localize.txt";
+    manifest["artifacts"]["visualization"] =
+        "frame_NNN_localize.png";
+
+    const fs::path manifest_path = output_dir / "capture_manifest.yaml";
+    std::ofstream output(manifest_path);
+    if (!output.is_open()) {
+        throw std::runtime_error(
+            "failed to open capture manifest: " +
+            manifest_path.string());
+    }
+    output << manifest << "\n";
+    if (!output.good()) {
+        throw std::runtime_error(
+            "failed to write capture manifest: " +
+            manifest_path.string());
+    }
+}
+
 int main(int argc, char* argv[]) {
-    AppConfig app = ParseArgs(argc, argv);
+    DebugLocalizeAppConfig app = ParseArgs(argc, argv);
     if (app.config_path.empty()) {
         std::cerr << "[debug_localize] Error: --config is required" << std::endl;
         return 1;
@@ -406,6 +460,13 @@ int main(int argc, char* argv[]) {
 
     if (app.warmup_frames < 0) {
         app.warmup_frames = camera_config.type == "spacemit_las2" ? 1 : 30;
+    }
+    try {
+        SaveCaptureContext(app, camera_config);
+    } catch (const std::exception& error) {
+        std::cerr << "[debug_localize] Failed to save capture context: "
+            << error.what() << std::endl;
+        return 1;
     }
 
     std::cout << "[debug_localize] Initializing camera backend: "

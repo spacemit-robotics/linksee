@@ -88,12 +88,13 @@ python3 scripts/calibrate_hand_eye.py \
 
 ```yaml
 calibration:
-  T_base_camera:
-    translation: [x, y, z]
-    rotation: [roll, pitch, yaw]
+  <camera.type>:
+    T_base_camera:
+      translation: [x, y, z]
+      rotation: [roll, pitch, yaw]
 ```
 
-`translation` 的单位为米，`rotation` 的单位为弧度。
+脚本根据数据集中的相机后端更新对应配置块，不会覆盖另一种相机的标定结果。`translation` 的单位为米，`rotation` 的单位为弧度。
 
 ## 6. 验证标定结果
 

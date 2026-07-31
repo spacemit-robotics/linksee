@@ -238,54 +238,70 @@ def _load_dataset(dataset_dir):
     return manifest, samples, R_g2b, t_g2b, R_t2c, t_t2c
 
 
-def _apply_to_grasp_config(config_path, t_vec, rpy):
-    """Patch only calibration.T_base_camera lines and preserve the rest."""
+def _apply_to_grasp_config(config_path, camera_type, t_vec, rpy):
+    """Update only the selected camera backend hand-eye calibration."""
     config_path = Path(config_path)
     text = config_path.read_text(encoding="utf-8")
     backup = config_path.with_suffix(
         config_path.suffix + ".bak." + datetime.now().strftime("%Y%m%d_%H%M%S"))
     shutil.copy2(config_path, backup)
 
+    root = yaml.safe_load(text) or {}
+    calibration = root.get("calibration", {})
+    if not isinstance(calibration, dict):
+        calibration = {}
+    legacy_transform = calibration.pop("T_base_camera", None)
+    if legacy_transform and camera_type not in calibration:
+        calibration[camera_type] = {"T_base_camera": legacy_transform}
+    calibration.setdefault(camera_type, {})
+    calibration[camera_type]["T_base_camera"] = {
+        "translation": [float(value) for value in t_vec],
+        "rotation": [float(value) for value in rpy],
+    }
+
     lines = text.splitlines()
-    in_calibration = False
-    in_tbc = False
-    replaced_t = False
-    replaced_r = False
-    out_lines = []
+    block_start = next(
+        (index for index, line in enumerate(lines)
+         if line == "calibration:"), len(lines))
+    block_end = block_start + 1
+    while block_end < len(lines):
+        line = lines[block_end]
+        if line and not line.startswith(" "):
+            break
+        block_end += 1
 
-    t_line = f"    translation: [{t_vec[0]:.6f}, {t_vec[1]:.6f}, {t_vec[2]:.6f}]"
-    r_line = f"    rotation: [{rpy[0]:.6f}, {rpy[1]:.6f}, {rpy[2]:.6f}]"
-
-    for line in lines:
-        stripped = line.strip()
-        if stripped == "calibration:" and not line.startswith(" "):
-            in_calibration = True
-            in_tbc = False
-        elif in_calibration and line and not line.startswith(" "):
-            in_calibration = False
-            in_tbc = False
-
-        if in_calibration and stripped == "T_base_camera:":
-            in_tbc = True
-        elif in_tbc and line.startswith("  ") and not line.startswith("    ") and stripped:
-            in_tbc = False
-
-        if in_tbc and stripped.startswith("translation:") and not stripped.startswith("#"):
-            out_lines.append(t_line)
-            replaced_t = True
+    calibration_lines = ["calibration:"]
+    ordered_backends = ["realsense", "spacemit_las2"]
+    ordered_backends.extend(
+        backend for backend in calibration
+        if backend not in ordered_backends)
+    for backend in ordered_backends:
+        backend_config = calibration.get(backend)
+        if not isinstance(backend_config, dict):
             continue
-        if in_tbc and stripped.startswith("rotation:") and not stripped.startswith("#"):
-            out_lines.append(r_line)
-            replaced_r = True
+        transform = backend_config.get("T_base_camera")
+        if not isinstance(transform, dict):
             continue
-        out_lines.append(line)
+        translation = transform.get("translation")
+        rotation = transform.get("rotation")
+        if not (isinstance(translation, list) and len(translation) == 3 and
+                isinstance(rotation, list) and len(rotation) == 3):
+            continue
+        calibration_lines.extend([
+            f"  {backend}:",
+            "    T_base_camera:",
+            "      translation: "
+            f"[{translation[0]:.6f}, {translation[1]:.6f}, "
+            f"{translation[2]:.6f}]",
+            "      rotation: "
+            f"[{rotation[0]:.6f}, {rotation[1]:.6f}, "
+            f"{rotation[2]:.6f}]",
+        ])
 
-    if not (replaced_t and replaced_r):
-        out_lines.append("")
-        out_lines.append("calibration:")
-        out_lines.append("  T_base_camera:")
-        out_lines.append(t_line)
-        out_lines.append(r_line)
+    if block_start == len(lines):
+        out_lines = lines + [""] + calibration_lines
+    else:
+        out_lines = lines[:block_start] + calibration_lines + lines[block_end:]
 
     config_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
     return backup
@@ -492,6 +508,17 @@ def _resolve_camera_type(camera_config, camera_override="auto"):
     if camera_type not in ("realsense", "spacemit_las2"):
         raise RuntimeError(f"不支持的相机后端: {camera_type}")
     return camera_type
+
+
+def _resolve_dataset_camera_type(manifest, camera_override="auto"):
+    if camera_override != "auto":
+        return _resolve_camera_type({}, camera_override)
+    camera = manifest.get("camera", {})
+    if not isinstance(camera, dict) or not camera.get("backend"):
+        raise RuntimeError(
+            "数据集缺少 camera.backend，请通过 --camera-type 指定相机后端")
+    return _resolve_camera_type(
+        {"type": camera["backend"]}, camera_override)
 
 
 def _create_pipeline_camera(camera_config, camera_type,
@@ -1642,6 +1669,8 @@ def main():
         marker_length = manifest.get(
             "marker_length_m",
             manifest.get("charuco", {}).get("marker_length_m", args.marker_length))
+        camera_type = _resolve_dataset_camera_type(
+            manifest, args.camera_type)
         out = save_result(dataset_dir, results, best, eval_details, count,
                           marker_length, cam_mtx)
         _json_dump(args.output, out)
@@ -1654,7 +1683,8 @@ def main():
         print(f"  结果已保存: {args.output}")
         print(f"  数据集结果: {dataset_dir / 'result.json'}")
         if args.apply_config:
-            backup = _apply_to_grasp_config(args.apply_config, t_vec, rpy)
+            backup = _apply_to_grasp_config(
+                args.apply_config, camera_type, t_vec, rpy)
             print(f"  已写回配置: {args.apply_config}")
             print(f"  备份文件: {backup}")
         return
@@ -1939,7 +1969,8 @@ def main():
     print(f"  数据集结果: {dataset_dir / 'result.json'}")
     print(f"  标定报告: {dataset_dir / 'report.txt'}")
     if args.apply_config:
-        backup = _apply_to_grasp_config(args.apply_config, t_vec, rpy)
+        backup = _apply_to_grasp_config(
+            args.apply_config, camera_type, t_vec, rpy)
         print(f"  已写回配置: {args.apply_config}")
         print(f"  备份文件: {backup}")
 
@@ -1949,9 +1980,10 @@ def main():
     print(f"{'=' * 60}")
     print(f"""
 calibration:
-  T_base_camera:
-    translation: [{t_vec[0]:.4f}, {t_vec[1]:.4f}, {t_vec[2]:.4f}]
-    rotation: [{rpy[0]:.4f}, {rpy[1]:.4f}, {rpy[2]:.4f}]
+  {camera_type}:
+    T_base_camera:
+      translation: [{t_vec[0]:.4f}, {t_vec[1]:.4f}, {t_vec[2]:.4f}]
+      rotation: [{rpy[0]:.4f}, {rpy[1]:.4f}, {rpy[2]:.4f}]
 """)
 
 

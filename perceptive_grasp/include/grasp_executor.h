@@ -11,12 +11,15 @@
 
 #include <cstddef>
 #include <cmath>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "arm_path_safety.h"
+#include "gripper_holding.h"
 #include "grasp_planner.h"
+#include "motion_completion.h"
 
 // Forward declarations for C API (avoid pulling full headers into this header)
 extern "C" {
@@ -41,11 +44,19 @@ enum class GraspResult {
 struct GripperCheckDiagnostics {
     std::string phase;
     std::string state = "UNKNOWN";
+    std::string decision = "INCONCLUSIVE";
     int holding_count = 0;
     int load_holding_count = 0;
+    int opening_count = 0;
+    int contact_count = 0;
+    int empty_count = 0;
     int check_count = 0;
+    int baseline_sample_count = 0;
     float load_threshold = 0.0f;
     float empty_closed_position = NAN;
+    float empty_closed_position_mad = NAN;
+    float empty_closed_load = NAN;
+    float empty_closed_load_mad = NAN;
     float min_object_position = NAN;
     float position = NAN;
     float load = NAN;
@@ -66,6 +77,7 @@ struct ExecutorDiagnostics {
     GraspResult last_result = GraspResult::SUCCESS;
     std::string last_action;
     std::string last_detail;
+    float validation_min_joint_margin_rad = NAN;
     GripperCheckDiagnostics gripper_check;
     WristYawDiagnostics wrist_yaw;
 };
@@ -146,13 +158,13 @@ struct ExecutorConfig {
 
     // 预定义姿态
     std::vector<float> home_joints = {
-        1.550f, -1.620f, 1.420f, 1.147f, 0.189f};
+        1.546f, -1.765f, 1.563f, 1.093f, 0.186f};
     std::vector<float> observe_joints = {
-        1.550f, 0.050f, -0.217f, 1.606f, 0.015f};
+        1.544f, -0.067f, 0.101f, 1.382f, 0.188f};
     std::vector<float> side_ready_joints = {
         1.550f, 0.021f, 1.490f, -1.700f, -0.036f};
     std::vector<float> place_joints = {
-        -1.480f, 0.087f, -0.140f, 1.389f, 0.033f};
+        -1.669f, -0.122f, 0.101f, 1.383f, 0.188f};
 
     // 阶段间等待时间
     TimingConfig timing;
@@ -164,9 +176,9 @@ struct ExecutorConfig {
 
     // Calibrated servo limits, kept inside the persistent register limits.
     std::vector<JointConstraint> joint_limits = {
-        {0, -1.540f, 1.630f},
-        {1, -1.690f, 1.680f},
-        {2, -1.840f, 1.500f},
+        {0, -1.700f, 1.630f},
+        {1, -1.770f, 1.680f},
+        {2, -1.840f, 1.570f},
         {3, -1.790f, 1.670f},
         {4, -2.700f, 2.800f},
     };
@@ -327,9 +339,16 @@ private:
     std::vector<Pose3D> validated_side_poses_;
     std::vector<std::vector<float>> validated_side_joint_path_;
     size_t validated_side_path_index_ = 0;
+    Pose3D validated_top_pre_grasp_pose_{};
+    std::vector<float> validated_top_pre_grasp_joints_;
+    std::vector<Pose3D> validated_top_poses_;
+    std::vector<std::vector<float>> validated_top_joint_path_;
+    size_t validated_top_path_index_ = 0;
     std::vector<float> active_target_joints_;
+    int active_motion_timeout_ms_ = 3000;
     int wait_motion_timeout_ms_ = 15000;
-    float empty_closed_position_ = NAN;
+    std::string last_motion_wait_detail_;
+    GripperBaseline gripper_baseline_;
     ExecutorDiagnostics diagnostics_;
 
     void RecordResult(GraspResult result, const std::string& action,
@@ -340,7 +359,21 @@ private:
     GraspResult MoveToJoints(const std::vector<float>& joints);
     GraspResult MoveToJointsCoordinated(
         const std::vector<float>& joints);
-    GraspResult MoveToJointsCollisionSafe(const std::vector<float>& joints);
+    GraspResult MoveToJointsCollisionSafe(
+        const std::vector<float>& joints,
+        bool allow_missing_support_surface = false);
+    GraspResult BuildCollisionSafeJointPath(
+        const std::vector<float>& start_joints,
+        const std::vector<float>& target_joints,
+        std::vector<std::vector<float>>& path,
+        std::string* detail,
+        bool allow_missing_support_surface = false) const;
+    GraspResult ValidateJointPathSafety(
+        const std::vector<float>& start_joints,
+        const std::vector<float>& target_joints,
+        std::string* detail,
+        bool allow_contact_retreat = false,
+        bool allow_missing_support_surface = false) const;
     GraspResult MoveToPoseWithIKJoints(const Pose3D& pose, float speed);
     GraspResult MoveToPoseSide(const Pose3D& pose, float speed);
     GraspResult MoveToSidePreGrasp(const Pose3D& pose, float speed);
@@ -350,7 +383,30 @@ private:
     GraspResult MoveToPoseConstrained(const Pose3D& pose, float speed);
     GraspResult MoveToPoseWithYaw(const Pose3D& pose, float speed,
                                     float yaw_rad);
-    GraspResult SolveIKConstrained(const Pose3D& pose, std::vector<float>& joints);
+    GraspResult SolveIKConstrained(
+        const Pose3D& pose,
+        std::vector<float>& joints,
+        const std::vector<float>* seed_joints = nullptr,
+        int timeout_ms = -1,
+        std::function<bool(std::vector<float>&)> candidate_validator = {});
+    GraspResult PlanTopJointPath(
+        const std::vector<Pose3D>& poses,
+        float grasp_yaw_rad,
+        int timeout_ms,
+        std::vector<std::vector<float>>& joint_path,
+        std::string* detail,
+        const std::vector<float>* start_joints = nullptr);
+    GraspResult MoveAlongValidatedTopPath(
+        const Pose3D& target_pose,
+        float speed,
+        const char* action,
+        float final_tolerance_rad,
+        bool allow_contact_retreat = false);
+    bool ApplyWristYaw(
+        float grasp_yaw_rad,
+        std::vector<float>& joints,
+        std::string* detail,
+        bool record_diagnostics);
     GraspResult SolveIKSide(const Pose3D& pose,
                             int timeout_ms,
                             std::vector<float>& joints,
@@ -380,7 +436,9 @@ private:
         float first_speed,
         float remaining_speed,
         float final_tolerance_rad,
-        int completion_timeout_ms = -1);
+        int completion_timeout_ms = -1,
+        bool allow_contact_retreat = false,
+        std::function<bool()> settled_acceptance = {});
     GraspResult CorrectSidePose(
         const Pose3D& pose, float speed, const char* action);
     bool TakeValidatedSidePath(
@@ -390,14 +448,14 @@ private:
                             bool use_top_constraints,
                             int timeout_ms,
                             std::vector<float>& joints);
-    GraspResult MoveToPose(const Pose3D& pose, float speed);
-    GraspResult MoveLinear(const Pose3D& pose, float speed);
-    bool WaitMotionDone(int timeout_ms = -1,
-                        float target_tolerance_rad = 0.060f);
+    GraspResult WaitMotionDone(
+        int timeout_ms = -1,
+        float target_tolerance_rad = 0.060f,
+        std::function<bool()> settled_acceptance = {});
     bool VerifyPoseReached(const char* action, const Pose3D& target_pose);
     bool GetCurrentJoints(std::vector<float>& joints);
     bool NeedsCollisionAvoidance(const std::vector<float>& current_joints,
-                                const std::vector<float>& target_joints);
+                                const std::vector<float>& target_joints) const;
 #endif
 };
 

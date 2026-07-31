@@ -32,9 +32,9 @@ camera:
 
 - `width`、`height`：彩色图和深度图的采集尺寸，单位像素。
 - `fps`：相机采集帧率。
-- `motion_flush_frames`：机械臂或底盘动作后丢弃的积压帧数。
+- `motion_flush_frames`：机械臂或底盘动作后非阻塞清理的最大积压帧数。程序清空当前队列后只等待一帧新数据，不会固定执行该数量的完整图像处理。
 - `align_depth`：将深度图对齐到彩色图，抓取定位时应保持开启。
-- `depth_filter`：深度滤波开关。时间滤波默认关闭，避免机器人动作后残留旧深度；空洞填充默认关闭，避免将周围地面深度扩散到弱纹理目标。杯、瓶缺少有效目标深度时，规划器使用周围地面点云和目标轮廓重建侧抓几何。
+- `depth_filter`：深度滤波开关。时间滤波默认关闭，避免机器人动作后残留旧深度；空洞填充默认关闭，避免将周围地面深度扩散到弱纹理目标。直立目标内部缺少有效深度时，规划器使用周围地面点云和目标轮廓重建几何。
 
 ### 1.2 配置 spacemit_las2
 
@@ -66,30 +66,37 @@ camera:
 detection:
   config_path: yolov8_seg.yaml
   target_labels: []
-  min_confidence: 0.4
+  min_confidence: 0.10
   min_area: 1000
-  stable_frames: 1
+  stable_frames: 3
 ```
 
 - `config_path`：目标检测模型配置文件，相对 `config/` 目录解析。
 - `target_labels`：允许检测的 coco 类别 id；空列表表示不限制类别。
 - `min_confidence`：最低检测置信度。误检增多时调高，漏检增多时调低。
 - `min_area`：最小检测区域面积，用于过滤过小目标，单位平方像素。
-- `stable_frames`：连续检测到目标多少帧后进入抓取规划。
+- `stable_frames`：目标检测框位置和面积连续稳定多少帧后进入抓取规划。目标仍在移动时，pipeline 保持在检测阶段；稳定后只执行一次三维几何估计和策略选择。
 
 ## 2. 配置手眼标定结果
 
 ```yaml
 calibration:
-  T_base_camera:
-    translation: [0.005122, 0.056533, 0.310072]
-    rotation: [-2.162887, -0.009940, -1.551754]
+  realsense:
+    T_base_camera:
+      translation: [-0.020684, 0.043910, 0.300747]
+      rotation: [-2.088074, 0.015059, -1.529363]
+  spacemit_las2:
+    T_base_camera:
+      translation: [-0.019765, 0.048938, 0.312118]
+      rotation: [-2.126969, -0.007183, -1.598329]
 ```
 
+- `realsense`：realsense 相机安装位置对应的手眼标定结果。
+- `spacemit_las2`：spacemit_las2 相机安装位置对应的手眼标定结果。
 - `translation`：相机坐标系到机械臂基座坐标系的平移，单位米。
 - `rotation`：相机坐标系到机械臂基座坐标系的旋转，单位弧度。
 
-通过[手眼标定](hand_eye_calibration.md)生成该结果。更换相机、机械臂安装位置或固定结构后必须重新标定。
+程序只加载 `camera.type` 对应的标定结果。通过[手眼标定](hand_eye_calibration.md)生成或更新该结果。更换相机、机械臂安装位置或固定结构后，必须重新标定对应相机后端。
 
 ## 3. 配置抓取策略
 
@@ -104,9 +111,11 @@ grasp:
     gripper_open: 0.6
   side:
     min_height_m: 0.060
-    approach_distance_m: 0.030
+    min_height_width_ratio: 1.0
+    approach_distance_m: 0.020
+    entry_clearance_m: 0.030
     pregrasp_min_x_m: 0.270
-    gripper_offset_m: 0.005
+    gripper_offset_m: 0.010
     grasp_forward_offset_m: 0.020
     grasp_height_ratio: 0.60
     initial_lift_m: 0.050
@@ -123,7 +132,7 @@ grasp:
     table_clearance_m: 0.005
     footprint_padding_m: 0.005
     gripper_max_width_m: 0.10
-    planning_timeout_ms: 220
+    planning_timeout_ms: 750
     perception_budget_ms: 500
   workspace:
     x_min: 0.0
@@ -140,7 +149,7 @@ orientation:
 
 **策略选择：**
 
-- `strategy`：抓取方向选择。`auto` 保持普通目标的二维顶抓策略，并对杯、瓶估计三维几何后选择顶抓或侧抓；`top` 或 `side` 强制使用指定方向。
+- `strategy`：抓取方向选择。`auto` 根据目标三维高度、宽度和候选可达性选择顶抓或侧抓，不读取目标类别；`top` 或 `side` 强制使用指定方向。
 
 **顶抓参数：**
 
@@ -153,7 +162,9 @@ orientation:
 **侧抓参数：**
 
 - `side.min_height_m`：允许生成侧抓候选的最小目标高度，单位米。
+- `side.min_height_width_ratio`：目标高度与桌面投影最大尺寸的最小比值。`auto` 仅在目标高度和该比值同时达到门限时首次选择侧抓，避免将横放的细长物体误判为直立物体；同一轮已经锁定侧抓后允许小幅测量波动，但仍执行夹爪宽度、间隙、工作空间和 ik 检查。
 - `side.approach_distance_m`：预抓取位到抓取位沿接近方向的水平进给距离，单位米。该值表示平面位移向量的长度，不表示单独的 `x` 或 `y` 分量；目标接近机械臂中心线时，进给主要发生在前向 `x` 轴，横向 `y` 基本不变。
+- `side.entry_clearance_m`：从观察位进入侧抓区域时，夹爪下缘高于目标最高点的安全距离，单位米。该参数只控制入场高度，不改变预抓取位到抓取位的水平进给距离。
 - `side.pregrasp_min_x_m`：预抓取位相对机械臂基座的期望前向距离，单位米。底盘会调整目标位置，使闭合夹爪的侧向扫掠终点靠近该位置。
 - `side.gripper_offset_m`：固定爪位于目标外侧后的额外 tcp 机械补偿，单位米。侧抓规划器首先沿夹爪开合方向偏移目标半宽，再叠加该参数，确保单动爪在预抓取和水平接近过程中不会扫过目标中心。
 - `side.grasp_forward_offset_m`：预抓取位和抓取位沿接近方向共同施加的 tcp 机械补偿，单位米。该参数不会改变两者之间由 `approach_distance_m` 定义的进给距离。
@@ -164,8 +175,8 @@ orientation:
 **公共夹爪参数：**
 
 - `gripper_effort`：闭合抓取时请求的归一化力度，范围为 `[0, 1]`。
-- `gripper_hold_load_threshold`：夹爪闭合后用于判断是否夹住目标的负载阈值。
-- `gripper_empty_position_margin`：抓取后夹爪开度相对空夹爪全闭基线的最小差值。
+- `gripper_hold_load_threshold`：持物判断使用的绝对负载下限。程序还会根据空夹爪负载分布计算动态阈值，并采用两者中的较大值。
+- `gripper_empty_position_margin`：抓取后夹爪开度相对空夹爪位置分布中位数的最小差值。程序会同时考虑基线波动，避免测量噪声造成误判。
 - `gripper_timeout_ms`：单次夹爪动作的超时时间，单位毫秒。
 
 **公共几何参数：**
@@ -178,15 +189,15 @@ orientation:
 - `geometry.table_clearance_m`：目标点和夹爪相对桌面的最小安全间隙，单位米。
 - `geometry.footprint_padding_m`：目标水平轮廓两侧增加的安全余量，单位米。
 - `geometry.gripper_max_width_m`：允许候选使用的最大夹持宽度，单位米；应按实际夹爪开口标定。
-- `geometry.planning_timeout_ms`：三维几何估计和候选 ik 筛选的总时限，单位毫秒。
-- `geometry.perception_budget_ms`：单帧采集、目标检测、三维几何和候选 ik 筛选的总时限，单位毫秒；超时后不会执行机械臂动作。
+- `geometry.planning_timeout_ms`：单个抓取候选执行 ik 和路径安全校验的最长时间，单位毫秒。
+- `geometry.perception_budget_ms`：单帧采集、目标检测、三维几何和候选 ik 筛选的性能预算，单位毫秒。安全方案超过该预算时记录 `OVERRUN` 告警，但不会仅因耗时超限而终止；工作空间、ik 和路径安全检查仍须全部通过。
 
 **顶抓方向参数：**
 
 - `orientation.enabled`：是否根据二维分割掩码估计顶抓夹爪方向。
 - `orientation.aspect_ratio_threshold`：二维目标长宽比低于该值时不覆盖顶抓腕部方向。
 
-普通目标的顶抓使用二维分割掩码和对齐深度定位，不读取 `geometry` 参数。杯、瓶以及显式配置为 `side` 的目标使用点云、桌面平面和 `geometry` 参数生成候选。选中顶抓后读取 `top` 和顶抓方向参数；选中侧抓后读取 `side` 参数。公共夹爪和工作空间参数对两种策略生效。
+`auto` 使用点云、桌面平面和 `geometry` 参数选择抓取策略。选中顶抓后，pipeline 使用二维分割掩码和对齐深度生成抓取位姿，并读取 `top` 和顶抓方向参数；选中侧抓后读取 `side` 参数。公共夹爪和工作空间参数对两种策略生效。
 
 底盘将目标移动到舒适区后，pipeline 会重新检测并重新构建点云。新的抓取候选仍需通过工作空间和 ik 可达性检查。
 
@@ -198,18 +209,18 @@ manipulator:
   urdf_path: "../urdf/so101.urdf"
   move_speed: 1.0
   line_speed: 0.5
-  home_joints: [1.550, -1.620, 1.420, 1.147, 0.189]
-  observe_joints: [1.550, 0.050, -0.217, 1.606, 0.015]
+  home_joints: [1.546, -1.765, 1.563, 1.093, 0.186]
+  observe_joints: [1.544, -0.067, 0.101, 1.382, 0.188]
   side_ready_joints: [1.550, 0.021, 1.490, -1.700, -0.036]
   joint_limits:
-    - {joint: 0, min: -1.540, max: 1.630}
-    - {joint: 1, min: -1.690, max: 1.680}
-    - {joint: 2, min: -1.840, max: 1.500}
+    - {joint: 0, min: -1.700, max: 1.630}
+    - {joint: 1, min: -1.770, max: 1.680}
+    - {joint: 2, min: -1.840, max: 1.570}
     - {joint: 3, min: -1.790, max: 1.670}
     - {joint: 4, min: -2.700, max: 2.800}
 
 place:
-  place_joints: [-1.480, 0.087, -0.140, 1.389, 0.033]
+  place_joints: [-1.669, -0.122, 0.101, 1.383, 0.188]
   release_open: 0.5
 ```
 
@@ -224,7 +235,7 @@ place:
 - `place_joints`：抓取成功后的放置姿态，关节角单位弧度。
 - `release_open`：放置目标时的夹爪张开度，范围为 `[0, 1]`。
 
-夹爪闭合后会先检查持物状态，抬起到预抓取位后再检查一次。只有夹爪保持非零开度且负载持续超过阈值，pipeline 才进入放置阶段。
+机械臂进入观察位时会连续采集空夹爪位置和负载，建立本次任务的基线分布。夹爪闭合后会检查持物状态，抬起后再检查一次。pipeline 综合夹爪开度、负载和驱动状态判断是否持物；持续负载与明显高于空夹噪声的部分开度可以共同确认持物，但单独出现空夹硬限位负载时不会判为成功。抬升后的证据仍不确定时，pipeline 保留可能持物状态并执行安全放置恢复，不会按抓空再次接近目标。
 
 侧抓时，机械臂先协调移动到 `side_ready_joints`，其中第四关节保持更快的前导进度。随后保持夹爪闭合并抬升到目标顶部以上，转动第一关节并移动到高位安全预抓取位。该阶段的末端路径保持在根据目标点云估计的物体顶部安全高度以上。
 
@@ -242,7 +253,7 @@ mobile_base:
   max_step_m: 0.12
   linear_speed: 0.20
   angular_speed: 1.2
-  min_cmd_duration_ms: 200
+  min_cmd_duration_ms: 350
 ```
 
 - `enabled`：启用底盘辅助对齐。
@@ -253,7 +264,7 @@ mobile_base:
 - `max_step_m`：单次前进或后退的最大距离，单位米。
 - `linear_speed`：前进或后退的命令速度，单位米每秒。
 - `angular_speed`：原地转向的命令角速度，单位弧度每秒。
-- `min_cmd_duration_ms`：单次底盘速度命令的最短持续时间，单位毫秒。
+- `min_cmd_duration_ms`：单次底盘速度命令的最短持续时间，单位毫秒。该值应高于底盘电机启动死区；linksee 底盘推荐保持 `350`。
 
 横向对齐目标为机械臂基座坐标系的 `y=0`：
 

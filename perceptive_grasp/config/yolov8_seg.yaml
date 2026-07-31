@@ -5,7 +5,7 @@ label_file_path: ~/.cache/models/vision/labels/coco.txt
 image_size: [640, 640]
 class: deploy.yolov8_seg.YOLOv8SegDetector
 default_params:
-  conf_threshold: 0.35
+  conf_threshold: 0.10
   iou_threshold: 0.45
   num_threads: 4
   providers:
