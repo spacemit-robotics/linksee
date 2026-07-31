@@ -17,8 +17,12 @@ namespace {
 using perceptive_grasp::MobileBaseAlignmentCommand;
 using perceptive_grasp::MobileBaseAlignmentConfig;
 using perceptive_grasp::MeasureMobileBaseAlignmentProgress;
+using perceptive_grasp::MobileBaseMotionReport;
+using perceptive_grasp::MobileBaseOdometry;
 using perceptive_grasp::PlanMobileBaseAlignment;
 using perceptive_grasp::RequiredMobileBaseAlignmentProgress;
+using perceptive_grasp::EvaluateMobileBaseMotion;
+using perceptive_grasp::IsMobileBaseDirectionReversal;
 
 bool Near(float lhs, float rhs) {
     return std::fabs(lhs - rhs) < 1e-5f;
@@ -59,6 +63,10 @@ void TestDefaultComfortRangeIsTightForLinkseeArm() {
     assert(Near(config.y_hysteresis, 0.025f));
     assert(Near(config.min_progress_floor_m, 0.003f));
     assert(Near(config.max_visual_regression_m, 0.010f));
+    assert(Near(config.odom_min_translation_m, 0.003f));
+    assert(Near(config.odom_min_rotation_rad, 0.010f));
+    assert(Near(config.odom_min_command_ratio, 0.05f));
+    assert(config.max_direction_reversals == 1);
 }
 
 void TestLongitudinalNoiseDoesNotTriggerMinimumDrivePulse() {
@@ -320,6 +328,91 @@ void TestLargeCorrectionKeepsFullProgressRequirement() {
                 0.02f));
 }
 
+void TestOdometryConfirmsForwardDrive() {
+    const MobileBaseAlignmentConfig config;
+    MobileBaseAlignmentCommand command;
+    command.type = MobileBaseAlignmentCommand::Type::DRIVE;
+    command.linear_x = 0.2f;
+    command.duration_ms = 500;
+    const MobileBaseOdometry before{1.0f, 2.0f, 0.0f};
+    const MobileBaseOdometry after{1.08f, 2.0f, 0.0f};
+
+    const MobileBaseMotionReport report = EvaluateMobileBaseMotion(
+        config, command, before, after);
+
+    assert(report.odometry_available);
+    assert(report.motion_confirmed);
+    assert(Near(report.forward_m, 0.08f));
+    assert(Near(report.translation_m, 0.08f));
+    assert(Near(report.signed_progress, 0.08f));
+    assert(Near(report.required_progress, 0.005f));
+}
+
+void TestOdometryRejectsOppositeDriveDirection() {
+    const MobileBaseAlignmentConfig config;
+    MobileBaseAlignmentCommand command;
+    command.type = MobileBaseAlignmentCommand::Type::DRIVE;
+    command.linear_x = -0.2f;
+    command.duration_ms = 500;
+    const MobileBaseOdometry before{0.0f, 0.0f, 0.0f};
+    const MobileBaseOdometry after{0.04f, 0.0f, 0.0f};
+
+    const MobileBaseMotionReport report = EvaluateMobileBaseMotion(
+        config, command, before, after);
+
+    assert(report.odometry_available);
+    assert(!report.motion_confirmed);
+    assert(Near(report.signed_progress, -0.04f));
+}
+
+void TestOdometryConfirmsWrappedRotation() {
+    const MobileBaseAlignmentConfig config;
+    MobileBaseAlignmentCommand command;
+    command.type = MobileBaseAlignmentCommand::Type::ROTATE;
+    command.angular_z = 1.2f;
+    command.duration_ms = 500;
+    const MobileBaseOdometry before{0.0f, 0.0f, 3.10f};
+    const MobileBaseOdometry after{0.0f, 0.0f, -3.08f};
+
+    const MobileBaseMotionReport report = EvaluateMobileBaseMotion(
+        config, command, before, after);
+
+    assert(report.odometry_available);
+    assert(report.motion_confirmed);
+    assert(report.yaw_rad > 0.10f);
+    assert(report.yaw_rad < 0.11f);
+}
+
+void TestMissingOdometryFallsBackToVisualConfirmation() {
+    const MobileBaseAlignmentConfig config;
+    MobileBaseAlignmentCommand command;
+    command.type = MobileBaseAlignmentCommand::Type::DRIVE;
+    command.linear_x = 0.2f;
+    command.duration_ms = 500;
+
+    const MobileBaseMotionReport report = EvaluateMobileBaseMotion(
+        config, command, std::nullopt, std::nullopt);
+
+    assert(!report.odometry_available);
+    assert(!report.motion_confirmed);
+    assert(report.detail.find("visual confirmation") != std::string::npos);
+}
+
+void TestDetectsRepeatedAxisDirectionReversal() {
+    MobileBaseAlignmentCommand forward;
+    forward.type = MobileBaseAlignmentCommand::Type::DRIVE;
+    forward.linear_x = 0.2f;
+    MobileBaseAlignmentCommand backward = forward;
+    backward.linear_x = -0.2f;
+    MobileBaseAlignmentCommand rotate;
+    rotate.type = MobileBaseAlignmentCommand::Type::ROTATE;
+    rotate.angular_z = 1.2f;
+
+    assert(IsMobileBaseDirectionReversal(forward, backward));
+    assert(!IsMobileBaseDirectionReversal(forward, rotate));
+    assert(!IsMobileBaseDirectionReversal(forward, forward));
+}
+
 }  // namespace
 
 int main() {
@@ -345,6 +438,11 @@ int main() {
     TestMeasuresBackwardVisualProgress();
     TestShortCorrectionUsesScaledProgressRequirement();
     TestLargeCorrectionKeepsFullProgressRequirement();
+    TestOdometryConfirmsForwardDrive();
+    TestOdometryRejectsOppositeDriveDirection();
+    TestOdometryConfirmsWrappedRotation();
+    TestMissingOdometryFallsBackToVisualConfirmation();
+    TestDetectsRepeatedAxisDirectionReversal();
     std::cout << "mobile_base_alignment_test passed" << std::endl;
     return 0;
 }

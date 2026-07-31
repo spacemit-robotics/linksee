@@ -87,13 +87,22 @@ endif()
 
 set(SOURCES
     src/main.cpp
+    src/camera_calibration.cpp
+    src/grasp_depth.cpp
     src/grasp_geometry.cpp
+    src/gripper_holding.cpp
     src/grasp_planner.cpp
     src/grasp_pipeline.cpp
+    src/grasp_pipeline_execution.cpp
+    src/grasp_pipeline_runtime.cpp
     src/stereo_camera.cpp
     src/stereo_geometry.cpp
+    src/target_association.cpp
     src/mobile_base_controller.cpp
     src/orientation_estimator.cpp
+    src/pipeline_debug_writer.cpp
+    src/pipeline_state.cpp
+    src/pipeline_timing.cpp
     src/voice_command_parser.cpp
 )
 
@@ -356,7 +365,13 @@ else()
             "Build components/control first, or use -DUSE_MOCK_EXECUTOR=ON")
     endif()
 
-    list(APPEND SOURCES src/grasp_executor.cpp src/arm_path_safety.cpp)
+    list(APPEND SOURCES
+        src/grasp_executor.cpp
+        src/grasp_executor_gripper.cpp
+        src/grasp_executor_runtime.cpp
+        src/arm_path_safety.cpp
+        src/motion_completion.cpp
+    )
     list(APPEND EXTRA_INCLUDE_DIRS ${MANIP_INCLUDE_DIR})
     list(APPEND EXTRA_LIBRARIES
         ${MANIP_LIBRARY}
@@ -475,6 +490,49 @@ target_include_directories(stereo_geometry_test PRIVATE
 target_link_libraries(stereo_geometry_test PRIVATE ${OpenCV_LIBS})
 add_test(NAME stereo_geometry_test COMMAND stereo_geometry_test)
 
+add_executable(camera_calibration_test
+    tests/camera_calibration_test.cpp
+    src/camera_calibration.cpp
+)
+target_include_directories(camera_calibration_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(camera_calibration_test PRIVATE yaml-cpp)
+add_test(NAME camera_calibration_test COMMAND camera_calibration_test)
+
+add_executable(grasp_depth_test
+    tests/grasp_depth_test.cpp
+    src/grasp_depth.cpp
+)
+target_include_directories(grasp_depth_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(grasp_depth_test PRIVATE ${OpenCV_LIBS})
+add_test(NAME grasp_depth_test COMMAND grasp_depth_test)
+
+add_executable(gripper_holding_test
+    tests/gripper_holding_test.cpp
+    src/gripper_holding.cpp
+)
+target_include_directories(gripper_holding_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+add_test(NAME gripper_holding_test COMMAND gripper_holding_test)
+
+add_executable(target_association_test
+    tests/target_association_test.cpp
+    src/target_association.cpp
+)
+target_include_directories(target_association_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_compile_definitions(target_association_test PRIVATE MOCK_DETECTOR=1)
+target_link_libraries(target_association_test PRIVATE ${OpenCV_LIBS})
+add_test(NAME target_association_test COMMAND target_association_test)
+
 add_executable(grasp_geometry_test
     tests/grasp_geometry_test.cpp
     src/grasp_geometry.cpp
@@ -487,6 +545,21 @@ target_include_directories(grasp_geometry_test PRIVATE
 target_compile_definitions(grasp_geometry_test PRIVATE MOCK_DETECTOR=1)
 target_link_libraries(grasp_geometry_test PRIVATE ${OpenCV_LIBS})
 add_test(NAME grasp_geometry_test COMMAND grasp_geometry_test)
+
+add_executable(grasp_strategy_regression_test
+    tests/grasp_strategy_regression_test.cpp
+    src/grasp_geometry.cpp
+    src/grasp_planner.cpp
+)
+target_include_directories(grasp_strategy_regression_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_compile_definitions(grasp_strategy_regression_test PRIVATE
+    MOCK_DETECTOR=1)
+target_link_libraries(grasp_strategy_regression_test PRIVATE ${OpenCV_LIBS})
+add_test(NAME grasp_strategy_regression_test
+    COMMAND grasp_strategy_regression_test)
 
 add_executable(orientation_estimator_test
     tests/orientation_estimator_test.cpp
@@ -507,8 +580,44 @@ add_executable(arm_path_safety_test
 target_include_directories(arm_path_safety_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+target_compile_definitions(arm_path_safety_test PRIVATE
+    PERCEPTIVE_GRASP_TEST_URDF="${CMAKE_CURRENT_SOURCE_DIR}/urdf/so101.urdf"
+)
 target_link_libraries(arm_path_safety_test PRIVATE PkgConfig::URDFDOM)
 add_test(NAME arm_path_safety_test COMMAND arm_path_safety_test)
+
+add_executable(motion_completion_test
+    tests/motion_completion_test.cpp
+    src/motion_completion.cpp
+)
+target_include_directories(motion_completion_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+add_test(NAME motion_completion_test COMMAND motion_completion_test)
+
+add_executable(pipeline_debug_writer_test
+    tests/pipeline_debug_writer_test.cpp
+    src/pipeline_debug_writer.cpp
+)
+target_include_directories(pipeline_debug_writer_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(pipeline_debug_writer_test PRIVATE ${OpenCV_LIBS})
+add_test(
+    NAME pipeline_debug_writer_test
+    COMMAND pipeline_debug_writer_test
+)
+
+add_executable(pipeline_timing_test
+    tests/pipeline_timing_test.cpp
+    src/pipeline_state.cpp
+    src/pipeline_timing.cpp
+)
+target_include_directories(pipeline_timing_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+add_test(NAME pipeline_timing_test COMMAND pipeline_timing_test)
 
 add_executable(voice_command_parser_test
     tests/voice_command_parser_test.cpp
@@ -640,6 +749,7 @@ endif()
 if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA)
     set(DEBUG_LOCALIZE_SOURCES
         tools/debug_localize.cpp
+        src/camera_calibration.cpp
         src/grasp_geometry.cpp
         src/grasp_planner.cpp
         src/stereo_camera.cpp
@@ -705,6 +815,7 @@ endif()
 if(HAVE_REALSENSE_CAMERA)
     add_executable(debug_grasp
         tools/debug_grasp.cpp
+        src/camera_calibration.cpp
         src/grasp_planner.cpp
         src/orientation_estimator.cpp
     )
@@ -756,7 +867,11 @@ if(NOT USE_MOCK_EXECUTOR)
     add_executable(debug_execute_safe
         tools/debug_execute_safe.cpp
         src/grasp_executor.cpp
+        src/grasp_executor_gripper.cpp
+        src/grasp_executor_runtime.cpp
         src/arm_path_safety.cpp
+        src/gripper_holding.cpp
+        src/motion_completion.cpp
     )
     target_include_directories(debug_execute_safe PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include

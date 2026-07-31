@@ -1,7 +1,5 @@
 # 故障诊断
 
-按照“运行环境、立体相机、目标定位、抓取规划、执行机构”的顺序排查问题。前一阶段未通过时，不要继续测试后续真实动作。
-
 ## 1. 准备诊断环境
 
 进入项目目录并加载运行环境：
@@ -33,9 +31,9 @@ python3 scripts/check_runtime_env.py \
 
 ```bash
 ./build/perceptive_grasp \
-  --debug \
   --config config/grasp_pipeline.yaml \
-  --target banana
+  --target banana \
+  --debug
 ```
 
 `--debug` 显示完整模块日志。默认模式输出 pipeline 结构化日志和模块错误。
@@ -154,7 +152,7 @@ python3 scripts/check_runtime_env.py \
   --plan-only
 ```
 
-`--plan-only` 会初始化当前配置中的硬件并读取机械臂状态，但不发送机械臂或底盘运动命令。普通顶抓完成目标检测、深度定位以及预抓取位和抓取位的 ik 检查后退出。杯、瓶和显式侧抓还会检查三维几何、桌面间隙和完整关节路径。直立目标的成功结果应包含 `strategy=side`；侧抓路径不满足安全间隙或可达性约束时，任务直接失败，不回退到顶抓。
+`--plan-only` 会初始化当前配置中的硬件并读取机械臂状态，但不发送机械臂或底盘运动命令。`auto` 先根据三维几何选择策略。顶抓检查深度定位、预抓取位、抓取位和垂直路径；侧抓检查桌面间隙和完整关节路径。直立目标的成功结果应包含 `strategy=side`；已选策略不满足安全间隙或可达性约束时，任务直接失败，不在同一轮中切换策略。
 
 需要检查完整状态机时，可使用主程序单步模式：
 
@@ -219,6 +217,7 @@ python3 scripts/check_runtime_env.py \
 
 ```text
 [Pipeline] Mobile base alignment needed: ...
+[Pipeline] Mobile base motion: odom=available ... detail=odometry confirmed commanded motion
 [Pipeline] Depth source=mask_foreground_q25 value=...mm samples=...
 [Pipeline] Mobile base visual progress: ...m (required >= ...m)
 ```
@@ -229,11 +228,11 @@ python3 scripts/check_runtime_env.py \
 
 - 分割 mask 是否覆盖目标，而不是地面或背景。
 - 目标表面的 spacemit_las2 深度是否有效。
-- `calibration.T_base_camera` 是否与当前相机安装位置一致。
+- `calibration.<camera.type>.T_base_camera` 是否与当前相机安装位置一致。
 - `mobile_base.max_step_m` 是否过大。
 - `mobile_base.linear_speed` 是否超过现场底盘可稳定控制的速度。
 
-pipeline 允许单次复检出现小幅视觉回退，并通过最大对齐次数和累计直行距离限制约束后续动作。出现 `visual progress ... exceeded allowed regression` 或 `cumulative travel safety limit reached` 时，应修正深度和标定，不要绕过安全限制。
+pipeline 通过最大对齐次数、实际累计直行距离和换向次数约束底盘动作。出现 `odometry did not confirm commanded motion`、视觉进度回退或反复换向时，pipeline 会停止底盘，并在当前位置继续执行机械臂安全校验。出现 `cumulative travel safety limit reached` 时，应检查深度、标定和舒适区参数，不要绕过累计移动安全限制。
 
 ## 7. 排查语音交互
 
@@ -267,7 +266,7 @@ VOICE_STATUS	state=IDLE;message=Ready
 - `target_requested` 和 `target_detected`：请求目标与实际检测结果。
 - `last_executor_action` 和 `last_executor_result`：最后一次执行动作及结果。
 - `last_executor_detail`：驱动、ik 或动作超时详情。
-- `gripper_check`：夹爪位置、负载、空夹爪全闭基线和持物判断结果。`phase=after_lift` 表示抬起后的二次确认结果。
+- `gripper_check`：记录持物判定、连续开度和负载证据、空夹爪位置及负载基线分布。`phase=after_lift` 表示抬起后的二次确认结果；`decision` 为 `HOLDING`、`EMPTY` 或 `INCONCLUSIVE`。
 
 结合对应的标注图和目标点云确认检测框、分割 mask 与三维几何结果是否属于同一目标。
 

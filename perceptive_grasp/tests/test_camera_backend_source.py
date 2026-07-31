@@ -15,12 +15,18 @@ CMAKE = ROOT / "CMakeLists.txt"
 CONFIG = ROOT / "config" / "grasp_pipeline.yaml"
 DETECTOR_CONFIG = ROOT / "config" / "yolov8_seg.yaml"
 MAIN_CPP = ROOT / "src" / "main.cpp"
+CAMERA_CALIBRATION_CPP = ROOT / "src" / "camera_calibration.cpp"
 PIPELINE_CPP = ROOT / "src" / "grasp_pipeline.cpp"
+PIPELINE_RUNTIME_CPP = ROOT / "src" / "grasp_pipeline_runtime.cpp"
+PIPELINE_DEBUG_WRITER_CPP = ROOT / "src" / "pipeline_debug_writer.cpp"
+PIPELINE_TIMING_H = ROOT / "include" / "pipeline_timing.h"
 TARGET_CPP = ROOT / "src" / "target_detector.cpp"
 TARGET_H = ROOT / "include" / "target_detector.h"
 PIPELINE_H = ROOT / "include" / "grasp_pipeline.h"
 STEREO_H = ROOT / "include" / "stereo_camera.h"
+DEPTH_H = ROOT / "include" / "depth_camera.h"
 CAMERA_FACTORY_CPP = ROOT / "src" / "stereo_camera.cpp"
+DEPTH_CPP = ROOT / "src" / "depth_camera.cpp"
 LAS2_CPP = ROOT / "src" / "las2_stereo_camera.cpp"
 STEREO_GEOMETRY_CPP = ROOT / "src" / "stereo_geometry.cpp"
 HAND_EYE_PY = ROOT / "scripts" / "calibrate_hand_eye.py"
@@ -35,12 +41,24 @@ class CameraBackendSourceTest(unittest.TestCase):
         cls.config = CONFIG.read_text(encoding="utf-8")
         cls.detector_config = DETECTOR_CONFIG.read_text(encoding="utf-8")
         cls.main = MAIN_CPP.read_text(encoding="utf-8")
-        cls.pipeline = PIPELINE_CPP.read_text(encoding="utf-8")
+        cls.camera_calibration = CAMERA_CALIBRATION_CPP.read_text(
+            encoding="utf-8")
+        cls.pipeline = (
+            PIPELINE_CPP.read_text(encoding="utf-8")
+            + PIPELINE_RUNTIME_CPP.read_text(encoding="utf-8")
+        )
+        cls.pipeline_debug_writer = PIPELINE_DEBUG_WRITER_CPP.read_text(
+            encoding="utf-8"
+        )
+        cls.pipeline_timing_h = PIPELINE_TIMING_H.read_text(
+            encoding="utf-8")
         cls.target = TARGET_CPP.read_text(encoding="utf-8")
         cls.target_h = TARGET_H.read_text(encoding="utf-8")
         cls.pipeline_h = PIPELINE_H.read_text(encoding="utf-8")
         cls.stereo_h = STEREO_H.read_text(encoding="utf-8")
+        cls.depth_h = DEPTH_H.read_text(encoding="utf-8")
         cls.camera_factory = CAMERA_FACTORY_CPP.read_text(encoding="utf-8")
+        cls.depth_cpp = DEPTH_CPP.read_text(encoding="utf-8")
         cls.las2_cpp = LAS2_CPP.read_text(encoding="utf-8")
         cls.stereo_geometry = STEREO_GEOMETRY_CPP.read_text(encoding="utf-8")
         cls.hand_eye = HAND_EYE_PY.read_text(encoding="utf-8")
@@ -52,6 +70,27 @@ class CameraBackendSourceTest(unittest.TestCase):
         self.assertIn("realsense:", self.config)
         self.assertIn("spacemit_las2:", self.config)
         self.assertIn("calib_path:", self.config)
+        self.assertIn("calibration:\n  realsense:", self.config)
+        self.assertIn("  spacemit_las2:\n    T_base_camera:", self.config)
+
+    def test_hand_eye_calibration_matches_selected_camera_backend(self):
+        self.assertIn(
+            "LoadCameraCalibration(\n"
+            "        root, cfg.camera.type, &cfg.planner)",
+            self.main,
+        )
+        self.assertIn("calibration[backend]", self.camera_calibration)
+        self.assertIn(
+            "calibration.\" + backend + \".T_base_camera",
+            self.camera_calibration,
+        )
+        self.assertIn(
+            "_resolve_dataset_camera_type", self.hand_eye)
+        self.assertIn(
+            "_apply_to_grasp_config(\n"
+            "                args.apply_config, camera_type",
+            self.hand_eye,
+        )
 
     def test_loader_reads_only_selected_backend_settings(self):
         self.assertIn('cam["type"]', self.main)
@@ -127,6 +166,10 @@ class CameraBackendSourceTest(unittest.TestCase):
         self.assertIn("add_executable(perceptive_grasp_core", self.cmake)
         self.assertIn("add_custom_target(perceptive_grasp ALL", self.cmake)
         self.assertIn("scripts/run_perceptive_grasp.py", self.cmake)
+        self.assertIn("src/grasp_pipeline_execution.cpp", self.cmake)
+        self.assertIn("src/grasp_pipeline_runtime.cpp", self.cmake)
+        self.assertIn("src/grasp_executor_gripper.cpp", self.cmake)
+        self.assertIn("src/grasp_executor_runtime.cpp", self.cmake)
 
     def test_debug_view_uses_selected_stereo_camera_backend(self):
         self.assertIn("LoadDebugViewConfig", self.debug_view)
@@ -180,6 +223,21 @@ class CameraBackendSourceTest(unittest.TestCase):
         self.assertIn("stage=CAMERA_REFRESH", self.pipeline)
         self.assertIn("current_frame_id != previous_frame_id", self.pipeline)
 
+    def test_realsense_refresh_discards_queue_before_processing_new_frame(self):
+        self.assertIn("DiscardQueuedFrames", self.stereo_h)
+        self.assertIn(
+            "int DiscardQueuedFrames(int max_frames) override",
+            self.depth_h,
+        )
+        self.assertIn("pipeline_.poll_for_frames", self.depth_cpp)
+        self.assertIn(
+            "camera_->DiscardQueuedFrames(maximum_discard_count)",
+            self.pipeline,
+        )
+        self.assertIn("discarded_frames=", self.pipeline)
+        self.assertNotIn(
+            "for (int i = 0; i < count; ++i)", self.pipeline)
+
     def test_las2_failed_initialization_exits_without_vendor_shutdown(self):
         self.assertIn(
             "access(settings.video_device.c_str(), R_OK | W_OK)",
@@ -194,8 +252,8 @@ class CameraBackendSourceTest(unittest.TestCase):
         self.assertIn("cv::stereoRectify", self.stereo_geometry)
 
     def test_detection_stability_and_performance_are_observable(self):
-        self.assertIn("stable_frames: 1", self.config)
-        self.assertIn("int detect_stable_frames = 1", self.pipeline_h)
+        self.assertIn("stable_frames: 3", self.config)
+        self.assertIn("int detect_stable_frames = 3", self.pipeline_h)
         self.assertIn('det["stable_frames"]', self.main)
         self.assertIn('module=" << module', self.pipeline)
         self.assertIn('"camera_warmup"', self.pipeline)
@@ -214,7 +272,27 @@ class CameraBackendSourceTest(unittest.TestCase):
         self.assertIn("initialization_ms=", self.pipeline)
         self.assertIn("task_ms=", self.pipeline)
         self.assertIn("end_to_end_ms=", self.pipeline)
-        self.assertIn("stage_timings_", self.pipeline_h)
+        self.assertIn("PipelineTiming task_timing_", self.pipeline_h)
+        self.assertIn(
+            "std::vector<PipelineStageTiming> stages_",
+            self.pipeline_timing_h,
+        )
+
+    def test_pipeline_debug_serialization_is_a_separate_module(self):
+        self.assertIn(
+            '#include "pipeline_debug_writer.h"',
+            self.pipeline,
+        )
+        self.assertNotIn("std::filesystem", self.pipeline)
+        self.assertNotIn("JsonEscape(", self.pipeline)
+        self.assertIn(
+            "bool SavePipelinePlanDebug(",
+            self.pipeline_debug_writer,
+        )
+        self.assertIn(
+            "bool SavePipelineTaskResultDebug(",
+            self.pipeline_debug_writer,
+        )
 
     def test_detector_uses_spacemit_execution_provider(self):
         self.assertIn("SpaceMITExecutionProvider", self.detector_config)

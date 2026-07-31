@@ -20,6 +20,14 @@ namespace perceptive_grasp {
 namespace {
 
 constexpr double kMinimumVectorNorm = 1e-9;
+// The production URDF uses intentionally conservative primitive boxes.
+// Remove a small skin so touching approximation boundaries do not reject
+// known-safe folded poses. This does not expand support-plane clearance.
+constexpr double kSelfCollisionGeometryInsetM = 0.002;
+// shoulder_link and lower_arm_link are represented by coarse boxes around
+// rounded printed parts. Apply a little more skin to this near-link pair so
+// box corners touching do not reject otherwise usable folded configurations.
+constexpr double kNearLinkAdditionalInsetM = 0.003;
 
 struct Vector3 {
     double x = 0.0;
@@ -41,6 +49,10 @@ struct Transform {
 
 Vector3 Add(const Vector3& lhs, const Vector3& rhs) {
     return {lhs.x + rhs.x, lhs.y + rhs.y, lhs.z + rhs.z};
+}
+
+Vector3 Subtract(const Vector3& lhs, const Vector3& rhs) {
+    return {lhs.x - rhs.x, lhs.y - rhs.y, lhs.z - rhs.z};
 }
 
 Vector3 Scale(const Vector3& vector, double scale) {
@@ -122,6 +134,206 @@ Transform JointMotion(const urdf::Joint& joint, double position) {
     return motion;
 }
 
+struct CollisionBox {
+    std::string link_name;
+    int link_order = -1;
+    Vector3 center;
+    Vector3 axis_x;
+    Vector3 axis_y;
+    Vector3 axis_z;
+    Vector3 half_extent;
+};
+
+CollisionBox MakeCollisionBox(const urdf::Geometry& geometry,
+    const Transform& collision_transform,
+    const std::string& link_name,
+    int link_order) {
+    CollisionBox box;
+    box.link_name = link_name;
+    box.link_order = link_order;
+    box.center = collision_transform.translation;
+    box.axis_x = Normalize(
+        Rotate(collision_transform.rotation, {1.0, 0.0, 0.0}));
+    box.axis_y = Normalize(
+        Rotate(collision_transform.rotation, {0.0, 1.0, 0.0}));
+    box.axis_z = Normalize(
+        Rotate(collision_transform.rotation, {0.0, 0.0, 1.0}));
+
+    if (geometry.type == urdf::Geometry::BOX) {
+        const auto& urdf_box = static_cast<const urdf::Box&>(geometry);
+        box.half_extent = {
+            0.5 * urdf_box.dim.x,
+            0.5 * urdf_box.dim.y,
+            0.5 * urdf_box.dim.z,
+        };
+    } else if (geometry.type == urdf::Geometry::CYLINDER) {
+        const auto& cylinder =
+            static_cast<const urdf::Cylinder&>(geometry);
+        box.half_extent = {
+            cylinder.radius,
+            cylinder.radius,
+            0.5 * cylinder.length,
+        };
+    } else if (geometry.type == urdf::Geometry::SPHERE) {
+        const auto& sphere = static_cast<const urdf::Sphere&>(geometry);
+        box.half_extent = {
+            sphere.radius,
+            sphere.radius,
+            sphere.radius,
+        };
+    }
+    box.half_extent.x = std::max(
+        0.001, box.half_extent.x - kSelfCollisionGeometryInsetM);
+    box.half_extent.y = std::max(
+        0.001, box.half_extent.y - kSelfCollisionGeometryInsetM);
+    box.half_extent.z = std::max(
+        0.001, box.half_extent.z - kSelfCollisionGeometryInsetM);
+    return box;
+}
+
+bool HasSupportedCollisionGeometry(const urdf::Geometry& geometry) {
+    return geometry.type == urdf::Geometry::BOX ||
+        geometry.type == urdf::Geometry::CYLINDER ||
+        geometry.type == urdf::Geometry::SPHERE;
+}
+
+bool UsesCalibratedBodyCollisionModel(const CollisionBox& lhs,
+    const CollisionBox& rhs) {
+    const bool proximal_to_distal =
+        (lhs.link_name == "base_link" ||
+            lhs.link_name == "shoulder_link") &&
+        (rhs.link_name == "wrist_link" ||
+            rhs.link_name == "gripper_link");
+    const bool distal_to_proximal =
+        (lhs.link_name == "wrist_link" ||
+            lhs.link_name == "gripper_link") &&
+        (rhs.link_name == "base_link" ||
+            rhs.link_name == "shoulder_link");
+    return proximal_to_distal || distal_to_proximal;
+}
+
+bool UsesConservativeNearLinkGeometry(const CollisionBox& lhs,
+    const CollisionBox& rhs) {
+    return (lhs.link_name == "shoulder_link" &&
+            rhs.link_name == "lower_arm_link") ||
+        (lhs.link_name == "lower_arm_link" &&
+            rhs.link_name == "shoulder_link");
+}
+
+CollisionBox WithAdditionalInset(
+    const CollisionBox& box, double inset_m) {
+    CollisionBox adjusted = box;
+    adjusted.half_extent.x = std::max(
+        0.001, adjusted.half_extent.x - inset_m);
+    adjusted.half_extent.y = std::max(
+        0.001, adjusted.half_extent.y - inset_m);
+    adjusted.half_extent.z = std::max(
+        0.001, adjusted.half_extent.z - inset_m);
+    return adjusted;
+}
+
+bool BoxesOverlap(const CollisionBox& lhs, const CollisionBox& rhs) {
+    constexpr double kAxisEpsilon = 1e-9;
+    const bool conservative_near_link_pair =
+        UsesConservativeNearLinkGeometry(lhs, rhs);
+    const CollisionBox effective_lhs = conservative_near_link_pair
+        ? WithAdditionalInset(lhs, kNearLinkAdditionalInsetM)
+        : lhs;
+    const CollisionBox effective_rhs = conservative_near_link_pair
+        ? WithAdditionalInset(rhs, kNearLinkAdditionalInsetM)
+        : rhs;
+    const Vector3 lhs_axes[] = {
+        effective_lhs.axis_x,
+        effective_lhs.axis_y,
+        effective_lhs.axis_z};
+    const Vector3 rhs_axes[] = {
+        effective_rhs.axis_x,
+        effective_rhs.axis_y,
+        effective_rhs.axis_z};
+    const double lhs_extent[] = {
+        effective_lhs.half_extent.x,
+        effective_lhs.half_extent.y,
+        effective_lhs.half_extent.z};
+    const double rhs_extent[] = {
+        effective_rhs.half_extent.x,
+        effective_rhs.half_extent.y,
+        effective_rhs.half_extent.z};
+
+    double rotation[3][3] = {};
+    double absolute_rotation[3][3] = {};
+    for (int lhs_axis = 0; lhs_axis < 3; ++lhs_axis) {
+        for (int rhs_axis = 0; rhs_axis < 3; ++rhs_axis) {
+            rotation[lhs_axis][rhs_axis] =
+                Dot(lhs_axes[lhs_axis], rhs_axes[rhs_axis]);
+            absolute_rotation[lhs_axis][rhs_axis] =
+                std::fabs(rotation[lhs_axis][rhs_axis]) + kAxisEpsilon;
+        }
+    }
+
+    const Vector3 center_delta = Subtract(
+        effective_rhs.center, effective_lhs.center);
+    const double translation[] = {
+        Dot(center_delta, lhs.axis_x),
+        Dot(center_delta, lhs.axis_y),
+        Dot(center_delta, lhs.axis_z),
+    };
+    for (int lhs_axis = 0; lhs_axis < 3; ++lhs_axis) {
+        const double lhs_radius = lhs_extent[lhs_axis];
+        double rhs_radius = 0.0;
+        for (int rhs_axis = 0; rhs_axis < 3; ++rhs_axis) {
+            rhs_radius += rhs_extent[rhs_axis] *
+                absolute_rotation[lhs_axis][rhs_axis];
+        }
+        if (std::fabs(translation[lhs_axis]) >
+            lhs_radius + rhs_radius) {
+            return false;
+        }
+    }
+
+    for (int rhs_axis = 0; rhs_axis < 3; ++rhs_axis) {
+        double lhs_radius = 0.0;
+        double projected_translation = 0.0;
+        for (int lhs_axis = 0; lhs_axis < 3; ++lhs_axis) {
+            lhs_radius += lhs_extent[lhs_axis] *
+                absolute_rotation[lhs_axis][rhs_axis];
+            projected_translation +=
+                translation[lhs_axis] * rotation[lhs_axis][rhs_axis];
+        }
+        if (std::fabs(projected_translation) >
+            lhs_radius + rhs_extent[rhs_axis]) {
+            return false;
+        }
+    }
+
+    for (int lhs_axis = 0; lhs_axis < 3; ++lhs_axis) {
+        const int lhs_next = (lhs_axis + 1) % 3;
+        const int lhs_last = (lhs_axis + 2) % 3;
+        for (int rhs_axis = 0; rhs_axis < 3; ++rhs_axis) {
+            const int rhs_next = (rhs_axis + 1) % 3;
+            const int rhs_last = (rhs_axis + 2) % 3;
+            const double lhs_radius =
+                lhs_extent[lhs_next] *
+                    absolute_rotation[lhs_last][rhs_axis] +
+                lhs_extent[lhs_last] *
+                    absolute_rotation[lhs_next][rhs_axis];
+            const double rhs_radius =
+                rhs_extent[rhs_next] *
+                    absolute_rotation[lhs_axis][rhs_last] +
+                rhs_extent[rhs_last] *
+                    absolute_rotation[lhs_axis][rhs_next];
+            const double projected_translation = std::fabs(
+                translation[lhs_last] *
+                    rotation[lhs_next][rhs_axis] -
+                translation[lhs_next] *
+                    rotation[lhs_last][rhs_axis]);
+            if (projected_translation > lhs_radius + rhs_radius) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 double ProjectedRadius(const urdf::Geometry& geometry,
                         const Transform& collision_transform,
                         const Vector3& plane_normal) {
@@ -182,9 +394,10 @@ struct ArmPathSafety::Impl {
     ArmPathSafetyResult CheckConfiguration(
         const std::vector<float>& joints,
         const SupportPlane& support_plane,
-        float required_clearance_m) const {
+        float required_clearance_m,
+        bool check_support_surface = true) const {
         ArmPathSafetyResult result;
-        if (!support_plane.valid) {
+        if (check_support_surface && !support_plane.valid) {
             result.detail = "support surface is unavailable";
             return result;
         }
@@ -193,11 +406,14 @@ struct ArmPathSafety::Impl {
             return result;
         }
 
-        const Vector3 plane_normal = Normalize(Vector3{
-            support_plane.normal_x,
-            support_plane.normal_y,
-            support_plane.normal_z});
-        if (Norm(plane_normal) < kMinimumVectorNorm) {
+        const Vector3 plane_normal = check_support_surface
+            ? Normalize(Vector3{
+                support_plane.normal_x,
+                support_plane.normal_y,
+                support_plane.normal_z})
+            : Vector3{0.0, 0.0, 1.0};
+        if (check_support_surface &&
+            Norm(plane_normal) < kMinimumVectorNorm) {
             result.detail = "support surface normal is invalid";
             return result;
         }
@@ -206,17 +422,35 @@ struct ArmPathSafety::Impl {
         result.minimum_clearance_m = std::numeric_limits<float>::infinity();
         Transform link_transform;
         bool collision_geometry_found = false;
+        bool arm_collision_geometry_found = false;
+        std::vector<CollisionBox> collision_boxes;
 
         const auto check_link = [&](const urdf::LinkConstSharedPtr& link,
                                     const Transform& transform,
+                                    int link_order,
+                                    bool arm_link,
+                                    bool check_support_plane,
                                     ArmPathSafetyResult* output) {
             if (!link) return;
             const auto& collisions = link->collision_array;
             for (const urdf::CollisionSharedPtr& collision : collisions) {
                 if (!collision || !collision->geometry) continue;
                 collision_geometry_found = true;
+                if (arm_link) {
+                    arm_collision_geometry_found = true;
+                }
                 const Transform collision_transform = Compose(
                     transform, FromUrdfPose(collision->origin));
+                if (!HasSupportedCollisionGeometry(*collision->geometry)) {
+                    output->safe = false;
+                    output->detail = "unsupported mesh collision on link " +
+                        link->name;
+                    return;
+                }
+                collision_boxes.push_back(MakeCollisionBox(
+                    *collision->geometry, collision_transform,
+                    link->name, link_order));
+                if (!check_support_plane) continue;
                 const double radius = ProjectedRadius(
                     *collision->geometry, collision_transform, plane_normal);
                 if (!std::isfinite(radius)) {
@@ -254,9 +488,13 @@ struct ArmPathSafety::Impl {
             }
         };
 
+        check_link(base, Transform{}, 0, false, false, &result);
+        if (!result.safe) return result;
+
         // The fixed base mount may intentionally touch the chassis support.
         // Only links downstream of a movable arm joint can sweep into it.
-        for (const ChainEntry& entry : chain) {
+        for (size_t index = 0; index < chain.size(); ++index) {
+            const ChainEntry& entry = chain[index];
             link_transform = Compose(
                 link_transform,
                 FromUrdfPose(entry.joint->parent_to_joint_origin_transform));
@@ -266,18 +504,45 @@ struct ArmPathSafety::Impl {
                     JointMotion(
                         *entry.joint, joints[entry.movable_joint_index]));
             }
-            check_link(entry.child_link, link_transform, &result);
+            check_link(
+                entry.child_link, link_transform,
+                static_cast<int>(index + 1),
+                true, check_support_surface, &result);
             if (!result.safe) return result;
         }
 
         if (!std::isfinite(result.minimum_clearance_m)) {
-            if (!collision_geometry_found) {
+            if (!collision_geometry_found ||
+                !arm_collision_geometry_found) {
                 result.safe = false;
                 result.detail = "URDF chain has no collision geometry";
+                return result;
             }
-            return result;
         }
-        if (result.minimum_clearance_m + 1e-6f < required_clearance_m) {
+        for (size_t lhs = 0; lhs < collision_boxes.size(); ++lhs) {
+            for (size_t rhs = lhs + 1; rhs < collision_boxes.size(); ++rhs) {
+                const CollisionBox& lhs_box = collision_boxes[lhs];
+                const CollisionBox& rhs_box = collision_boxes[rhs];
+                if (lhs_box.link_order == rhs_box.link_order ||
+                    std::abs(lhs_box.link_order - rhs_box.link_order) <= 1) {
+                    continue;
+                }
+                // These conservative boxes overlap throughout the known-safe
+                // folded-arm transition. The executor checks this pair with
+                // its calibrated joint-space body-collision region.
+                if (UsesCalibratedBodyCollisionModel(lhs_box, rhs_box)) {
+                    continue;
+                }
+                if (BoxesOverlap(lhs_box, rhs_box)) {
+                    result.safe = false;
+                    result.detail = "collision between " +
+                        lhs_box.link_name + " and " + rhs_box.link_name;
+                    return result;
+                }
+            }
+        }
+        if (check_support_surface &&
+            result.minimum_clearance_m + 1e-6f < required_clearance_m) {
             result.safe = false;
             result.detail = ClearanceDetail(
                 result.link_name,
@@ -365,6 +630,27 @@ ArmPathSafetyResult ArmPathSafety::CheckPath(
     const SupportPlane& support_plane,
     float required_clearance_m,
     float maximum_joint_step_rad) const {
+    return CheckPathInternal(
+        start_joints, target_joints, support_plane,
+        required_clearance_m, maximum_joint_step_rad, true);
+}
+
+ArmPathSafetyResult ArmPathSafety::CheckSelfCollisionPath(
+    const std::vector<float>& start_joints,
+    const std::vector<float>& target_joints,
+    float maximum_joint_step_rad) const {
+    return CheckPathInternal(
+        start_joints, target_joints, SupportPlane{},
+        0.0f, maximum_joint_step_rad, false);
+}
+
+ArmPathSafetyResult ArmPathSafety::CheckPathInternal(
+    const std::vector<float>& start_joints,
+    const std::vector<float>& target_joints,
+    const SupportPlane& support_plane,
+    float required_clearance_m,
+    float maximum_joint_step_rad,
+    bool check_support_surface) const {
     ArmPathSafetyResult result;
     if (start_joints.size() != target_joints.size() || start_joints.empty()) {
         result.detail = "path joint vectors have different sizes";
@@ -394,8 +680,9 @@ ArmPathSafetyResult ArmPathSafety::CheckPath(
             sample[joint] = start_joints[joint] +
                 progress * (target_joints[joint] - start_joints[joint]);
         }
-        ArmPathSafetyResult configuration = CheckConfiguration(
-            sample, support_plane, required_clearance_m);
+        ArmPathSafetyResult configuration = impl_->CheckConfiguration(
+            sample, support_plane, required_clearance_m,
+            check_support_surface);
         if (configuration.minimum_clearance_m < result.minimum_clearance_m) {
             result.minimum_clearance_m = configuration.minimum_clearance_m;
             result.link_name = configuration.link_name;
@@ -410,6 +697,53 @@ ArmPathSafetyResult ArmPathSafety::CheckPath(
             return configuration;
         }
     }
+    return result;
+}
+
+ArmPathSafetyResult ArmPathSafety::CheckContactRetreatPath(
+    const std::vector<float>& start_joints,
+    const std::vector<float>& target_joints,
+    const SupportPlane& support_plane,
+    float required_clearance_m,
+    float maximum_joint_step_rad,
+    float maximum_start_penetration_m,
+    float maximum_clearance_regression_m) const {
+    ArmPathSafetyResult result;
+    if (maximum_start_penetration_m < 0.0f ||
+        maximum_clearance_regression_m < 0.0f) {
+        result.detail = "contact retreat tolerances are invalid";
+        return result;
+    }
+
+    const ArmPathSafetyResult start = CheckConfiguration(
+        start_joints, support_plane, -maximum_start_penetration_m);
+    if (!start.safe) {
+        result = start;
+        result.detail = "contact retreat start is unsafe: " + start.detail;
+        return result;
+    }
+
+    const float retreat_clearance_floor = std::min(
+        required_clearance_m,
+        start.minimum_clearance_m - maximum_clearance_regression_m);
+    result = CheckPath(
+        start_joints, target_joints, support_plane,
+        retreat_clearance_floor, maximum_joint_step_rad);
+    if (!result.safe) {
+        result.detail = "contact retreat path is unsafe: " + result.detail;
+        return result;
+    }
+
+    const ArmPathSafetyResult target = CheckConfiguration(
+        target_joints, support_plane, required_clearance_m);
+    if (!target.safe) {
+        result = target;
+        result.detail =
+            "contact retreat target did not restore normal clearance: " +
+            target.detail;
+        return result;
+    }
+
     return result;
 }
 

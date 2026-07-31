@@ -35,6 +35,7 @@
 #include <opencv2/imgproc.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include "camera_calibration.h"
 #include "grasp_planner.h"
 #include "orientation_estimator.h"
 #include "vision_service.h"
@@ -78,7 +79,7 @@ static float ImageLineAngleFromHorizontal(float image_angle) {
     return angle;
 }
 
-struct AppConfig {
+struct DebugGraspAppConfig {
     std::string config_path;
     std::string target_name;
     std::string output_dir = "./debug_grasp_output";
@@ -153,8 +154,8 @@ static std::optional<std::pair<cv::Point, uint16_t>> FindValidDepthInBox(
     return best;
 }
 
-static AppConfig ParseArgs(int argc, char* argv[]) {
-    AppConfig cfg;
+static DebugGraspAppConfig ParseArgs(int argc, char* argv[]) {
+    DebugGraspAppConfig cfg;
     cfg.config_path = kDefaultConfigPath;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -205,16 +206,7 @@ static GraspPlannerConfig LoadPlannerConfig(const std::string& pipeline_config) 
     YAML::Node root = YAML::LoadFile(pipeline_config);
     GraspPlannerConfig cfg;
 
-    if (root["calibration"] && root["calibration"]["T_base_camera"]) {
-        auto t = root["calibration"]["T_base_camera"]["translation"];
-        auto r = root["calibration"]["T_base_camera"]["rotation"];
-        if (t && r && t.size() >= 3 && r.size() >= 3) {
-            for (int i = 0; i < 3; ++i) {
-                cfg.t_base_camera[i] = t[i].as<float>();
-                cfg.r_base_camera[i] = r[i].as<float>();
-            }
-        }
-    }
+    perceptive_grasp::LoadCameraCalibration(root, "realsense", &cfg);
 
     auto grasp = root["grasp"];
     if (grasp) {
@@ -376,7 +368,7 @@ static bool WaitEnter(const std::string& msg) {
 
 int main(int argc, char* argv[]) {
     try {
-        AppConfig app = ParseArgs(argc, argv);
+        DebugGraspAppConfig app = ParseArgs(argc, argv);
         if (app.config_path.empty()) {
             std::cerr << "[debug_grasp] Error: --config is required" << std::endl;
             return 1;

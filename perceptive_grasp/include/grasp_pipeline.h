@@ -30,28 +30,14 @@
 #include "grasp_planner.h"
 #include "mobile_base_controller.h"
 #include "orientation_estimator.h"
+#include "pipeline_state.h"
+#include "pipeline_timing.h"
 #include "stereo_camera.h"
+#include "target_association.h"
 #include "target_detector.h"
 #include "voice_command_parser.h"
 
 namespace perceptive_grasp {
-
-/** Pipeline 状态 */
-enum class PipelineState {
-    IDLE,           // 空闲，等待触发
-    OBSERVING,      // 移到观察位，准备检测
-    DETECTING,      // 正在检测目标
-    PLANNING,       // 规划抓取
-    BASE_ALIGNING,  // 底盘短距离对齐目标后重新检测
-    APPROACHING,    // 接近目标
-    GRASPING,       // 执行抓取
-    LIFTING,        // 抬起
-    PLACING,        // 放置
-    HOMING,         // 放置后回到观察姿态
-    RECOVERING,     // 任务失败后回到安全恢复姿态
-    DONE,           // 完成
-    ERROR,          // 错误
-};
 
 /** Pipeline 事件回调 (用于外部集成，如语音反馈) */
 using PipelineCallback = std::function<void(PipelineState state,
@@ -67,14 +53,14 @@ struct PipelineConfig {
     OrientationConfig orientation;  // 夹爪方向估计配置
 
     // Pipeline 行为
-    int max_retries = 2;           // 抓空重试次数
-    int detect_stable_frames = 1;  // 连续检测到才执行 (防误检)
+    int max_retries = 3;           // 抓空重试次数
+    int detect_stable_frames = 3;  // 目标位置和轮廓连续稳定帧数
     bool auto_loop = false;        // 自动循环抓取
     bool auto_orient = true;       // 自动对齐夹爪方向 (根据物体形状)
     bool step_mode = false;        // 单步模式 (每阶段暂停确认)
     bool plan_only = false;        // 仅验证感知、IK 和路径，不执行运动
     bool performance_log_enabled = false;  // 是否打印检测/IK耗时日志
-    int target_missing_frames = 10; // 指定目标连续未检出多少帧后报不存在
+    int target_missing_frames = 20; // 指定目标连续未检出多少帧后报不存在
     // Top-grasp pixel offset: 0=center, 1=short-axis edge.
     float top_grasp_point_x_ratio = 0.5f;
     VoiceCommandConfig voice;       // 语音命令配置
@@ -184,13 +170,6 @@ private:
         std::future<GraspResult> future;
     };
 
-    struct StageTiming {
-        int sequence = 0;
-        PipelineState state = PipelineState::IDLE;
-        std::int64_t elapsed_ms = 0;
-        std::string result;
-    };
-
     PipelineConfig config_;
 
     // 模块
@@ -211,16 +190,22 @@ private:
     int missing_count_ = 0;
     int geometry_retry_count_ = 0;
     int base_align_attempts_ = 0;
+    bool target_stationary_confirmed_ = false;
     bool motion_geometry_confirmation_pending_ = false;
     bool motion_geometry_reference_valid_ = false;
     int motion_geometry_sample_count_ = 0;
     int motion_geometry_consistent_count_ = 0;
     int motion_geometry_refresh_count_ = 0;
     ObjectGeometry3D motion_geometry_reference_;
+    bool top_alignment_reference_valid_ = false;
+    std::array<float, 3> top_alignment_reference_ = {};
     bool have_previous_base_alignment_point_ = false;
     std::array<float, 3> previous_base_alignment_point_ = {};
     MobileBaseAlignmentCommand previous_base_alignment_command_;
-    float base_align_commanded_travel_m_ = 0.0f;
+    bool last_top_support_plane_valid_ = false;
+    SupportPlane last_top_support_plane_;
+    float base_align_travel_m_ = 0.0f;
+    int base_align_direction_reversals_ = 0;
     AsyncAction action_;
     bool failure_recovery_active_ = false;
     bool failure_recovery_succeeded_ = false;
@@ -240,11 +225,13 @@ private:
     std::atomic<bool> shutdown_requested_{false};
     bool return_to_observe_pending_ = false;
     bool return_to_home_pending_ = false;
+    bool place_possible_object_pending_ = false;
     bool waiting_voice_target_ = false;
     std::chrono::steady_clock::time_point waiting_voice_target_since_;
 
     // 缓存的检测和规划结果
     DetectionTarget current_target_{};
+    TargetTrack target_track_{};
     std::vector<DetectionTarget> last_candidates_;
     cv::Mat current_color_;
     cv::Mat current_depth_;
@@ -258,6 +245,8 @@ private:
     GraspGeometryResult grasp_geometry_result_;
     ObjectGeometry3D last_valid_geometry_;
     bool last_valid_geometry_available_ = false;
+    GraspStrategy last_valid_strategy_ = GraspStrategy::TOP;
+    bool last_valid_strategy_available_ = false;
     bool top_geometry_recovery_active_ = false;
     MobileBaseAlignmentCommand base_alignment_command_;
     float grasp_yaw_rad_ = NAN;  // 夹爪旋转角 (NAN=不覆盖)
@@ -267,14 +256,9 @@ private:
     std::string last_status_message_;
 
     // One task may visit DETECTING/PLANNING/BASE_ALIGNING multiple times.
-    bool task_timing_active_ = false;
-    bool stage_timing_active_ = false;
-    int stage_sequence_ = 0;
-    std::chrono::steady_clock::time_point task_started_at_;
-    std::chrono::steady_clock::time_point stage_started_at_;
+    PipelineTiming task_timing_;
     std::chrono::steady_clock::time_point perception_cycle_started_at_;
     bool perception_cycle_active_ = false;
-    std::vector<StageTiming> stage_timings_;
     std::int64_t initialization_elapsed_ms_ = 0;
 
     void SetState(PipelineState new_state, const std::string& msg = "");
@@ -296,6 +280,7 @@ private:
                                 GraspResult result) const;
     bool RetryRecoverableMotion(const std::string& phase,
                                 GraspResult result);
+    GraspResult PlacePossibleObjectAndReturnHome();
     bool FlushCameraAfterMotion(const char* reason);
     bool SaveStepCameraDebug(const char* phase);
     bool BuildMaskTopGrasp(
@@ -305,8 +290,25 @@ private:
         uint16_t& depth_mm,
         float cam_point[3],
         float base_point[3],
-        std::string& error);
+        std::string& error,
+        float fallback_depth_mm = NAN,
+        const SupportPlane* fallback_support_plane = nullptr,
+        bool allow_global_mask_depth = true);
+    bool EstimateSupportPlaneDepth(
+        const SupportPlane& support_plane,
+        int pixel_x,
+        int pixel_y,
+        float& depth_mm) const;
+    bool ResolveTopSupportPlane(
+        const TablePlane& table,
+        SupportPlane& support_plane,
+        std::string& source);
+    bool BuildLowProfileTopFallback(
+        const GraspGeometryResult& failed_geometry,
+        GraspGeometryResult& recovered_geometry);
+    bool ConfirmTopAlignmentPoint(const float alignment_point[3]);
     void HandleTopPlanning();
+    bool RetryTransientTopPlanning(const std::string& reason);
     void SaveGraspDebug(float grasp_px, float grasp_py, uint16_t depth_mm,
                         const float cam_point[3], const float base_point[3]);
     void SaveTaskResultDebug(PipelineState terminal_state,
@@ -316,6 +318,9 @@ private:
     void HandleDetecting();
     void HandlePlanning();
     void HandleBaseAligning();
+    bool ValidateBaseAlignmentCommandTransition(
+        const MobileBaseAlignmentCommand& command,
+        std::string& error);
     void HandleApproaching();
     void HandleGrasping();
     void HandleLifting();

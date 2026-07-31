@@ -61,7 +61,29 @@ public:
         float required_clearance_m,
         float maximum_joint_step_rad) const;
 
+    ArmPathSafetyResult CheckSelfCollisionPath(
+        const std::vector<float>& start_joints,
+        const std::vector<float>& target_joints,
+        float maximum_joint_step_rad) const;
+
+    ArmPathSafetyResult CheckContactRetreatPath(
+        const std::vector<float>& start_joints,
+        const std::vector<float>& target_joints,
+        const SupportPlane& support_plane,
+        float required_clearance_m,
+        float maximum_joint_step_rad,
+        float maximum_start_penetration_m,
+        float maximum_clearance_regression_m) const;
+
 private:
+    ArmPathSafetyResult CheckPathInternal(
+        const std::vector<float>& start_joints,
+        const std::vector<float>& target_joints,
+        const SupportPlane& support_plane,
+        float required_clearance_m,
+        float maximum_joint_step_rad,
+        bool check_support_surface) const;
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

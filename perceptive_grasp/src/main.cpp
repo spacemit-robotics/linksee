@@ -32,6 +32,7 @@
 
 namespace fs = std::filesystem;
 
+#include "camera_calibration.h"
 #include "grasp_pipeline.h"
 #ifdef ENABLE_ROS2_VOICE
 #include "voice_command_listener.h"
@@ -73,25 +74,6 @@ static void CleanupRuntime(bool destroy_pipeline = true) {
     if (g_local_voice_thread.joinable()) {
         g_local_voice_thread.detach();
     }
-}
-
-static const char* PipelineStateName(PipelineState state) {
-    switch (state) {
-        case PipelineState::IDLE: return "IDLE";
-        case PipelineState::OBSERVING: return "OBSERVING";
-        case PipelineState::DETECTING: return "DETECTING";
-        case PipelineState::PLANNING: return "PLANNING";
-        case PipelineState::BASE_ALIGNING: return "BASE_ALIGNING";
-        case PipelineState::APPROACHING: return "APPROACHING";
-        case PipelineState::GRASPING: return "GRASPING";
-        case PipelineState::LIFTING: return "LIFTING";
-        case PipelineState::PLACING: return "PLACING";
-        case PipelineState::HOMING: return "HOMING";
-        case PipelineState::RECOVERING: return "RECOVERING";
-        case PipelineState::DONE: return "DONE";
-        case PipelineState::ERROR: return "ERROR";
-    }
-    return "UNKNOWN";
 }
 
 static std::string EscapeStatusField(const std::string& text) {
@@ -318,19 +300,8 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         }
     }
 
-    // Calibration
-    if (auto cal = root["calibration"]) {
-        if (auto tbc = cal["T_base_camera"]) {
-            if (auto t = tbc["translation"]) {
-                for (int i = 0; i < 3; i++)
-                    cfg.planner.t_base_camera[i] = t[i].as<float>(0.0f);
-            }
-            if (auto r = tbc["rotation"]) {
-                for (int i = 0; i < 3; i++)
-                    cfg.planner.r_base_camera[i] = r[i].as<float>(0.0f);
-            }
-        }
-    }
+    perceptive_grasp::LoadCameraCalibration(
+        root, cfg.camera.type, &cfg.planner);
 
     // Grasp strategy
     if (auto g = root["grasp"]) {
@@ -394,7 +365,7 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
                 50, geometry["planning_timeout_ms"].as<int>(
                         settings.planning_timeout_ms));
             settings.perception_budget_ms = std::max(
-                settings.planning_timeout_ms,
+                1,
                 geometry["perception_budget_ms"].as<int>(
                     settings.perception_budget_ms));
         }
@@ -402,9 +373,15 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             settings.side_min_height_m =
                 side["min_height_m"].as<float>(
                     settings.side_min_height_m);
+            settings.side_min_height_width_ratio =
+                side["min_height_width_ratio"].as<float>(
+                    settings.side_min_height_width_ratio);
             settings.side_approach_distance_m =
                 side["approach_distance_m"].as<float>(
                     settings.side_approach_distance_m);
+            settings.side_entry_clearance_m =
+                side["entry_clearance_m"].as<float>(
+                    settings.side_entry_clearance_m);
             settings.side_pregrasp_min_x_m =
                 side["pregrasp_min_x_m"].as<float>(
                     settings.side_pregrasp_min_x_m);
@@ -440,7 +417,9 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             settings.footprint_padding_m < 0.0f ||
             settings.gripper_max_width_m <= 0.0f ||
             settings.side_min_height_m < 0.0f ||
+            settings.side_min_height_width_ratio <= 0.0f ||
             settings.side_approach_distance_m <= 0.0f ||
+            settings.side_entry_clearance_m < 0.0f ||
             settings.side_pregrasp_min_x_m < 0.0f ||
             settings.side_grasp_forward_offset_m < 0.0f ||
             settings.side_grasp_height_ratio <= 0.0f ||
@@ -702,6 +681,18 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         cfg.mobile_base.max_total_travel_m =
             base["max_total_travel_m"].as<float>(
                 cfg.mobile_base.max_total_travel_m);
+        cfg.mobile_base.odom_min_translation_m =
+            base["odom_min_translation_m"].as<float>(
+                cfg.mobile_base.odom_min_translation_m);
+        cfg.mobile_base.odom_min_rotation_rad =
+            base["odom_min_rotation_rad"].as<float>(
+                cfg.mobile_base.odom_min_rotation_rad);
+        cfg.mobile_base.odom_min_command_ratio =
+            base["odom_min_command_ratio"].as<float>(
+                cfg.mobile_base.odom_min_command_ratio);
+        cfg.mobile_base.max_direction_reversals =
+            base["max_direction_reversals"].as<int>(
+                cfg.mobile_base.max_direction_reversals);
     }
 
     // Timing between pipeline/executor stages
@@ -839,9 +830,18 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
     validate_normalized("grasp.gripper_effort", cfg.executor.gripper_effort);
     validate_normalized("place.release_open",
                         cfg.executor.place_release_open);
+    validate_normalized(
+        "detection.min_confidence", cfg.detector.min_confidence);
     if (cfg.executor.gripper_empty_position_margin < 0.0f) {
         throw std::runtime_error(
             "grasp.gripper_empty_position_margin must be non-negative");
+    }
+    if (cfg.mobile_base.odom_min_translation_m < 0.0f ||
+        cfg.mobile_base.odom_min_rotation_rad < 0.0f ||
+        cfg.mobile_base.odom_min_command_ratio < 0.0f ||
+        cfg.mobile_base.max_direction_reversals < 0) {
+        throw std::runtime_error(
+            "mobile_base odometry thresholds must be non-negative");
     }
 
     return cfg;

@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PIPELINE_H = ROOT / "include" / "grasp_pipeline.h"
 PIPELINE_CPP = ROOT / "src" / "grasp_pipeline.cpp"
 MAIN_CPP = ROOT / "src" / "main.cpp"
+MOBILE_BASE_CPP = ROOT / "src" / "mobile_base_controller.cpp"
 CMAKE = ROOT / "CMakeLists.txt"
 CONFIG = ROOT / "config" / "grasp_pipeline.yaml"
 
@@ -38,6 +39,7 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
         cls.header = PIPELINE_H.read_text(encoding="utf-8")
         cls.pipeline = PIPELINE_CPP.read_text(encoding="utf-8")
         cls.main = MAIN_CPP.read_text(encoding="utf-8")
+        cls.mobile_base = MOBILE_BASE_CPP.read_text(encoding="utf-8")
         cls.cmake = CMAKE.read_text(encoding="utf-8")
         cls.config = CONFIG.read_text(encoding="utf-8")
 
@@ -55,13 +57,16 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
         self.assertLess(align_index, approach_index)
         self.assertIn("PipelineState::BASE_ALIGNING", body)
 
-    def test_max_base_alignment_attempts_stop_before_arm_planning(self):
+    def test_max_base_alignment_attempts_fall_back_to_arm_validation(self):
         body = _function_body(self.pipeline, "void GraspPipeline::HandlePlanning")
-        max_attempts_index = body.find("Base alignment failed: max attempts")
+        max_attempts_index = body.find(
+            "reached the alignment attempt")
         plan_index = body.find("executor_->ValidateGraspPoses")
         self.assertGreaterEqual(max_attempts_index, 0)
         self.assertGreaterEqual(plan_index, 0)
         self.assertLess(max_attempts_index, plan_index)
+        self.assertIn(
+            "continuing with workspace, IK and path validation", body)
 
     def test_alignment_has_progress_and_travel_safety_guards(self):
         body = _function_body(self.pipeline, "void GraspPipeline::HandlePlanning")
@@ -70,10 +75,27 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
         self.assertIn("required_progress", body)
         self.assertIn("limited but valid", body)
         self.assertIn("max_visual_regression_m", body)
-        self.assertIn("allowed regression", body)
+        self.assertIn("visual progress regressed", body)
+        self.assertIn("base_alignment_soft_stopped", body)
         self.assertIn("max_total_travel_m", body)
+        self.assertIn("base_align_travel_m_", body)
         self.assertIn("visual progress", body)
-        self.assertIn("check depth and motion", body)
+        self.assertIn(
+            "arm safety validation remains required", body)
+        self.assertIn("ValidateBaseAlignmentCommandTransition", body)
+
+    def test_unconfirmed_odometry_falls_back_to_visual_confirmation(self):
+        execute = _function_body(
+            self.mobile_base,
+            "GraspResult MobileBaseController::Execute")
+        self.assertIn(
+            "continuing with visual confirmation", execute)
+        unconfirmed_index = execute.find(
+            "report.odometry_available && !report.motion_confirmed")
+        return_index = execute.find(
+            "return GraspResult::SUCCESS", unconfirmed_index)
+        self.assertGreaterEqual(unconfirmed_index, 0)
+        self.assertGreater(return_index, unconfirmed_index)
 
     def test_planning_prefers_foreground_mask_depth(self):
         body = _function_body(self.pipeline, "void GraspPipeline::HandlePlanning")
@@ -91,12 +113,55 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
         self.assertIn("required_shift", body)
         self.assertIn("std::clamp", body)
         self.assertIn("config_.planner.workspace.x_max", body)
+        self.assertIn(
+            "alignment_config.x_tolerance =\n"
+            "                0.5f * kSidePreGraspAlignmentWindowM",
+            body,
+        )
+        self.assertIn(
+            "alignment_config.x_hysteresis =\n"
+            "                kSidePreGraspUpperHysteresisM",
+            body,
+        )
+        self.assertNotIn(
+            "alignment_config.x_tolerance = std::min",
+            body,
+        )
         self.assertNotIn(
             "config_.mobile_base.target_x +",
             body,
         )
         self.assertIn("alignment_config.target_x = base_point[0]", body)
         self.assertIn("preserving current base distance", body)
+
+    def test_side_alignment_stops_after_minimum_pulse_overshoot(self):
+        body = _function_body(
+            self.pipeline, "void GraspPipeline::HandlePlanning")
+        self.assertIn("side_pregrasp_alignment_active", body)
+        self.assertIn(
+            "IsMobileBaseDirectionReversal(",
+            body,
+        )
+        self.assertIn(
+            "minimum chassis pulse crossed the side alignment target",
+            body,
+        )
+        self.assertIn(
+            "validating ",
+            body,
+        )
+        self.assertIn(
+            "arm reachability at the current position",
+            body,
+        )
+        self.assertIn(
+            "workspace and IK validation ",
+            body,
+        )
+        self.assertIn(
+            "remain required",
+            body,
+        )
 
     def test_top_grasp_alignment_uses_candidate_grasp_point(self):
         body = _function_body(
@@ -115,6 +180,9 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
         body = _function_body(
             self.pipeline, "void GraspPipeline::HandleBaseAligning")
         self.assertIn("mobile_base_->Execute", body)
+        self.assertIn("mobile_base_->LastMotionReport()", body)
+        self.assertIn("motion_report.odometry_available", body)
+        self.assertIn("motion_report.translation_m", body)
         self.assertIn('SetState(PipelineState::DETECTING', body)
         self.assertIn("stable_count_ = 0", body)
         self.assertIn('FlushCameraAfterMotion("base motion")', body)
@@ -124,6 +192,7 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
         self.assertIn("target_x: 0.275", self.config)
         self.assertIn("x_tolerance:", self.config)
         self.assertIn("y_tolerance: 0.15", self.config)
+        self.assertIn("min_cmd_duration_ms: 350", self.config)
         self.assertIn("cfg.mobile_base.enabled", self.main)
         self.assertIn("target_x", self.main)
         self.assertIn("x_hysteresis", self.main)
@@ -133,6 +202,10 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
         self.assertIn("min_progress_floor_m", self.main)
         self.assertIn("max_visual_regression_m", self.main)
         self.assertIn("max_total_travel_m", self.main)
+        self.assertIn("odom_min_translation_m", self.main)
+        self.assertIn("odom_min_rotation_rad", self.main)
+        self.assertIn("odom_min_command_ratio", self.main)
+        self.assertIn("max_direction_reversals", self.main)
 
     def test_build_includes_mobile_base_controller(self):
         self.assertIn("src/mobile_base_controller.cpp", self.cmake)

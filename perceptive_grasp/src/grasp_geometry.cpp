@@ -29,13 +29,10 @@ constexpr float kForegroundDepthMarginMm = 30.0f;
 // dominate the fitted cloud. Graspable tabletop objects fit within 120 mm
 // along the camera ray; larger depth gaps belong to the support/background.
 constexpr float kMaximumObjectDepthSpanMm = 120.0f;
-constexpr float kHollowContainerDepthSpanMm = 45.0f;
+constexpr float kSilhouetteDepthSpanMm = 45.0f;
 constexpr float kSupportDepthBeforeObjectMm = 100.0f;
 constexpr float kSupportDepthBehindObjectMm = 500.0f;
-
-bool IsUprightContainer(const std::string& label_name) {
-    return label_name == "cup" || label_name == "bottle";
-}
+constexpr float kLockedSideHysteresisRatio = 0.85f;
 
 bool WithinDimensionTolerance(float reference,
                                 float current,
@@ -83,6 +80,19 @@ float Clamp(float value, float lower, float upper) {
     return std::max(lower, std::min(value, upper));
 }
 
+float HeightToFootprintRatio(const ObjectGeometry3D& geometry) {
+    return geometry.height_m /
+        std::max(geometry.length_m, kEpsilon);
+}
+
+bool IsClearlyHorizontal(const ObjectGeometry3D& geometry,
+                            const GraspGeometryConfig& config) {
+    return geometry.valid &&
+        HeightToFootprintRatio(geometry) <
+            config.side_min_height_width_ratio *
+                kLockedSideHysteresisRatio;
+}
+
 float Percentile(std::vector<float> values, float quantile) {
     if (values.empty()) return NAN;
     quantile = Clamp(quantile, 0.0f, 1.0f);
@@ -114,19 +124,6 @@ float MedianDepthAround(const cv::Mat& depth,
         }
     }
     return Percentile(values, 0.50f);
-}
-
-bool MeetsTargetSizePrior(const DetectionTarget& target,
-                            const ObjectGeometry3D& geometry) {
-    const float footprint = std::max(
-        geometry.length_m, geometry.width_m);
-    if (target.label_name == "cup") {
-        return geometry.height_m >= 0.040f && footprint >= 0.030f;
-    }
-    if (target.label_name == "bottle") {
-        return geometry.height_m >= 0.060f && footprint >= 0.025f;
-    }
-    return true;
 }
 
 cv::Mat NormalizeTargetMask(const DetectionTarget& target,
@@ -917,7 +914,7 @@ GraspCandidate MakeSideCandidate(
         Scale(
             geometry.table.normal,
             geometry.height_m + config.finger_half_height_m +
-                config.side_approach_distance_m));
+                config.side_entry_clearance_m));
     candidate.entry_clearance_z_m = entry_clearance_point.z;
     const cv::Point3f retreat_point = Add(
         grasp_point,
@@ -942,6 +939,59 @@ GraspCandidate MakeSideCandidate(
         candidate.geometry_valid = true;
     }
     return candidate;
+}
+
+float PoseWorkspaceMargin(
+    const Pose3D& pose,
+    const GraspPlannerConfig& planner_config) {
+    const WorkspaceLimits& workspace = planner_config.workspace;
+    return std::min({
+        pose.x - workspace.x_min,
+        workspace.x_max - pose.x,
+        pose.y - workspace.y_min,
+        workspace.y_max - pose.y,
+        pose.z - workspace.z_min,
+        workspace.z_max - pose.z});
+}
+
+void ApplyCandidateQualityScore(
+    GraspCandidate& candidate,
+    const ObjectGeometry3D& geometry,
+    const GraspGeometryConfig& config,
+    const GraspPlannerConfig& planner_config) {
+    candidate.width_margin_m = std::max(
+        0.0f, config.gripper_max_width_m - candidate.required_width_m);
+    candidate.depth_quality = Clamp(
+        static_cast<float>(geometry.object_point_count) /
+            static_cast<float>(std::max(
+                config.min_object_points * 4, 1)),
+        0.0f, 1.0f);
+    candidate.path_clearance_m =
+        candidate.strategy == GraspStrategy::TOP
+        ? std::max(
+            0.0f, candidate.pre_grasp_pose.z - candidate.grasp_pose.z)
+        : std::max(
+            0.0f,
+            candidate.entry_clearance_z_m - candidate.pre_grasp_pose.z);
+    candidate.workspace_margin_m = std::min({
+        PoseWorkspaceMargin(candidate.pre_grasp_pose, planner_config),
+        PoseWorkspaceMargin(candidate.grasp_pose, planner_config),
+        PoseWorkspaceMargin(candidate.retreat_pose, planner_config),
+        PoseWorkspaceMargin(candidate.lift_pose, planner_config)});
+
+    const float normalized_width_margin = Clamp(
+        candidate.width_margin_m /
+            std::max(config.gripper_max_width_m, kEpsilon),
+        0.0f, 1.0f);
+    const float normalized_path_clearance = Clamp(
+        candidate.path_clearance_m / 0.05f, 0.0f, 1.0f);
+    const float normalized_workspace_margin = Clamp(
+        candidate.workspace_margin_m / 0.05f, 0.0f, 1.0f);
+    candidate.score +=
+        0.12f * normalized_width_margin +
+        0.08f * candidate.depth_quality +
+        0.05f * normalized_path_clearance +
+        0.05f * normalized_workspace_margin;
 }
 
 }  // namespace
@@ -1004,7 +1054,8 @@ bool GraspGeometryPlanner::Plan(
     const DetectionTarget& target,
     const StereoCamera& camera,
     const GraspPlanner& coordinate_planner,
-    GraspGeometryResult& result) const {
+    GraspGeometryResult& result,
+    std::optional<GraspStrategy> locked_strategy) const {
     const auto started_at = std::chrono::steady_clock::now();
     result = GraspGeometryResult{};
     if (depth.empty() || depth.type() != CV_16UC1) {
@@ -1022,18 +1073,34 @@ bool GraspGeometryPlanner::Plan(
                 cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3)));
     if (cv::countNonZero(eroded_mask) < 16) eroded_mask = target_mask;
 
-    // Transparent and hollow containers often have valid depth only on their
-    // silhouette. Eroding that mask would retain the background visible
-    // through the object and remove the useful wall samples.
-    const bool hollow_container = IsUprightContainer(target.label_name);
     const float silhouette_width = std::max(1.0f, target.x2 - target.x1);
     const float silhouette_height = std::max(1.0f, target.y2 - target.y1);
-    const bool upright_container_silhouette =
-        hollow_container &&
-        silhouette_height >= 1.05f * silhouette_width;
+    const std::vector<cv::Point> target_pixels = SamplePixels(
+        target_mask, AdaptiveStride(target_mask, config_));
+    std::vector<float> target_depths;
+    target_depths.reserve(target_pixels.size());
+    for (const cv::Point& pixel : target_pixels) {
+        const uint16_t depth_mm = depth.at<uint16_t>(pixel.y, pixel.x);
+        if (depth_mm != 0) target_depths.push_back(depth_mm);
+    }
+    result.center_depth_mm = MedianDepthAround(depth, target.center, 4);
+    const float near_mask_depth_mm = Percentile(target_depths, 0.05f);
+    const bool silhouette_depth_pattern =
+        target_depths.size() <
+            static_cast<size_t>(config_.min_object_points) ||
+        (std::isfinite(result.center_depth_mm) &&
+        std::isfinite(near_mask_depth_mm) &&
+        result.center_depth_mm - near_mask_depth_mm >=
+            kForegroundDepthMarginMm);
+    const bool upright_silhouette =
+        silhouette_height >= 1.05f * silhouette_width &&
+        silhouette_depth_pattern;
+
+    // Open or transparent upright targets are identified from image shape and
+    // depth discontinuity. No object class is used for this decision.
     const cv::Mat& object_mask =
-        hollow_container ? target_mask : eroded_mask;
-    const int stride = hollow_container
+        upright_silhouette ? target_mask : eroded_mask;
+    const int stride = upright_silhouette
         ? 1
         : AdaptiveStride(object_mask, config_);
     const std::vector<cv::Point> object_pixels =
@@ -1068,30 +1135,56 @@ bool GraspGeometryPlanner::Plan(
     const std::vector<cv::Point> support_pixels =
         SamplePixels(support_mask, std::max(2, stride * 2));
 
-    result.center_depth_mm = MedianDepthAround(depth, target.center, 4);
     std::string silhouette_error;
-    if (upright_container_silhouette) {
+    if (upright_silhouette) {
         std::vector<cv::Point3f> support_points;
         DeprojectPixels(
             support_pixels, depth, camera, coordinate_planner,
             1.0f, 20000.0f, support_points);
+
+        ObjectGeometry3D silhouette_geometry;
+        std::vector<cv::Point3f> silhouette_points;
         if (EstimateUprightContainerFromSilhouette(
                 target_mask, support_points, camera, coordinate_planner,
-                config_, result.geometry, result.object_points,
-                silhouette_error) &&
-            MeetsTargetSizePrior(target, result.geometry)) {
+                config_, silhouette_geometry, silhouette_points,
+                silhouette_error)) {
+            ObjectGeometry3D depth_geometry;
+            std::vector<cv::Point3f> depth_points;
+            std::string depth_geometry_error;
+            std::vector<cv::Point3f> raw_depth_points;
+            bool depth_geometry_valid = false;
+            if (!target_depths.empty()) {
+                const float depth_low = std::max(
+                    1.0f, Percentile(target_depths, 0.01f) -
+                        kForegroundDepthMarginMm);
+                const float depth_high =
+                    Percentile(target_depths, 0.99f) +
+                        kForegroundDepthMarginMm;
+                DeprojectPixels(
+                    target_pixels, depth, camera, coordinate_planner,
+                    depth_low, depth_high, raw_depth_points);
+                depth_geometry_valid = EstimateObjectGeometry(
+                    raw_depth_points, support_points, config_,
+                    depth_geometry, &depth_points,
+                    depth_geometry_error);
+            }
+
+            if (depth_geometry_valid &&
+                IsClearlyHorizontal(depth_geometry, config_)) {
+                result.geometry = depth_geometry;
+                result.object_points = std::move(depth_points);
+            } else {
+                result.geometry = silhouette_geometry;
+                result.object_points = std::move(silhouette_points);
+            }
             result.candidates = GenerateCandidates(
                 result.geometry, result.object_points, config_,
-                planner_config_, target.label_name);
+                planner_config_, locked_strategy);
             result.elapsed_ms =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - started_at)
                     .count();
             return !result.candidates.empty();
-        }
-        if (result.geometry.valid && silhouette_error.empty()) {
-            silhouette_error =
-                "silhouette geometry violates target size prior";
         }
         result.geometry = ObjectGeometry3D{};
         result.object_points.clear();
@@ -1128,11 +1221,8 @@ bool GraspGeometryPlanner::Plan(
         if (!duplicate) foreground_candidates.push_back(candidate);
     }
 
-    // The center of a cup often observes the support surface through its
-    // opening. Prefer the near wall for cups; other targets use a more robust
-    // lower quartile that is less sensitive to small foreground occluders.
     const float foreground_quantile =
-        hollow_container ? 0.01f : 0.25f;
+        upright_silhouette ? 0.01f : 0.25f;
     const float foreground_reference_depth_mm =
         Percentile(object_depths, foreground_quantile);
     float best_reference_error_mm = std::numeric_limits<float>::max();
@@ -1143,8 +1233,8 @@ bool GraspGeometryPlanner::Plan(
     for (const float foreground_depth : foreground_candidates) {
         const float depth_low = std::max(
             1.0f, foreground_depth - kForegroundDepthMarginMm);
-        const float maximum_depth_span = hollow_container
-            ? kHollowContainerDepthSpanMm
+        const float maximum_depth_span = upright_silhouette
+            ? kSilhouetteDepthSpanMm
             : kMaximumObjectDepthSpanMm;
         const float depth_high = foreground_depth + maximum_depth_span;
         std::vector<cv::Point3f> raw_object_points;
@@ -1183,18 +1273,6 @@ bool GraspGeometryPlanner::Plan(
                         << candidate_error << " (object="
                         << raw_object_points.size() << ", support="
                         << support_points.size() << ")";
-            cluster_diagnostics.push_back(diagnostic.str());
-            continue;
-        }
-        if (!MeetsTargetSizePrior(target, candidate_geometry)) {
-            last_geometry_error = "foreground cluster violates target "
-                "size prior";
-            std::ostringstream diagnostic;
-            diagnostic << std::lround(foreground_depth)
-                        << "mm: target size prior failed (dims=["
-                        << candidate_geometry.length_m << ","
-                        << candidate_geometry.width_m << ","
-                        << candidate_geometry.height_m << "]m)";
             cluster_diagnostics.push_back(diagnostic.str());
             continue;
         }
@@ -1242,7 +1320,7 @@ bool GraspGeometryPlanner::Plan(
     }
     result.candidates = GenerateCandidates(
         result.geometry, result.object_points, config_, planner_config_,
-        target.label_name);
+        locked_strategy);
     result.elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started_at)
@@ -1406,27 +1484,29 @@ std::vector<GraspCandidate> GraspGeometryPlanner::GenerateCandidates(
     const std::vector<cv::Point3f>& object_points,
     const GraspGeometryConfig& config,
     const GraspPlannerConfig& planner_config,
-    const std::string& target_label) {
+    std::optional<GraspStrategy> locked_strategy) {
     std::vector<GraspCandidate> candidates;
     if (!geometry.valid) return candidates;
     const bool allow_top = config.strategy == "auto" ||
         config.strategy == "top";
     const bool allow_side = config.strategy == "auto" ||
         config.strategy == "side";
-    const float height_width_ratio = geometry.height_m /
-        std::max(geometry.width_m, kEpsilon);
-    const bool upright_container = IsUprightContainer(target_label);
-    const float side_min_height = upright_container
-        ? std::min(config.side_min_height_m, 0.040f)
-        : config.side_min_height_m;
-    const float side_min_height_width_ratio = upright_container
-        ? std::min(config.side_min_height_width_ratio, 0.85f)
-        : config.side_min_height_width_ratio;
-    const bool side_shape =
-        geometry.height_m >= side_min_height &&
-        height_width_ratio >= side_min_height_width_ratio;
-    const bool upright_requires_side = config.strategy == "auto" &&
-        side_shape;
+    const float height_footprint_ratio =
+        HeightToFootprintRatio(geometry);
+    const bool preferred_side_shape =
+        geometry.height_m >= config.side_min_height_m &&
+        height_footprint_ratio >=
+            config.side_min_height_width_ratio;
+    const bool locked_side_shape =
+        locked_strategy == GraspStrategy::SIDE &&
+        geometry.height_m >=
+            config.side_min_height_m * kLockedSideHysteresisRatio &&
+        height_footprint_ratio >=
+            config.side_min_height_width_ratio *
+                kLockedSideHysteresisRatio;
+    const bool side_shape = preferred_side_shape || locked_side_shape;
+    const bool geometry_requires_side = config.strategy == "auto" &&
+        preferred_side_shape;
 
     if (allow_top) {
         const TopGraspSection section =
@@ -1472,8 +1552,8 @@ std::vector<GraspCandidate> GraspGeometryPlanner::GenerateCandidates(
             top.grasp_yaw_rad -= static_cast<float>(CV_PI);
         }
 
-        if (upright_requires_side) {
-            Reject(top, "upright object requires side grasp");
+        if (geometry_requires_side) {
+            Reject(top, "3D geometry requires side grasp");
         } else if (object_width_m + kMinimumGripperClearanceM >
             config.gripper_max_width_m) {
             Reject(top, "required top opening exceeds gripper width");
@@ -1504,28 +1584,33 @@ std::vector<GraspCandidate> GraspGeometryPlanner::GenerateCandidates(
             if (Dot(major, radial) < 0.0f) major = Scale(major, -1.0f);
 
             const float tall_bonus = 0.12f * Clamp(
-                (height_width_ratio - config.side_min_height_width_ratio) /
-                    2.0f,
+                (height_footprint_ratio -
+                    config.side_min_height_width_ratio) / 2.0f,
                 0.0f, 1.0f);
+            const float side_base_score =
+                preferred_side_shape ? 0.88f : 0.65f;
             const cv::Point3f radial_opening(
                 -radial.y, radial.x, 0.0f);
             candidates.push_back(MakeSideCandidate(
                 geometry, object_points, radial, radial_opening,
-                config, 0.88f + tall_bonus));
+                config, side_base_score + tall_bonus));
 
-            // A hollow container can have one footprint axis stretched by
-            // missing depth around its rim. Keep the measured minor-axis
-            // opening candidate even when its approach is not exactly radial;
-            // IK and path validation still gate execution.
-            if (upright_container ||
-                std::fabs(Dot(major, radial)) >= 0.98f) {
+            // Keep one geometrically distinct approach so IK and path
+            // validation can choose the safer reachable side.
+            if (std::fabs(Dot(major, radial)) < 0.98f) {
                 candidates.push_back(MakeSideCandidate(
                     geometry, object_points, major, geometry.minor_axis,
-                    config, 0.84f + tall_bonus));
+                    config, side_base_score - 0.04f + tall_bonus));
             }
         }
     }
 
+    for (GraspCandidate& candidate : candidates) {
+        if (candidate.geometry_valid) {
+            ApplyCandidateQualityScore(
+                candidate, geometry, config, planner_config);
+        }
+    }
     std::stable_sort(
         candidates.begin(), candidates.end(),
         [](const GraspCandidate& lhs, const GraspCandidate& rhs) {

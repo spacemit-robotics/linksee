@@ -74,7 +74,7 @@ static void ComputeTopDownQuat(float yaw_deg, float& qw, float& qx, float& qy, f
     qz = a1*d2 + b1*c2 - c1*b2 + d1*a2;
 }
 
-struct AppConfig {
+struct DebugExecuteSafeAppConfig {
     std::string config_path;
     Pose3D pre_grasp_pose{};
     bool has_pose = false;
@@ -138,8 +138,8 @@ static bool ConfirmStep(const std::string& msg, bool auto_yes) {
     return line == "y" || line == "Y" || line == "yes" || line == "YES";
 }
 
-static AppConfig ParseArgs(int argc, char* argv[]) {
-    AppConfig cfg;
+static DebugExecuteSafeAppConfig ParseArgs(int argc, char* argv[]) {
+    DebugExecuteSafeAppConfig cfg;
     cfg.config_path = kDefaultConfigPath;
 
     for (int i = 1; i < argc; ++i) {
@@ -268,7 +268,7 @@ static ExecutorConfig LoadExecutorConfig(const std::string& config_path) {
 
 int main(int argc, char* argv[]) {
     try {
-        AppConfig app = ParseArgs(argc, argv);
+        DebugExecuteSafeAppConfig app = ParseArgs(argc, argv);
         if (app.config_path.empty() || (!app.has_pose && !app.has_joints)) {
             PrintUsage(argv[0]);
             return 1;

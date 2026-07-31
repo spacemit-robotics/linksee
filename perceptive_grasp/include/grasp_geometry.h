@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -43,10 +44,11 @@ struct GraspGeometryConfig {
     float footprint_padding_m = 0.005f;
     float gripper_max_width_m = 0.075f;
     float side_min_height_m = 0.060f;
-    float side_min_height_width_ratio = 1.10f;
-    float side_approach_distance_m = 0.030f;
+    float side_min_height_width_ratio = 1.0f;
+    float side_approach_distance_m = 0.020f;
+    float side_entry_clearance_m = 0.030f;
     float side_pregrasp_min_x_m = 0.270f;
-    float side_gripper_offset_m = 0.005f;
+    float side_gripper_offset_m = 0.015f;
     float side_grasp_forward_offset_m = 0.0f;
     float side_initial_lift_m = 0.050f;
     float side_lift_retreat_m = 0.025f;
@@ -92,6 +94,11 @@ struct GraspCandidate {
     cv::Point3f opening_axis{0.0f, 1.0f, 0.0f};
     float grasp_yaw_rad = NAN;
     float required_width_m = 0.0f;
+    float width_margin_m = 0.0f;
+    float depth_quality = 0.0f;
+    float path_clearance_m = 0.0f;
+    float workspace_margin_m = 0.0f;
+    float ik_margin_rad = NAN;
     float score = 0.0f;
     bool geometry_valid = false;
     std::string rejection_reason;
@@ -137,7 +144,9 @@ public:
                 const DetectionTarget& target,
                 const StereoCamera& camera,
                 const GraspPlanner& coordinate_planner,
-                GraspGeometryResult& result) const;
+                GraspGeometryResult& result,
+                std::optional<GraspStrategy> locked_strategy =
+                    std::nullopt) const;
 
     static bool EstimateObjectGeometry(
         const std::vector<cv::Point3f>& object_points,
@@ -152,7 +161,7 @@ public:
         const std::vector<cv::Point3f>& object_points,
         const GraspGeometryConfig& config,
         const GraspPlannerConfig& planner_config,
-        const std::string& target_label = "");
+        std::optional<GraspStrategy> locked_strategy = std::nullopt);
 
 private:
     GraspGeometryConfig config_;

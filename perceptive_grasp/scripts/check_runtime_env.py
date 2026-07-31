@@ -12,6 +12,7 @@ import getpass
 import grp
 import importlib
 import json
+import math
 import os
 import re
 import shutil
@@ -43,6 +44,39 @@ def status(ok: bool, name: str, detail: str = "") -> bool:
     mark = "OK" if ok else "FAIL"
     print(f"[{mark}] {name}" + (f": {detail}" if detail else ""))
     return ok
+
+
+def check_hand_eye_calibration(root: Dict[str, Any],
+                               camera_type: str) -> bool:
+    backend = "realsense" if camera_type == "d435i" else camera_type
+    calibration = root.get("calibration", {})
+    profile = calibration.get(backend, {}) \
+        if isinstance(calibration, dict) else {}
+    transform = profile.get("T_base_camera", {}) \
+        if isinstance(profile, dict) else {}
+    legacy_profile = False
+    if (not transform and backend == "realsense" and
+            isinstance(calibration, dict)):
+        transform = calibration.get("T_base_camera", {})
+        legacy_profile = bool(transform)
+    translation = transform.get("translation") \
+        if isinstance(transform, dict) else None
+    rotation = transform.get("rotation") \
+        if isinstance(transform, dict) else None
+    field_name = f"calibration.{backend}.T_base_camera"
+
+    if not (isinstance(translation, list) and len(translation) == 3 and
+            isinstance(rotation, list) and len(rotation) == 3):
+        return status(False, field_name,
+                      "translation and rotation must each contain 3 values")
+    try:
+        values = [float(value) for value in translation + rotation]
+    except (TypeError, ValueError):
+        return status(False, field_name, "values must be numeric")
+    detail = "legacy shared profile; migrate to calibration.realsense" \
+        if legacy_profile else "selected camera backend"
+    return status(all(math.isfinite(value) for value in values),
+                  field_name, detail)
 
 
 def prompt_yes_no(question: str, default: bool = False) -> bool:
@@ -949,6 +983,8 @@ def main() -> int:
     backend_config = camera.get(camera_type) if supported_camera else None
     ok &= status(isinstance(backend_config, dict),
                  f"camera.{camera_type} configuration")
+    if supported_camera:
+        ok &= check_hand_eye_calibration(root, camera_type)
     sdk_root = os.environ.get("SDK_ROOT", "") or infer_sdk_root(os.getcwd())
     ok &= check_application_binaries()
     report_serial_devices(device, mobile_base_device)

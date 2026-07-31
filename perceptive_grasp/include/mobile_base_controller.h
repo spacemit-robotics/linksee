@@ -9,6 +9,8 @@
 #ifndef MOBILE_BASE_CONTROLLER_H
 #define MOBILE_BASE_CONTROLLER_H
 
+#include <mutex>
+#include <optional>
 #include <string>
 
 namespace perceptive_grasp {
@@ -46,7 +48,7 @@ struct MobileBaseAlignmentConfig {
     float max_step_m = 0.12f;
     float linear_speed = 0.20f;
     float angular_speed = 1.2f;
-    // Compensates the measured yaw response of the Linksee UART chassis.
+    // Compensates the measured yaw response of the linksee UART chassis.
     float yaw_gain = 8.0f;
     int min_cmd_duration_ms = 350;
     int min_rotation_duration_ms = 1000;
@@ -58,6 +60,10 @@ struct MobileBaseAlignmentConfig {
     float min_progress_floor_m = 0.003f;
     float max_visual_regression_m = 0.010f;
     float max_total_travel_m = 0.24f;
+    float odom_min_translation_m = 0.003f;
+    float odom_min_rotation_rad = 0.010f;
+    float odom_min_command_ratio = 0.05f;
+    int max_direction_reversals = 1;
 };
 
 /** One bounded chassis motion selected by the alignment planner. */
@@ -74,6 +80,27 @@ struct MobileBaseAlignmentCommand {
     int duration_ms = 0;
     bool max_attempts_reached = false;
     std::string reason;
+};
+
+/** Chassis pose reported by the base driver. */
+struct MobileBaseOdometry {
+    float x = 0.0f;
+    float y = 0.0f;
+    float yaw = 0.0f;
+};
+
+/** Measured result of one bounded chassis command. */
+struct MobileBaseMotionReport {
+    bool odometry_available = false;
+    bool motion_confirmed = false;
+    float forward_m = 0.0f;
+    float lateral_m = 0.0f;
+    float yaw_rad = 0.0f;
+    float translation_m = 0.0f;
+    float signed_progress = 0.0f;
+    float required_progress = 0.0f;
+    float commanded_motion = 0.0f;
+    std::string detail;
 };
 
 /**
@@ -107,6 +134,24 @@ float RequiredMobileBaseAlignmentProgress(
     const float previous_base_point[3],
     const MobileBaseAlignmentCommand& previous_command);
 
+/**
+ * @brief Evaluate measured odometry for one chassis command.
+ *
+ * Missing odometry is reported as unavailable so the caller can fall back to
+ * visual confirmation. Available odometry must show motion in the commanded
+ * direction.
+ */
+MobileBaseMotionReport EvaluateMobileBaseMotion(
+    const MobileBaseAlignmentConfig& config,
+    const MobileBaseAlignmentCommand& command,
+    const std::optional<MobileBaseOdometry>& before,
+    const std::optional<MobileBaseOdometry>& after);
+
+/** Return true when two commands reverse the same motion axis. */
+bool IsMobileBaseDirectionReversal(
+    const MobileBaseAlignmentCommand& previous,
+    const MobileBaseAlignmentCommand& current);
+
 /** Owns the selected chassis driver and executes bounded alignment commands. */
 class MobileBaseController {
 public:
@@ -119,12 +164,19 @@ public:
     /** Execute one bounded chassis command and brake when it completes. */
     GraspResult Execute(const MobileBaseAlignmentCommand& command);
 
+    /** Return the measured result of the most recently completed command. */
+    MobileBaseMotionReport LastMotionReport() const;
+
     /** Stop chassis motion immediately. */
     void Brake();
 
 private:
+    void SetLastMotionReport(const MobileBaseMotionReport& report);
+
     MobileBaseAlignmentConfig config_;
     void* chassis_ = nullptr;
+    mutable std::mutex motion_report_mutex_;
+    MobileBaseMotionReport last_motion_report_;
 };
 
 }  // namespace perceptive_grasp

@@ -69,6 +69,16 @@ public:
     /** Return the backend frame identifier from the last successful capture. */
     virtual std::int64_t LastFrameId() const = 0;
 
+    /**
+     * Discard frames already queued by the backend without running image
+     * conversion or depth processing. Returns the discarded frame count, or
+     * -1 on failure.
+     */
+    virtual int DiscardQueuedFrames(int max_frames) {
+        (void)max_frames;
+        return 0;
+    }
+
     /** Reset stateful processing after the robot changes the camera pose. */
     virtual void ResetAfterMotion() {}
 
