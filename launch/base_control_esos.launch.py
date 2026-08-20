@@ -22,6 +22,9 @@ def generate_launch_description():
     send_hz = LaunchConfiguration('send_hz')
     odom_hz = LaunchConfiguration('odom_hz')
     cmd_vel_timeout = LaunchConfiguration('cmd_vel_timeout')
+    deadzone_epsilon = LaunchConfiguration('deadzone_epsilon')
+    min_linear_velocity = LaunchConfiguration('min_linear_velocity')
+    min_angular_velocity = LaunchConfiguration('min_angular_velocity')
     publish_tf = LaunchConfiguration('publish_tf')
     odom_topic = LaunchConfiguration('odom_topic')
     odom_frame = LaunchConfiguration('odom_frame')
@@ -61,6 +64,24 @@ def generate_launch_description():
         'cmd_vel_timeout',
         default_value='0.2',
         description='Timeout in seconds before stopping when cmd_vel is lost'
+    )
+
+    declare_deadzone_epsilon = DeclareLaunchArgument(
+        'deadzone_epsilon',
+        default_value='0.001',
+        description='Velocity deadzone epsilon. Commands at or below this absolute value are treated as zero'
+    )
+
+    declare_min_linear_velocity = DeclareLaunchArgument(
+        'min_linear_velocity',
+        default_value='0.04',
+        description='Minimum absolute linear.x velocity sent to chassis when command is outside deadzone'
+    )
+
+    declare_min_angular_velocity = DeclareLaunchArgument(
+        'min_angular_velocity',
+        default_value='0.41',
+        description='Minimum absolute angular.z velocity sent to chassis when command is outside deadzone'
     )
 
     declare_publish_tf = DeclareLaunchArgument(
@@ -234,6 +255,9 @@ def generate_launch_description():
             'send_hz': send_hz,
             'odom_hz': odom_hz,
             'cmd_vel_timeout': cmd_vel_timeout,
+            'deadzone_epsilon': deadzone_epsilon,
+            'min_linear_velocity': min_linear_velocity,
+            'min_angular_velocity': min_angular_velocity,
             'publish_tf': publish_tf,
             'odom_topic': odom_topic,
             'odom_frame': odom_frame,
@@ -261,6 +285,9 @@ def generate_launch_description():
         declare_send_hz,
         declare_odom_hz,
         declare_cmd_vel_timeout,
+        declare_deadzone_epsilon,
+        declare_min_linear_velocity,
+        declare_min_angular_velocity,
         declare_publish_tf,
         declare_odom_topic,
         declare_odom_frame,
