@@ -18,6 +18,8 @@
 
 namespace perceptive_grasp {
 
+struct MockDetectorTestAccess;
+
 /**
     * @brief OpenCV DNN 版目标检测器 (x86 standalone)
     *
@@ -37,13 +39,15 @@ public:
                         DetectionTarget& target) override;
 
 private:
+    friend struct MockDetectorTestAccess;
     cv::dnn::Net net_;
     float conf_threshold_ = 0.5f;
     float nms_threshold_ = 0.45f;
     int input_size_ = 640;
 
     bool LoadLabels(const std::string& label_file);
-    void PostprocessYOLOv8(const cv::Mat& output, const cv::Mat& image,
+    void PostprocessYOLOv8(const std::vector<cv::Mat>& outputs,
+                            const cv::Mat& image,
                             std::vector<DetectionTarget>& targets);
 };
 

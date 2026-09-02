@@ -126,6 +126,30 @@ float MedianDepthAround(const cv::Mat& depth,
     return Percentile(values, 0.50f);
 }
 
+float MedianMaskBoundaryDepth(const cv::Mat& depth,
+    const cv::Mat& mask) {
+    cv::Mat interior;
+    cv::erode(mask, interior,
+        cv::getStructuringElement(
+            cv::MORPH_ELLIPSE, cv::Size(5, 5)));
+    cv::Mat boundary;
+    cv::subtract(mask, interior, boundary);
+
+    std::vector<float> values;
+    values.reserve(static_cast<size_t>(cv::countNonZero(boundary)));
+    for (int y = 0; y < boundary.rows; ++y) {
+        const uint8_t* boundary_row = boundary.ptr<uint8_t>(y);
+        const uint16_t* depth_row = depth.ptr<uint16_t>(y);
+        for (int x = 0; x < boundary.cols; ++x) {
+            if (boundary_row[x] != 0 && depth_row[x] != 0) {
+                values.push_back(static_cast<float>(depth_row[x]));
+            }
+        }
+    }
+    if (values.size() < 16) return NAN;
+    return Percentile(values, 0.50f);
+}
+
 cv::Mat NormalizeTargetMask(const DetectionTarget& target,
                             const cv::Size& image_size) {
     cv::Mat mask;
@@ -531,6 +555,21 @@ bool EstimateUprightContainerFromSilhouette(
         error = "container silhouette width is unavailable";
         return false;
     }
+    if (!config.side_single_sided_gripper) {
+        const int center_x = static_cast<int>(std::lround(
+            static_cast<float>(bottom_x) + kWidthHeightRatio *
+                static_cast<float>(top_x - bottom_x)));
+        const int symmetric_half_width = std::min(
+            center_x - left_x, right_x - center_x);
+        if (symmetric_half_width < 2) {
+            error = "container silhouette body width is unavailable";
+            return false;
+        }
+        // Simulation uses a symmetric parallel gripper. Ignore a handle or
+        // spout that extends only one side of the rendered silhouette.
+        left_x = center_x - symmetric_half_width;
+        right_x = center_x + symmetric_half_width;
+    }
     cv::Point3f left_origin;
     cv::Point3f left_direction;
     cv::Point3f right_origin;
@@ -888,8 +927,17 @@ GraspCandidate MakeSideCandidate(
         minimum_center_height, maximum_center_height);
     cv::Point3f grasp_point = Add(
         geometry.table_center, Scale(geometry.table.normal, center_height));
-    const float fixed_jaw_offset_m =
-        0.5f * object_width_m + config.side_gripper_offset_m;
+    cv::Point3f visible_surface_axis = Normalize(
+        cv::Point3f(geometry.center.x, geometry.center.y, 0.0f));
+    if (Norm(visible_surface_axis) >= kEpsilon) {
+        grasp_point = Add(
+            grasp_point,
+            Scale(
+                visible_surface_axis,
+                config.side_visible_surface_offset_m));
+    }
+    const float fixed_jaw_offset_m = config.side_gripper_offset_m +
+        (config.side_single_sided_gripper ? 0.5f * object_width_m : 0.0f);
     grasp_point = Add(grasp_point,
                         Scale(opening, fixed_jaw_offset_m));
 
@@ -932,7 +980,11 @@ GraspCandidate MakeSideCandidate(
 
     if (object_width_m + kMinimumGripperClearanceM >
         config.gripper_max_width_m) {
-        Reject(candidate, "required side opening exceeds gripper width");
+        std::ostringstream reason;
+        reason << "required side opening exceeds gripper width"
+                << " (object=" << object_width_m
+                << "m, limit=" << config.gripper_max_width_m << "m)";
+        Reject(candidate, reason.str());
     } else {
         candidate.required_width_m = std::min(
             candidate.required_width_m, config.gripper_max_width_m);
@@ -1084,13 +1136,21 @@ bool GraspGeometryPlanner::Plan(
         if (depth_mm != 0) target_depths.push_back(depth_mm);
     }
     result.center_depth_mm = MedianDepthAround(depth, target.center, 4);
-    const float near_mask_depth_mm = Percentile(target_depths, 0.05f);
+    // The inside edge of the segmentation mask is a more stable foreground
+    // reference than a low global percentile. A small nearby occluder (for
+    // example the robot wrist entering one side of the mask) can dominate the
+    // 5th/25th percentiles even though the object center and most of its
+    // silhouette remain at the correct depth. The boundary median also keeps
+    // the intended behavior for hollow objects, where the center sees through
+    // the opening but the rim carries the object depth.
+    const float boundary_depth_mm =
+        MedianMaskBoundaryDepth(depth, target_mask);
     const bool silhouette_depth_pattern =
         target_depths.size() <
             static_cast<size_t>(config_.min_object_points) ||
         (std::isfinite(result.center_depth_mm) &&
-        std::isfinite(near_mask_depth_mm) &&
-        result.center_depth_mm - near_mask_depth_mm >=
+        std::isfinite(boundary_depth_mm) &&
+        result.center_depth_mm - boundary_depth_mm >=
             kForegroundDepthMarginMm);
     const bool upright_silhouette =
         silhouette_height >= 1.05f * silhouette_width &&
@@ -1205,8 +1265,19 @@ bool GraspGeometryPlanner::Plan(
     }
 
     std::vector<float> foreground_candidates;
+    if (std::isfinite(boundary_depth_mm)) {
+        foreground_candidates.push_back(boundary_depth_mm);
+    }
     if (std::isfinite(result.center_depth_mm)) {
-        foreground_candidates.push_back(result.center_depth_mm);
+        const bool duplicate = std::any_of(
+            foreground_candidates.begin(), foreground_candidates.end(),
+            [center_depth = result.center_depth_mm](float existing) {
+                return std::fabs(existing - center_depth) <
+                    kForegroundDepthMarginMm;
+            });
+        if (!duplicate) {
+            foreground_candidates.push_back(result.center_depth_mm);
+        }
     }
     for (const float quantile : {
             0.005f, 0.01f, 0.02f, 0.05f, 0.10f, 0.25f, 0.50f,
@@ -1221,10 +1292,11 @@ bool GraspGeometryPlanner::Plan(
         if (!duplicate) foreground_candidates.push_back(candidate);
     }
 
-    const float foreground_quantile =
-        upright_silhouette ? 0.01f : 0.25f;
     const float foreground_reference_depth_mm =
-        Percentile(object_depths, foreground_quantile);
+        std::isfinite(boundary_depth_mm)
+            ? boundary_depth_mm
+            : Percentile(
+                object_depths, upright_silhouette ? 0.01f : 0.25f);
     float best_reference_error_mm = std::numeric_limits<float>::max();
     float best_geometry_volume = -1.0f;
     int best_object_point_count = -1;

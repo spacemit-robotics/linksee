@@ -74,9 +74,13 @@ void GraspPipeline::HandleGrasping() {
         }
         StartAction(
             PipelineState::GRASPING, "open_move_close_gripper", [this]() {
+                std::cout << "[GraspExecutor] grasp phase=open_gripper"
+                        << std::endl;
                 auto result = executor_->OpenGripperForGrasp(grasp_opening_);
                 if (result != GraspResult::SUCCESS) return result;
                 object_may_be_held_.store(false);
+                std::cout << "[GraspExecutor] grasp phase=descend_to_target"
+                        << std::endl;
                 result = executor_->MoveToGrasp(
                     grasp_pose_, grasp_yaw_rad_,
                     grasp_strategy_ == GraspStrategy::TOP);
@@ -89,6 +93,8 @@ void GraspPipeline::HandleGrasping() {
                 // Closing has started, so recovery must assume that an
                 // object may be held until EMPTY or release is confirmed.
                 object_may_be_held_.store(true);
+                std::cout << "[GraspExecutor] grasp phase=close_gripper"
+                        << std::endl;
                 return executor_->CloseGripperAndCheck();
             });
         return;
@@ -100,7 +106,9 @@ void GraspPipeline::HandleGrasping() {
     switch (*result) {
         case GraspResult::SUCCESS:
             object_may_be_held_.store(true);
-            SetState(PipelineState::LIFTING, "Object held, lifting...");
+            SetState(
+                PipelineState::LIFTING,
+                "Gripper closed; lifting to verify object holding...");
             break;
 
         case GraspResult::EMPTY:

@@ -24,6 +24,151 @@ import check_runtime_env  # noqa: E402
 
 
 class RuntimeEnvDiagnosticsTest(unittest.TestCase):
+    def test_sensevoice_backend_uses_sdk_managed_models(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            ok = check_runtime_env.check_voice_asr_backend({
+                "voice": {"asr": {"backend": "sensevoice"}},
+            })
+
+        self.assertTrue(ok)
+        self.assertIn("sensevoice", output.getvalue())
+
+    def test_qwen_backend_checks_llama_server(self):
+        qwen = {
+            "endpoint": "http://10.0.0.2:8063/v1/chat/completions",
+            "model": "qwen3-asr",
+        }
+        with mock.patch.object(
+                check_runtime_env,
+                "probe_qwen3_asr_endpoint",
+                return_value="http://10.0.0.2:8063/health") as probe:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_voice_asr_backend({
+                    "voice": {
+                        "asr": {
+                            "backend": "qwen3_asr",
+                            "qwen3_asr": qwen,
+                        },
+                    },
+                })
+
+        self.assertTrue(ok)
+        probe.assert_called_once_with(qwen)
+        self.assertIn("qwen3_asr", output.getvalue())
+
+    def test_qwen_local_auto_start_checks_runtime_files(self):
+        qwen = {
+            "endpoint": "http://127.0.0.1:8063/v1/chat/completions",
+            "auto_start": True,
+        }
+        with mock.patch.object(
+                check_runtime_env, "validate_qwen3_local_runtime",
+                return_value=("/usr/bin/llama-server", "/models", "/model")):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_voice_asr_backend({
+                    "voice": {
+                        "asr": {
+                            "backend": "qwen3_asr",
+                            "qwen3_asr": qwen,
+                        },
+                    },
+                })
+
+        self.assertTrue(ok)
+        self.assertIn("local auto-start", output.getvalue())
+
+    def test_unknown_asr_backend_is_rejected(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            ok = check_runtime_env.check_voice_asr_backend({
+                "voice": {"asr": {"backend": "whisper"}},
+            })
+
+        self.assertFalse(ok)
+        self.assertIn("unsupported", output.getvalue())
+
+    def test_remote_mujoco_uses_shared_endpoint(self):
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        with mock.patch.object(
+                check_runtime_env.socket, "create_connection",
+                return_value=connection) as create_connection:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_remote_mujoco({
+                    "remote_mujoco": {
+                        "host": "10.0.91.182",
+                        "port": 9090,
+                    },
+                })
+
+        self.assertTrue(ok)
+        create_connection.assert_called_once_with(
+            ("10.0.91.182", 9090), timeout=2.0)
+        self.assertIn("10.0.91.182:9090", output.getvalue())
+
+    def test_remote_mujoco_reports_unreachable_endpoint(self):
+        with mock.patch.object(
+                check_runtime_env.socket, "create_connection",
+                side_effect=OSError("connection refused")):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_remote_mujoco({
+                    "remote_mujoco": {
+                        "host": "127.0.0.1",
+                        "port": 9090,
+                    },
+                })
+
+        self.assertFalse(ok)
+        self.assertIn("unreachable", output.getvalue())
+
+    def test_local_mujoco_checks_server_and_scene_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build = root / "build"
+            config_dir = root / "config"
+            scene = root / "simulation" / "mujoco" / "scene.xml"
+            build.mkdir()
+            config_dir.mkdir()
+            scene.parent.mkdir(parents=True)
+            server = build / "mujoco_grasp_sim_server"
+            server.write_text("#!/bin/sh\n", encoding="utf-8")
+            server.chmod(0o755)
+            scene.write_text("<mujoco/>\n", encoding="utf-8")
+            config = config_dir / "pipeline.yaml"
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_mujoco_simulation({
+                    "camera": {
+                        "mujoco": {"xml_path": "../simulation/mujoco/scene.xml"},
+                    },
+                    "manipulator": {
+                        "mujoco": {"xml_path": "../simulation/mujoco/scene.xml"},
+                    },
+                }, str(config), str(build))
+
+        self.assertTrue(ok)
+        self.assertIn("MuJoCo simulation server", output.getvalue())
+        self.assertIn(str(scene), output.getvalue())
+
+    def test_local_mujoco_rejects_missing_runtime_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config" / "pipeline.yaml"
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_mujoco_simulation({
+                    "camera": {"mujoco": {"xml_path": "missing.xml"}},
+                    "manipulator": {"mujoco": {"xml_path": "missing.xml"}},
+                }, str(config), str(Path(tmp) / "build"))
+
+        self.assertFalse(ok)
+        self.assertIn("missing or not executable", output.getvalue())
+
     def test_hand_eye_calibration_selects_camera_backend(self):
         root = {
             "calibration": {
@@ -302,6 +447,25 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(run.call_args.args[0][0], tool)
         self.assertEqual(run.call_args.kwargs["cwd"], str(ROOT))
+
+    def test_so101_probe_prefers_requested_build_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tool = str(Path(tmp) / "read_joints")
+            Path(tool).write_text("#!/bin/sh\n", encoding="utf-8")
+            Path(tool).chmod(0o755)
+            result = SimpleNamespace(
+                returncode=0,
+                stdout=("[ReadJoints] Current joints (rad): "
+                        "[1, 2, 3, 4, 5]"),
+                stderr="",
+            )
+            with mock.patch.object(check_runtime_env.subprocess, "run",
+                                   return_value=result) as run:
+                ok = check_runtime_env._probe_so101_device(
+                    "/dev/ttyACM1", str(ROOT), tmp)
+
+        self.assertTrue(ok)
+        self.assertEqual(run.call_args.args[0][0], tool)
 
     def test_application_check_finds_launcher_and_core_in_named_build_directory(self):
         build_dir = str(ROOT / "build_release")
@@ -887,7 +1051,7 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         report.assert_called_once_with("/dev/ttyACM2", "")
         serial_roles.assert_called_once_with(
-            "/dev/ttyACM2", "", False, mock.ANY)
+            "/dev/ttyACM2", "", False, mock.ANY, "")
         check_rpmsg.assert_called_once_with(
             "/dev/rpmsg_ctrl0", "/dev/rpmsg0", mock.ANY)
         checked_devices = [call.args[0] for call in check_tty.call_args_list]
@@ -975,7 +1139,8 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
                 mock.patch.object(check_runtime_env, "_udev_properties",
                                   side_effect=fake_props), \
                 mock.patch.object(check_runtime_env, "_probe_so101_device",
-                                  side_effect=lambda d, r: d == "/dev/ttyACM1"):
+                                  side_effect=lambda d, r, b="":
+                                  d == "/dev/ttyACM1"):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 ok = check_runtime_env.check_serial_role_configuration(
@@ -1022,7 +1187,8 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
                                       "ID_VENDOR": "1a86",
                                   }), \
                 mock.patch.object(check_runtime_env, "_probe_so101_device",
-                                  side_effect=lambda d, r: d == "/dev/ttyACM1"):
+                                  side_effect=lambda d, r, b="":
+                                  d == "/dev/ttyACM1"):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 ok = check_runtime_env.check_serial_role_configuration(

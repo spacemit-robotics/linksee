@@ -3,7 +3,7 @@
     * SPDX-License-Identifier: Apache-2.0
     *
     * @file main.cpp
-    * @brief Perceptive Grasp - 视觉抓取 Demo 入口
+    * @brief perceptive_grasp application entry point.
     *
     * 用法:
     *   ./perceptive_grasp --config config/grasp_pipeline.yaml
@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 
 #include <yaml-cpp/yaml.h>
 
@@ -183,6 +185,9 @@ static void PrintUsage(const char* prog) {
                 << "  --loop            Auto-loop; Ctrl+C returns home and exits\n"
                 << "  --step            Step mode: pause before each stage\n"
                 << "  --plan-only       Validate perception and arm path without motion\n"
+                << "  --validate-config Validate configuration without initializing hardware\n"
+                << "  --remote-host <host>  Override remote_mujoco server host\n"
+                << "  --remote-port <port>  Override remote_mujoco server port\n"
                 << "  --help            Show this help\n";
 #ifdef ENABLE_ROS2_VOICE
     std::cout << "  --voice           Listen for ASR text from ROS2 topic (optional)\n"
@@ -221,10 +226,52 @@ static void ResolveConfigPath(const fs::path& config_dir,
     *path = fs::weakly_canonical(resolved).string();
 }
 
+static cv::Scalar ParseHsvTriplet(const YAML::Node& node,
+                                const std::string& field_name) {
+    if (!node || !node.IsSequence() || node.size() != 3) {
+        throw std::runtime_error(field_name + " must contain [h, s, v]");
+    }
+    const int hue = node[0].as<int>();
+    const int saturation = node[1].as<int>();
+    const int value = node[2].as<int>();
+    if (hue < 0 || hue > 179 || saturation < 0 || saturation > 255 ||
+        value < 0 || value > 255) {
+        throw std::runtime_error(field_name + " is outside the OpenCV HSV range");
+    }
+    return cv::Scalar(hue, saturation, value);
+}
+
 static PipelineConfig LoadConfig(const std::string& config_path) {
     PipelineConfig cfg;
 
     YAML::Node root = YAML::LoadFile(config_path);
+
+    // A remote simulation uses one endpoint for both frame acquisition and
+    // robot commands. Backend-local blocks are accepted when present.
+    if (auto remote = root["remote_mujoco"]) {
+        if (!remote.IsMap()) {
+            throw std::runtime_error("remote_mujoco must be a mapping");
+        }
+        const std::string host = remote["host"].as<std::string>(
+            cfg.camera.remote_mujoco.host);
+        const int port = remote["port"].as<int>(
+            cfg.camera.remote_mujoco.port);
+        if (host.empty() || port < 1 || port > 65535) {
+            throw std::runtime_error(
+                "remote_mujoco host must be set and port must be in "
+                "[1, 65535]");
+        }
+        cfg.camera.remote_mujoco.host = host;
+        cfg.camera.remote_mujoco.port = port;
+        cfg.executor.remote_mujoco.host = host;
+        cfg.executor.remote_mujoco.port = port;
+        cfg.camera.remote_mujoco.timeout_ms =
+            remote["frame_timeout_ms"].as<int>(
+                cfg.camera.remote_mujoco.timeout_ms);
+        cfg.executor.remote_mujoco.timeout_ms =
+            remote["action_timeout_ms"].as<int>(
+                cfg.executor.remote_mujoco.timeout_ms);
+    }
 
     // Camera
     if (auto cam = root["camera"]) {
@@ -276,6 +323,38 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
                 settings.max_depth_m =
                     depth["max_m"].as<float>(settings.max_depth_m);
             }
+        } else if (cfg.camera.type == "mujoco") {
+            auto mujoco = cam["mujoco"];
+            if (!mujoco || !mujoco.IsMap()) {
+                throw std::runtime_error(
+                    "camera.mujoco configuration is required");
+            }
+            auto& settings = cfg.camera.mujoco;
+            settings.xml_path = mujoco["xml_path"].as<std::string>(
+                settings.xml_path);
+            settings.camera_name = mujoco["camera_name"].as<std::string>(
+                settings.camera_name);
+            settings.width = mujoco["width"].as<int>(settings.width);
+            settings.height = mujoco["height"].as<int>(settings.height);
+            if (auto depth = mujoco["depth"]) {
+                settings.min_depth_m =
+                    depth["min_m"].as<float>(settings.min_depth_m);
+                settings.max_depth_m =
+                    depth["max_m"].as<float>(settings.max_depth_m);
+            }
+        } else if (cfg.camera.type == "remote_mujoco") {
+            auto remote = cam["remote_mujoco"];
+            auto& settings = cfg.camera.remote_mujoco;
+            if (remote) {
+                if (!remote.IsMap()) {
+                    throw std::runtime_error(
+                        "camera.remote_mujoco must be a mapping");
+                }
+                settings.host = remote["host"].as<std::string>(settings.host);
+                settings.port = remote["port"].as<int>(settings.port);
+                settings.timeout_ms =
+                    remote["timeout_ms"].as<int>(settings.timeout_ms);
+            }
         } else {
             throw std::runtime_error("unsupported camera.type: " +
                                     cfg.camera.type);
@@ -293,9 +372,89 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         cfg.detect_stable_frames =
             std::max(1, det["stable_frames"].as<int>(
                             cfg.detect_stable_frames));
+        cfg.detector.allow_color_only_fallback =
+            det["allow_color_only_fallback"].as<bool>(false);
+        cfg.detector.refine_with_simulation_colors =
+            det["refine_with_simulation_colors"].as<bool>(false);
+        if (cfg.detector.allow_color_only_fallback &&
+            cfg.camera.type != "mujoco" &&
+            cfg.camera.type != "remote_mujoco") {
+            throw std::runtime_error(
+                "detection.allow_color_only_fallback is only valid for "
+                "mujoco camera backends");
+        }
+        if (cfg.detector.refine_with_simulation_colors &&
+            cfg.camera.type != "mujoco" &&
+            cfg.camera.type != "remote_mujoco") {
+            throw std::runtime_error(
+                "detection.refine_with_simulation_colors is only valid "
+                "for mujoco camera backends");
+        }
         if (auto labels = det["target_labels"]) {
             for (size_t i = 0; i < labels.size(); i++) {
                 cfg.detector.target_labels.push_back(labels[i].as<int>());
+            }
+        }
+        if (auto remap = det["label_remap"]) {
+            if (!remap.IsMap()) {
+                throw std::runtime_error(
+                    "detection.label_remap must be a mapping");
+            }
+            for (const auto& item : remap) {
+                const std::string source = item.first.as<std::string>();
+                const std::string target = item.second.as<std::string>();
+                if (source.empty() || target.empty()) {
+                    throw std::runtime_error(
+                        "detection.label_remap entries must not be empty");
+                }
+                cfg.detector.label_remap[source] = target;
+            }
+        }
+        if (auto color_targets = det["simulation_color_targets"]) {
+            if (cfg.camera.type != "mujoco" &&
+                cfg.camera.type != "remote_mujoco") {
+                throw std::runtime_error(
+                    "detection.simulation_color_targets is only valid for "
+                    "mujoco camera backends");
+            }
+            if (!color_targets.IsSequence()) {
+                throw std::runtime_error(
+                    "detection.simulation_color_targets must be a sequence");
+            }
+            for (size_t i = 0; i < color_targets.size(); ++i) {
+                const YAML::Node item = color_targets[i];
+                perceptive_grasp::SimulationColorTargetConfig target;
+                target.label = item["label"].as<std::string>("");
+                if (target.label.empty()) {
+                    throw std::runtime_error(
+                        "simulation color target label must not be empty");
+                }
+                const std::string prefix =
+                    "detection.simulation_color_targets[" +
+                    std::to_string(i) + "]";
+                target.hsv_min = ParseHsvTriplet(
+                    item["hsv_min"], prefix + ".hsv_min");
+                target.hsv_max = ParseHsvTriplet(
+                    item["hsv_max"], prefix + ".hsv_max");
+                target.min_area = item["min_area"].as<float>(
+                    target.min_area);
+                target.max_area = item["max_area"].as<float>(
+                    target.max_area);
+                target.score = item["score"].as<float>(target.score);
+                if (target.min_area <= 0.0f || target.max_area < 0.0f ||
+                    (target.max_area > 0.0f &&
+                        target.max_area < target.min_area) ||
+                    target.score <= 0.0f || target.score > 1.0f) {
+                    throw std::runtime_error(
+                        prefix + " has an invalid area range or score");
+                }
+                for (int channel = 0; channel < 3; ++channel) {
+                    if (target.hsv_min[channel] > target.hsv_max[channel]) {
+                        throw std::runtime_error(
+                            prefix + ".hsv_min must not exceed hsv_max");
+                    }
+                }
+                cfg.detector.simulation_color_targets.push_back(target);
             }
         }
     }
@@ -322,6 +481,56 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             cfg.top_grasp_point_x_ratio > 1.0f) {
             throw std::runtime_error(
                 "grasp.top.grasp_point_x_ratio must be in [0, 1]");
+        }
+        cfg.top_position_source = top["position_source"].as<std::string>(
+            cfg.top_position_source);
+        if (cfg.top_position_source != "mask_depth" &&
+            cfg.top_position_source != "projected_geometry_center") {
+            throw std::runtime_error(
+                "grasp.top.position_source must be mask_depth or "
+                "projected_geometry_center");
+        }
+        cfg.orientation.safe_mask_interior =
+            top["safe_mask_interior"].as<bool>(
+                cfg.orientation.safe_mask_interior);
+        cfg.top_support_plane_occlusion_recovery =
+            top["support_plane_occlusion_recovery"].as<bool>(
+                cfg.top_support_plane_occlusion_recovery);
+        cfg.top_support_plane_height_anchor =
+            top["support_plane_height_anchor"].as<bool>(
+                cfg.top_support_plane_height_anchor);
+        cfg.top_projected_center_blend =
+            top["projected_center_blend"].as<float>(
+                cfg.top_projected_center_blend);
+        cfg.top_sparse_projected_center_blend =
+            top["sparse_projected_center_blend"].as<float>(
+                cfg.top_projected_center_blend);
+        if (cfg.top_projected_center_blend < 0.0f ||
+            cfg.top_projected_center_blend > 1.0f) {
+            throw std::runtime_error(
+                "grasp.top.projected_center_blend must be in [0, 1]");
+        }
+        if (cfg.top_sparse_projected_center_blend < 0.0f ||
+            cfg.top_sparse_projected_center_blend > 1.0f) {
+            throw std::runtime_error(
+                "grasp.top.sparse_projected_center_blend must be in "
+                "[0, 1]");
+        }
+        cfg.top_minimum_grasp_height_m =
+            top["minimum_grasp_height"].as<float>(
+                cfg.top_minimum_grasp_height_m);
+        if (cfg.top_minimum_grasp_height_m < 0.0f) {
+            throw std::runtime_error(
+                "grasp.top.minimum_grasp_height must be non-negative");
+        }
+        cfg.top_verification_lift_m =
+            top["verification_lift_m"].as<float>(
+                cfg.top_verification_lift_m);
+        if (cfg.top_verification_lift_m < 0.0f ||
+            cfg.top_verification_lift_m > cfg.planner.approach_height) {
+            throw std::runtime_error(
+                "grasp.top.verification_lift_m must be in [0, "
+                "grasp.top.approach_height]");
         }
         cfg.executor.gripper_open = top["gripper_open"].as<float>(
             cfg.executor.gripper_open);
@@ -385,9 +594,15 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             settings.side_pregrasp_min_x_m =
                 side["pregrasp_min_x_m"].as<float>(
                     settings.side_pregrasp_min_x_m);
+            settings.side_single_sided_gripper =
+                side["single_sided_gripper"].as<bool>(
+                    settings.side_single_sided_gripper);
             settings.side_gripper_offset_m =
                 side["gripper_offset_m"].as<float>(
                     settings.side_gripper_offset_m);
+            settings.side_visible_surface_offset_m =
+                side["visible_surface_offset_m"].as<float>(
+                    settings.side_visible_surface_offset_m);
             settings.side_grasp_forward_offset_m =
                 side["grasp_forward_offset_m"].as<float>(
                     settings.side_grasp_forward_offset_m);
@@ -421,6 +636,7 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             settings.side_approach_distance_m <= 0.0f ||
             settings.side_entry_clearance_m < 0.0f ||
             settings.side_pregrasp_min_x_m < 0.0f ||
+            settings.side_visible_surface_offset_m < 0.0f ||
             settings.side_grasp_forward_offset_m < 0.0f ||
             settings.side_grasp_height_ratio <= 0.0f ||
             settings.side_grasp_height_ratio >= 1.0f ||
@@ -461,6 +677,8 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             cfg.executor.baudrate);
         cfg.executor.urdf_path = m["urdf_path"].as<std::string>(
             cfg.executor.urdf_path);
+        cfg.executor.legacy_top_ik = m["legacy_top_ik"].as<bool>(
+            cfg.executor.legacy_top_ik);
 
         // 解析 URDF 相对路径: 相对于配置文件所在目录
         if (!cfg.executor.urdf_path.empty() &&
@@ -501,6 +719,82 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             }
         }
 
+        if (auto mj = m["mujoco"]) {
+            auto& mujoco = cfg.executor.mujoco;
+            mujoco.xml_path = mj["xml_path"].as<std::string>(
+                mujoco.xml_path);
+            mujoco.end_effector_site =
+                mj["end_effector_site"].as<std::string>(
+                    mujoco.end_effector_site);
+            mujoco.gripper_actuator =
+                mj["gripper_actuator"].as<std::string>(
+                    mujoco.gripper_actuator);
+            mujoco.robot_root_body =
+                mj["robot_root_body"].as<std::string>(
+                    mujoco.robot_root_body);
+            mujoco.gripper_root_body =
+                mj["gripper_root_body"].as<std::string>(
+                    mujoco.gripper_root_body);
+            mujoco.gripper_open_ctrl =
+                mj["gripper_open_ctrl"].as<float>(
+                    mujoco.gripper_open_ctrl);
+            mujoco.gripper_close_ctrl =
+                mj["gripper_close_ctrl"].as<float>(
+                    mujoco.gripper_close_ctrl);
+            mujoco.gravity_compensation =
+                mj["gravity_compensation"].as<bool>(
+                    mujoco.gravity_compensation);
+            mujoco.arm_stiffness_scale =
+                mj["arm_stiffness_scale"].as<float>(
+                    mujoco.arm_stiffness_scale);
+            if (!std::isfinite(mujoco.arm_stiffness_scale) ||
+                mujoco.arm_stiffness_scale <= 0.0f) {
+                throw std::runtime_error(
+                    "manipulator.mujoco.arm_stiffness_scale must be positive");
+            }
+            mujoco.joint_tolerance_rad =
+                mj["joint_tolerance_rad"].as<float>(
+                    mujoco.joint_tolerance_rad);
+            mujoco.ik_position_tolerance_m =
+                mj["ik_position_tolerance_m"].as<float>(
+                    mujoco.ik_position_tolerance_m);
+            mujoco.cartesian_tracking_tolerance_m =
+                mj["cartesian_tracking_tolerance_m"].as<float>(
+                    mujoco.cartesian_tracking_tolerance_m);
+            mujoco.ik_step_scale =
+                mj["ik_step_scale"].as<float>(mujoco.ik_step_scale);
+            mujoco.ik_damping =
+                mj["ik_damping"].as<float>(mujoco.ik_damping);
+            mujoco.ik_iterations =
+                mj["ik_iterations"].as<int>(mujoco.ik_iterations);
+            mujoco.settle_steps =
+                mj["settle_steps"].as<int>(mujoco.settle_steps);
+            mujoco.max_motion_steps =
+                mj["max_motion_steps"].as<int>(
+                    mujoco.max_motion_steps);
+            if (auto names = mj["joint_names"]) {
+                mujoco.joint_names.clear();
+                for (size_t i = 0; i < names.size(); ++i) {
+                    mujoco.joint_names.push_back(names[i].as<std::string>());
+                }
+            }
+            if (auto names = mj["actuator_names"]) {
+                mujoco.actuator_names.clear();
+                for (size_t i = 0; i < names.size(); ++i) {
+                    mujoco.actuator_names.push_back(
+                        names[i].as<std::string>());
+                }
+            }
+        }
+
+        if (auto remote = m["remote_mujoco"]) {
+            auto& settings = cfg.executor.remote_mujoco;
+            settings.host = remote["host"].as<std::string>(settings.host);
+            settings.port = remote["port"].as<int>(settings.port);
+            settings.timeout_ms =
+                remote["timeout_ms"].as<int>(settings.timeout_ms);
+        }
+
         cfg.executor.ik_max_trials = m["ik_max_trials"].as<int>(cfg.executor.ik_max_trials);
         cfg.executor.wrist_yaw_scale = m["wrist_yaw_scale"].as<float>(cfg.executor.wrist_yaw_scale);
 
@@ -517,15 +811,35 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             }
         }
         if (auto jl = m["joint_limits"]) {
+            if (!jl.IsSequence() || jl.size() == 0) {
+                throw std::runtime_error(
+                    "manipulator.joint_limits must be a non-empty sequence");
+            }
             cfg.executor.joint_limits.clear();
+            std::unordered_set<int> configured_joints;
             for (size_t i = 0; i < jl.size(); ++i) {
+                if (!jl[i].IsMap() || !jl[i]["joint"] ||
+                    !jl[i]["min"] || !jl[i]["max"]) {
+                    throw std::runtime_error(
+                        "manipulator.joint_limits[" + std::to_string(i) +
+                        "] must contain joint, min and max");
+                }
                 JointConstraint limit;
                 limit.joint_index = jl[i]["joint"].as<int>(-1);
                 limit.min_rad = jl[i]["min"].as<float>(0.0f);
                 limit.max_rad = jl[i]["max"].as<float>(0.0f);
-                if (limit.joint_index >= 0) {
-                    cfg.executor.joint_limits.push_back(limit);
+                if (limit.joint_index < 0 ||
+                    limit.min_rad > limit.max_rad) {
+                    throw std::runtime_error(
+                        "manipulator.joint_limits[" + std::to_string(i) +
+                        "] has an invalid joint or range");
                 }
+                if (!configured_joints.insert(limit.joint_index).second) {
+                    throw std::runtime_error(
+                        "manipulator.joint_limits contains duplicate joint " +
+                        std::to_string(limit.joint_index));
+                }
+                cfg.executor.joint_limits.push_back(limit);
             }
         }
 
@@ -836,6 +1150,15 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         throw std::runtime_error(
             "grasp.gripper_empty_position_margin must be non-negative");
     }
+    if (cfg.camera.type == "remote_mujoco" &&
+        cfg.executor.manip_driver == "remote_mujoco" &&
+        (cfg.camera.remote_mujoco.host !=
+            cfg.executor.remote_mujoco.host ||
+            cfg.camera.remote_mujoco.port !=
+            cfg.executor.remote_mujoco.port)) {
+        throw std::runtime_error(
+            "remote_mujoco camera and executor must use the same endpoint");
+    }
     if (cfg.mobile_base.odom_min_translation_m < 0.0f ||
         cfg.mobile_base.odom_min_rotation_rad < 0.0f ||
         cfg.mobile_base.odom_min_command_ratio < 0.0f ||
@@ -860,6 +1183,9 @@ int main(int argc, char* argv[]) {
     bool tts_mode = false;
     bool voice_stdin = false;
     bool status_stdout = false;
+    bool validate_config_only = false;
+    std::string remote_host;
+    int remote_port = 0;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -890,6 +1216,22 @@ int main(int argc, char* argv[]) {
             step_mode = true;
         } else if (arg == "--plan-only") {
             plan_only = true;
+        } else if (arg == "--validate-config") {
+            validate_config_only = true;
+        } else if (arg == "--remote-host" && i + 1 < argc) {
+            remote_host = argv[++i];
+        } else if (arg == "--remote-port" && i + 1 < argc) {
+            remote_port = std::atoi(argv[++i]);
+            if (remote_port < 1 || remote_port > 65535) {
+                std::cerr << "Error: --remote-port must be in [1, 65535]"
+                            << std::endl;
+                return 1;
+            }
+        } else {
+            std::cerr << "Error: unknown or incomplete option: " << arg
+                        << std::endl;
+            PrintUsage(argv[0]);
+            return 1;
         }
     }
 
@@ -908,7 +1250,7 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
-    std::cout << "=== Perceptive Grasp Demo ===" << std::endl;
+    std::cout << "=== perceptive_grasp ===" << std::endl;
     std::cout << "Config: " << config_path << std::endl;
     if (!target_name.empty())
         std::cout << "Target: " << target_name << std::endl;
@@ -946,6 +1288,14 @@ int main(int argc, char* argv[]) {
     if (tts_mode || status_stdout) cfg.voice.tts_enabled = true;
     if (!voice_topic.empty()) cfg.voice.input_topic = voice_topic;
     if (!status_topic.empty()) cfg.voice.status_topic = status_topic;
+    if (!remote_host.empty()) {
+        cfg.camera.remote_mujoco.host = remote_host;
+        cfg.executor.remote_mujoco.host = remote_host;
+    }
+    if (remote_port > 0) {
+        cfg.camera.remote_mujoco.port = remote_port;
+        cfg.executor.remote_mujoco.port = remote_port;
+    }
     if (cfg.voice.enabled && cfg.auto_loop) {
         std::cout << "[Main] --loop ignored because voice mode waits for "
                     << "explicit commands" << std::endl;
@@ -961,6 +1311,13 @@ int main(int argc, char* argv[]) {
     ResolveConfigPath(config_dir, &cfg.debug_output_dir);
     ResolveConfigPath(config_dir, &cfg.camera.spacemit_las2.model_path);
     ResolveConfigPath(config_dir, &cfg.camera.spacemit_las2.calib_path);
+    ResolveConfigPath(config_dir, &cfg.camera.mujoco.xml_path);
+    ResolveConfigPath(config_dir, &cfg.executor.mujoco.xml_path);
+
+    if (validate_config_only) {
+        std::cout << "[Config] valid" << std::endl;
+        return 0;
+    }
 
     // 创建并初始化 Pipeline
     g_pipeline = std::make_unique<GraspPipeline>(cfg);

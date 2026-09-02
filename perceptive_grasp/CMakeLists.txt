@@ -25,8 +25,12 @@ option(ENABLE_LAS2_CAMERA
        "Enable optional spacemit_las2 stereo camera backend" ON)
 option(ENABLE_WEBRTC_AEC
        "Enable WebRTC acoustic echo cancellation for the voice bridge" ON)
+option(ENABLE_REMOTE_MUJOCO
+       "Enable remote MuJoCo client backends for split PC/K3 simulation" OFF)
+option(ENABLE_MUJOCO_EXECUTOR
+       "Enable optional MuJoCo UR5e executor backend for PC simulation" OFF)
 
-# X86_STANDALONE 是主机侧规划和调试构建的快捷选项。
+# X86_STANDALONE 是主机侧规划与仿真验证构建的快捷选项。
 if(X86_STANDALONE)
     set(USE_OPENCV_DNN ON)
     set(USE_MOCK_EXECUTOR ON)
@@ -36,6 +40,7 @@ endif()
 
 find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc highgui imgcodecs dnn calib3d)
 find_package(yaml-cpp REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(URDFDOM REQUIRED IMPORTED_TARGET urdfdom)
 
@@ -51,6 +56,35 @@ if(ENABLE_WEBRTC_AEC)
         message(FATAL_ERROR
             "[Voice] WebRTC AEC requires meson and ninja-build; install "
             "them or configure with -DENABLE_WEBRTC_AEC=OFF")
+    endif()
+endif()
+
+set(HAVE_MUJOCO_EXECUTOR OFF)
+set(HAVE_MUJOCO_CAMERA OFF)
+if(ENABLE_MUJOCO_EXECUTOR)
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+        message(FATAL_ERROR
+            "[Executor] MuJoCo executor is PC/x86_64 only; disable "
+            "ENABLE_MUJOCO_EXECUTOR for K3 builds")
+    endif()
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/scripts/prepare_mujoco_assets.py"
+        RESULT_VARIABLE MUJOCO_ASSET_RESULT
+    )
+    if(NOT MUJOCO_ASSET_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "[Simulation] failed to prepare pinned MuJoCo Menagerie assets")
+    endif()
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../../../../components/simulation/mujoco/cmake/FindMuJoCo.cmake")
+    set(HAVE_MUJOCO_EXECUTOR ON)
+    message(STATUS "[Executor] mujoco ur5e simulation backend enabled")
+    find_package(glfw3 QUIET)
+    if(glfw3_FOUND)
+        set(HAVE_MUJOCO_CAMERA ON)
+        message(STATUS "[Camera] mujoco rendered camera backend enabled")
+    else()
+        message(STATUS "[Camera] MuJoCo rendered camera backend disabled: glfw3 not found")
     endif()
 endif()
 
@@ -95,6 +129,7 @@ set(SOURCES
     src/grasp_pipeline.cpp
     src/grasp_pipeline_execution.cpp
     src/grasp_pipeline_runtime.cpp
+    src/simulation_color_detector.cpp
     src/stereo_camera.cpp
     src/stereo_geometry.cpp
     src/target_association.cpp
@@ -105,6 +140,18 @@ set(SOURCES
     src/pipeline_timing.cpp
     src/voice_command_parser.cpp
 )
+
+set(HAVE_REMOTE_MUJOCO_CAMERA OFF)
+if(ENABLE_REMOTE_MUJOCO)
+    set(HAVE_REMOTE_MUJOCO_CAMERA ON)
+    list(APPEND SOURCES
+        src/remote_mujoco_camera.cpp
+        src/remote_mujoco_grasp_executor.cpp
+        src/remote_mujoco_protocol.cpp
+    )
+    add_definitions(-DHAVE_REMOTE_MUJOCO=1)
+    message(STATUS "[Simulation] remote_mujoco client backend enabled")
+endif()
 
 if(HAVE_REALSENSE_CAMERA)
     list(APPEND SOURCES src/depth_camera.cpp)
@@ -256,7 +303,9 @@ if(ENABLE_LAS2_CAMERA)
     endif()
 endif()
 
-if(NOT HAVE_REALSENSE_CAMERA AND NOT HAVE_LAS2_CAMERA)
+if(NOT HAVE_REALSENSE_CAMERA AND NOT HAVE_LAS2_CAMERA AND
+   NOT HAVE_MUJOCO_CAMERA AND NOT HAVE_REMOTE_MUJOCO_CAMERA AND
+   NOT X86_STANDALONE)
     message(FATAL_ERROR
         "No stereo camera backend found. Install realsense dependencies or "
         "place spacemit_las2 in ~/las2_runtime.")
@@ -330,6 +379,22 @@ else()
     list(APPEND EXTRA_LIBRARIES ${VISION_LIBRARY})
 endif()
 
+# MuJoCo is self-contained and must not inherit real manipulator SDK links.
+if(HAVE_MUJOCO_EXECUTOR)
+    list(APPEND SOURCES
+        src/mujoco_grasp_executor.cpp
+        src/mujoco_simulation.cpp
+    )
+    list(APPEND EXTRA_INCLUDE_DIRS ${MUJOCO_INCLUDE_DIR})
+    list(APPEND EXTRA_LIBRARIES ${MUJOCO_LIB})
+    add_definitions(-DHAVE_MUJOCO_EXECUTOR=1)
+    if(HAVE_MUJOCO_CAMERA)
+        list(APPEND SOURCES src/mujoco_stereo_camera.cpp)
+        list(APPEND EXTRA_LIBRARIES glfw)
+        add_definitions(-DHAVE_MUJOCO_CAMERA=1)
+    endif()
+endif()
+
 # ============ 执行器选择 ============
 
 if(USE_MOCK_EXECUTOR)
@@ -389,10 +454,14 @@ if(USE_OPENCV_DNN)
 else()
     message(STATUS "  Detector:  VisionService")
 endif()
-if(USE_MOCK_EXECUTOR)
-    message(STATUS "  Executor:  Mock (print only)")
+if(USE_MOCK_EXECUTOR AND HAVE_MUJOCO_EXECUTOR)
+    message(STATUS "  Executor:  mock pipeline, mujoco ur5e service")
+elseif(USE_MOCK_EXECUTOR)
+    message(STATUS "  Executor:  mock (print only)")
+elseif(HAVE_MUJOCO_EXECUTOR)
+    message(STATUS "  Executor:  real hardware pipeline, mujoco ur5e service")
 else()
-    message(STATUS "  Executor:  Real hardware")
+    message(STATUS "  Executor:  real hardware")
 endif()
 set(_CAMERA_BACKENDS)
 if(HAVE_REALSENSE_CAMERA)
@@ -400,6 +469,12 @@ if(HAVE_REALSENSE_CAMERA)
 endif()
 if(HAVE_LAS2_CAMERA)
     list(APPEND _CAMERA_BACKENDS "spacemit_las2")
+endif()
+if(HAVE_MUJOCO_CAMERA)
+    list(APPEND _CAMERA_BACKENDS "mujoco")
+endif()
+if(HAVE_REMOTE_MUJOCO_CAMERA)
+    list(APPEND _CAMERA_BACKENDS "remote_mujoco")
 endif()
 list(JOIN _CAMERA_BACKENDS ", " _CAMERA_BACKENDS_SUMMARY)
 message(STATUS "  Camera:    ${_CAMERA_BACKENDS_SUMMARY}")
@@ -449,9 +524,26 @@ add_custom_target(perceptive_grasp ALL
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_perceptive_grasp.py"
         "${CMAKE_BINARY_DIR}/perceptive_grasp"
     COMMAND chmod +x "${CMAKE_BINARY_DIR}/perceptive_grasp"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/local_voice_bridge.py"
+        "${CMAKE_BINARY_DIR}/local_voice_bridge.py"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/asr_node.py"
+        "${CMAKE_BINARY_DIR}/asr_node.py"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/asr_backend.py"
+        "${CMAKE_BINARY_DIR}/asr_backend.py"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tts_node.py"
+        "${CMAKE_BINARY_DIR}/tts_node.py"
+    COMMAND chmod +x "${CMAKE_BINARY_DIR}/local_voice_bridge.py"
     DEPENDS
         perceptive_grasp_core
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_perceptive_grasp.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/local_voice_bridge.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/asr_backend.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/asr_node.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tts_node.py"
     COMMENT "Preparing perceptive_grasp structured-log launcher"
 )
 
@@ -532,6 +624,43 @@ target_include_directories(target_association_test PRIVATE
 target_compile_definitions(target_association_test PRIVATE MOCK_DETECTOR=1)
 target_link_libraries(target_association_test PRIVATE ${OpenCV_LIBS})
 add_test(NAME target_association_test COMMAND target_association_test)
+
+add_executable(simulation_color_detector_test
+    tests/simulation_color_detector_test.cpp
+    src/simulation_color_detector.cpp
+)
+target_include_directories(simulation_color_detector_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_compile_definitions(simulation_color_detector_test PRIVATE
+    MOCK_DETECTOR=1)
+target_link_libraries(simulation_color_detector_test PRIVATE ${OpenCV_LIBS})
+add_test(NAME simulation_color_detector_test
+    COMMAND simulation_color_detector_test)
+
+if(USE_OPENCV_DNN)
+    add_executable(mock_detector_test
+        tests/mock_detector_test.cpp
+        src/mock/mock_detector.cpp
+        src/simulation_color_detector.cpp
+    )
+    target_include_directories(mock_detector_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_compile_definitions(mock_detector_test PRIVATE MOCK_DETECTOR=1)
+    target_link_libraries(mock_detector_test PRIVATE ${OpenCV_LIBS} yaml-cpp)
+    add_test(NAME mock_detector_test COMMAND mock_detector_test)
+endif()
+
+add_test(NAME config_validation_test
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_config_validation.py
+        --binary $<TARGET_FILE:perceptive_grasp_core>
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/config/grasp_pipeline.yaml
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/config/grasp_pipeline_mujoco_ur5e.yaml
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/config/grasp_pipeline_remote_mujoco_ur5e.yaml)
 
 add_executable(grasp_geometry_test
     tests/grasp_geometry_test.cpp
@@ -628,6 +757,72 @@ target_include_directories(voice_command_parser_test PRIVATE
 )
 add_test(NAME voice_command_parser_test COMMAND voice_command_parser_test)
 
+if(ENABLE_REMOTE_MUJOCO OR HAVE_MUJOCO_CAMERA)
+    add_executable(remote_mujoco_protocol_test
+        tests/remote_mujoco_protocol_test.cpp
+        src/remote_mujoco_protocol.cpp
+    )
+    target_include_directories(remote_mujoco_protocol_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(remote_mujoco_protocol_test PRIVATE pthread)
+    add_test(NAME remote_mujoco_protocol_test
+        COMMAND remote_mujoco_protocol_test)
+endif()
+
+if(HAVE_MUJOCO_EXECUTOR)
+    add_executable(mujoco_grasp_executor_test
+        tests/mujoco_grasp_executor_test.cpp
+        src/mujoco_grasp_executor.cpp
+        src/mujoco_simulation.cpp
+    )
+    target_include_directories(mujoco_grasp_executor_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${MUJOCO_INCLUDE_DIR}
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(mujoco_grasp_executor_test PRIVATE
+        ${MUJOCO_LIB}
+        ${OpenCV_LIBS}
+        pthread
+    )
+    target_compile_definitions(mujoco_grasp_executor_test PRIVATE
+        HAVE_MUJOCO_EXECUTOR=1
+        MOCK_EXECUTOR=1
+        PERCEPTIVE_GRASP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME mujoco_grasp_executor_test
+        COMMAND mujoco_grasp_executor_test)
+endif()
+
+if(HAVE_MUJOCO_CAMERA)
+    add_executable(mujoco_grasp_sim_server
+        tools/mujoco_grasp_sim_server.cpp
+        src/mujoco_grasp_executor.cpp
+        src/mujoco_simulation.cpp
+        src/mujoco_stereo_camera.cpp
+        src/remote_mujoco_protocol.cpp
+    )
+    target_include_directories(mujoco_grasp_sim_server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${MUJOCO_INCLUDE_DIR}
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(mujoco_grasp_sim_server PRIVATE
+        ${MUJOCO_LIB}
+        ${OpenCV_LIBS}
+        yaml-cpp
+        glfw
+        pthread
+    )
+    target_compile_definitions(mujoco_grasp_sim_server PRIVATE
+        HAVE_MUJOCO_EXECUTOR=1
+        HAVE_MUJOCO_CAMERA=1
+        MOCK_EXECUTOR=1)
+    install(TARGETS mujoco_grasp_sim_server DESTINATION bin)
+    install(DIRECTORY simulation/mujoco/
+        DESTINATION share/perceptive_grasp/simulation/mujoco)
+endif()
+
 if(HAVE_WEBRTC_AEC)
     add_library(perceptive_voice_aec SHARED src/voice_aec_processor.cpp)
     add_dependencies(perceptive_voice_aec webrtc_audio_processing_project)
@@ -680,6 +875,7 @@ if(HAVE_LAS2_CAMERA)
         DESTINATION "${CMAKE_INSTALL_LIBDIR}/perceptive_grasp")
 endif()
 install(PROGRAMS
+    scripts/asr_backend.py
     scripts/asr_node.py
     scripts/check_runtime_env.py
     scripts/local_voice_bridge.py
@@ -688,17 +884,30 @@ install(PROGRAMS
 
 # ============ 立体相机调试工具 ============
 
-if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA)
+if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA OR HAVE_MUJOCO_CAMERA OR
+   HAVE_REMOTE_MUJOCO_CAMERA)
     set(DEBUG_VIEW_SOURCES
         tools/debug_view.cpp
         src/stereo_camera.cpp
         src/stereo_geometry.cpp
     )
+    if(HAVE_REMOTE_MUJOCO_CAMERA)
+        list(APPEND DEBUG_VIEW_SOURCES
+            src/remote_mujoco_camera.cpp
+            src/remote_mujoco_protocol.cpp
+        )
+    endif()
     if(HAVE_REALSENSE_CAMERA)
         list(APPEND DEBUG_VIEW_SOURCES src/depth_camera.cpp)
     endif()
     if(HAVE_LAS2_CAMERA)
         list(APPEND DEBUG_VIEW_SOURCES src/las2_stereo_camera.cpp)
+    endif()
+    if(HAVE_MUJOCO_CAMERA)
+        list(APPEND DEBUG_VIEW_SOURCES
+            src/mujoco_stereo_camera.cpp
+            src/mujoco_simulation.cpp
+        )
     endif()
 
     add_executable(debug_view ${DEBUG_VIEW_SOURCES})
@@ -732,6 +941,10 @@ if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA)
             )
         endif()
     endif()
+    if(HAVE_MUJOCO_CAMERA)
+        target_include_directories(debug_view PRIVATE ${MUJOCO_INCLUDE_DIR})
+        target_link_libraries(debug_view PRIVATE ${MUJOCO_LIB} glfw)
+    endif()
 
     if(USE_OPENCV_DNN)
         target_compile_definitions(debug_view PRIVATE NO_VISION_SERVICE=1)
@@ -746,7 +959,8 @@ else()
         "[Tools] debug_view skipped: no camera backend available")
 endif()
 
-if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA)
+if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA OR HAVE_MUJOCO_CAMERA OR
+   HAVE_REMOTE_MUJOCO_CAMERA)
     set(DEBUG_LOCALIZE_SOURCES
         tools/debug_localize.cpp
         src/camera_calibration.cpp
@@ -755,11 +969,23 @@ if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA)
         src/stereo_camera.cpp
         src/stereo_geometry.cpp
     )
+    if(HAVE_REMOTE_MUJOCO_CAMERA)
+        list(APPEND DEBUG_LOCALIZE_SOURCES
+            src/remote_mujoco_camera.cpp
+            src/remote_mujoco_protocol.cpp
+        )
+    endif()
     if(HAVE_REALSENSE_CAMERA)
         list(APPEND DEBUG_LOCALIZE_SOURCES src/depth_camera.cpp)
     endif()
     if(HAVE_LAS2_CAMERA)
         list(APPEND DEBUG_LOCALIZE_SOURCES src/las2_stereo_camera.cpp)
+    endif()
+    if(HAVE_MUJOCO_CAMERA)
+        list(APPEND DEBUG_LOCALIZE_SOURCES
+            src/mujoco_stereo_camera.cpp
+            src/mujoco_simulation.cpp
+        )
     endif()
 
     add_executable(debug_localize ${DEBUG_LOCALIZE_SOURCES})
@@ -794,6 +1020,10 @@ if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA)
             )
         endif()
     endif()
+    if(HAVE_MUJOCO_CAMERA)
+        target_include_directories(debug_localize PRIVATE ${MUJOCO_INCLUDE_DIR})
+        target_link_libraries(debug_localize PRIVATE ${MUJOCO_LIB} glfw)
+    endif()
 
     if(USE_OPENCV_DNN)
         message(WARNING
@@ -804,9 +1034,8 @@ if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA)
         target_include_directories(debug_localize PRIVATE
             ${VISION_INCLUDE_DIR})
         target_link_libraries(debug_localize PRIVATE ${VISION_LIBRARY})
+        install(TARGETS debug_localize DESTINATION bin)
     endif()
-
-    install(TARGETS debug_localize DESTINATION bin)
 else()
     message(STATUS
         "[Tools] debug_localize skipped: no camera backend available")
@@ -830,10 +1059,10 @@ if(HAVE_REALSENSE_CAMERA)
         pthread
     )
 
-    if(USE_OPENCV_DNN)
+    if(USE_OPENCV_DNN OR USE_MOCK_EXECUTOR)
         message(WARNING
-            "debug_grasp skipped: requires VisionService "
-            "(USE_OPENCV_DNN=OFF)")
+            "debug_grasp skipped: requires VisionService and the real "
+            "manipulator SDK")
         set_target_properties(debug_grasp PROPERTIES EXCLUDE_FROM_ALL TRUE)
     else()
         target_include_directories(debug_grasp PRIVATE
@@ -844,9 +1073,8 @@ if(HAVE_REALSENSE_CAMERA)
             ${VISION_LIBRARY}
             ${MANIP_LIBRARY}
         )
+        install(TARGETS debug_grasp DESTINATION bin)
     endif()
-
-    install(TARGETS debug_grasp DESTINATION bin)
 else()
     message(STATUS
         "[Tools] debug_grasp skipped: realsense backend not available")

@@ -168,13 +168,14 @@ GripperHoldingEvidence EvaluateGripperHolding(
             std::max(evidence.contact_count, contact_count);
         evidence.empty_count =
             std::max(evidence.empty_count, empty_count);
-        if (contact_count >= required) {
-            evidence.result = GripperHoldingResult::HOLDING;
-            return evidence;
-        }
     }
 
-    if (evidence.empty_count >= required) {
+    // Classify from the latest sustained sequence, not an earlier transient.
+    // The max counters above remain useful diagnostics, but must not cause an
+    // old contact event to mask a later confirmed-empty close.
+    if (contact_count >= required) {
+        evidence.result = GripperHoldingResult::HOLDING;
+    } else if (empty_count >= required) {
         evidence.result = GripperHoldingResult::EMPTY;
     }
     return evidence;

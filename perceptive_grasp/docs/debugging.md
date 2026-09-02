@@ -17,7 +17,7 @@ python3 scripts/check_runtime_env.py \
   --config config/grasp_pipeline.yaml
 ```
 
-检查结果中的 `perceptive_grasp launcher` 对应结构化日志启动器，`perceptive_grasp core` 对应实际运行抓取 pipeline 的 c++ 程序，二者都必须可执行。
+检查结果中的 `perceptive_grasp launcher` 对应结构化日志启动器，`perceptive_grasp core` 对应实际运行抓取 pipeline 的 C++ 程序，二者都必须可执行。
 
 硬件、权限、运行库和模型均可用时，最后一行显示：
 
@@ -38,7 +38,7 @@ python3 scripts/check_runtime_env.py \
 
 `--debug` 显示完整模块日志。默认模式输出 pipeline 结构化日志和模块错误。
 
-## 2. 排查立体相机取图
+## 2. 排查 RGB-D 取图
 
 使用 `debug_view` 验证当前 `camera.type` 选择的相机后端：
 
@@ -61,7 +61,7 @@ python3 scripts/check_runtime_env.py \
 2. 目标表面的深度连续，黑色无效区域没有覆盖主要抓取位置。
 3. 彩色图和深度图中的目标轮廓位于同一像素区域。
 
-使用 realsense 后端时，取图失败通常由设备未连接、usb 带宽不足或设备权限引起。使用 spacemit_las2 后端时，重点检查环境检查输出中的视频格式、dma heap、模型和标定文件。两个后端的检查方法见[硬件部署](hardware_setup.md#5-验证立体相机)。
+使用 `realsense` 后端时，取图失败通常由设备未连接、USB 带宽不足或设备权限引起。使用 `spacemit_las2` 后端时，重点检查环境检查输出中的视频格式、DMA heap、模型和标定文件。两个后端的检查方法见[硬件部署](hardware_setup.md#5-验证-rgb-d-相机)。
 
 相机刚启动时画面不稳定，可使用 `--warmup <N>` 覆盖预热帧数。不要通过增加预热帧数掩盖持续存在的无效深度。
 
@@ -116,13 +116,13 @@ python3 scripts/check_runtime_env.py \
 将同一目标放在工作区的左、中、右位置并分别定位：
 
 - 图像中的抓取点随目标稳定移动，但基座坐标始终存在近似固定偏差时，重新标定或检查标定结果是否已写回配置。
-- 偏差随目标位置明显变化时，检查立体相机标定、深度图与彩色图对齐以及相机固定结构。
+- 偏差随目标位置明显变化时，检查 RGB-D 相机标定、深度图与彩色图对齐以及相机固定结构。
 - 顶抓基座坐标合理但抓取点存在固定偏差时，先检查分割掩码和手眼标定，再调整 `top.gripper_offset` 或 `top.grasp_point_x_ratio`。
 - 侧抓三维中心或水平轮廓偏离目标时，检查目标点云和桌面平面；仅在存在稳定机械偏差时调整 `side.gripper_offset_m`。
 
-## 4. 排查抓取规划和 ik
+## 4. 排查抓取规划和 IK
 
-两种立体相机后端均可使用 `debug_localize` 执行不移动机械臂的三维几何检查：
+两种真机 RGB-D 后端均可使用 `debug_localize` 执行不移动机械臂的三维几何检查：
 
 ```bash
 ./build/debug_localize \
@@ -141,7 +141,7 @@ python3 scripts/check_runtime_env.py \
 - `base_point_m`、`pre_grasp_m` 和 `grasp_m` 是否与现场位置一致。
 - `frame_*_object_*.ply` 中是否只包含目标，没有大面积桌面或背景点。
 
-`debug_localize` 不连接机械臂，因此不执行 ik。需要继续验证候选位姿时，使用输出的位姿运行 `debug_ik`；该工具只求解运动学，不发送运动命令。
+`debug_localize` 不连接机械臂，因此不执行 IK。需要继续验证候选位姿时，使用输出的位姿运行 `debug_ik`；该工具只求解运动学，不发送运动命令。
 
 需要使用机械臂当前关节角验证完整候选和运动路径，但不允许机械臂或底盘运动时，运行：
 
@@ -196,7 +196,7 @@ python3 scripts/check_runtime_env.py \
 
 首次测试使用交互确认，不要增加 `--yes`。工具先移动到观察姿态，再移动到指定位置；不会下探，也不会闭合夹爪。
 
-如果 ik 成功但机械臂不动，使用主程序 `--debug` 日志检查串口、舵机响应和动作超时。机械臂运动方向或关节姿态异常时，停止运行并重新核对 urdf、关节零位和预定义姿态。
+如果 IK 成功但机械臂不动，使用主程序 `--debug` 日志检查串口、舵机响应和动作超时。机械臂运动方向或关节姿态异常时，停止运行并重新核对 URDF、关节零位和预定义姿态。
 
 ## 6. 排查底盘辅助对齐
 
@@ -222,7 +222,7 @@ python3 scripts/check_runtime_env.py \
 [Pipeline] Mobile base visual progress: ...m (required >= ...m)
 ```
 
-重新定位后的目标框、深度和 `base_point_m` 应随底盘动作变化。目标进入 `target_x ± x_tolerance` 定义的前向舒适区，且横向偏移进入 `y_tolerance` 的稳定范围后，pipeline 才进入机械臂抓取阶段。视觉进展低于期望值但高于停滞门限时，pipeline 会继续重新检测并执行下一次小步对齐。
+重新定位后的目标框、深度和 `base_point_m` 应随底盘动作变化。目标进入 `target_x ± x_tolerance` 定义的前向舒适区，且横向偏移进入 `y_tolerance` 的稳定范围后，pipeline 才进入机械臂抓取阶段。目标仍需对齐但视觉进展低于最低要求时，当前任务立即安全失败，不再重复下发相同底盘命令，也不会在未经确认的过远位置执行机械臂动作。
 
 底盘越过目标时检查：
 
@@ -232,7 +232,7 @@ python3 scripts/check_runtime_env.py \
 - `mobile_base.max_step_m` 是否过大。
 - `mobile_base.linear_speed` 是否超过现场底盘可稳定控制的速度。
 
-pipeline 通过最大对齐次数、实际累计直行距离和换向次数约束底盘动作。出现 `odometry did not confirm commanded motion`、视觉进度回退或反复换向时，pipeline 会停止底盘，并在当前位置继续执行机械臂安全校验。出现 `cumulative travel safety limit reached` 时，应检查深度、标定和舒适区参数，不要绕过累计移动安全限制。
+pipeline 通过视觉运动确认、最大对齐次数、实际累计直行距离和换向次数约束底盘动作。出现 `visual feedback did not confirm commanded motion` 或视觉进度回退时，当前任务会停止底盘并安全失败；反复换向时停止底盘并在当前位置执行机械臂安全校验。出现 `cumulative travel safety limit reached` 时，应检查深度、标定和舒适区参数，不要绕过累计移动安全限制。
 
 ## 7. 排查语音交互
 
@@ -243,7 +243,7 @@ VOICE_STATUS	state=IDLE;message=Ready
 [VoiceBridge] Listening: ...
 ```
 
-出现 `perceptive_grasp not ready` 时，先处理同一终端中更早出现的相机、检测器、机械臂或底盘初始化错误。能够进入 `Listening` 但命令没有执行时，检查 asr 识别文本、`voice.trigger_words` 和 `voice.target_aliases`。
+出现 `perceptive_grasp not ready` 时，先处理同一终端中更早出现的相机、检测器、机械臂或底盘初始化错误。能够进入 `Listening` 但命令没有执行时，检查 ASR 识别文本、`voice.trigger_words` 和 `voice.target_aliases`。
 
 音频设备、文本命令验证和语音模型问题见[语音控制](voice_control.md)。
 
@@ -290,14 +290,14 @@ logging:
 
 重点关注：
 
-- `[Init] END module=camera_warmup`：立体相机首次取帧和深度推理耗时。
-- `[Init] END module=detector_warmup`：yolo 首次推理耗时。
+- `[Init] END module=camera_warmup`：RGB-D 相机首次取帧和深度推理耗时。
+- `[Init] END module=detector_warmup`：YOLO 首次推理耗时。
 - `[Timing] stage=DETECTING`：单轮取帧和目标检测耗时。
 - `[Timing] stage=PLANNING`：深度处理、坐标变换和抓取规划耗时。
 - `[Timing] component=IK`：单次 ik 求解耗时。
 - `[Action] START/END`：机械臂或底盘动作耗时和结果。
 - `PIPELINE SUMMARY`：初始化、任务、端到端总耗时及各阶段结果。
 
-`elapsed_ms` 表示墙钟耗时。`cpu_ms` 表示进程所有 linux 线程累计的 cpu 时间，多线程运行时可以大于 `elapsed_ms`。两者相除可估算该阶段平均占用的逻辑核数量，但不能直接表示 npu 或 x100 的硬件利用率。
+`elapsed_ms` 表示墙钟耗时。`cpu_ms` 表示进程所有 Linux 线程累计的 CPU 时间，多线程运行时可以大于 `elapsed_ms`。两者相除可估算该阶段平均占用的逻辑核数量，但不能直接表示 NPU 或 X100 的硬件利用率。
 
-k3 的 linux 逻辑核 `0-7` 为 a100 通用核，`8-15` 为 x100 ai 核。发布配置将 spacemit_las2 绑定到逻辑核 `8`，yolo 的 spacemit ep 使用其余 ai 核。性能结果以目标设备输出为准，完成分析后可关闭详细性能日志。
+K3 的 Linux 逻辑核 `0-7` 为 A100 通用核，`8-15` 为 X100 AI 核。发布配置将 `spacemit_las2` 绑定到逻辑核 `8`，YOLO 的 SpaceMIT EP 使用其余 AI 核。性能结果以目标设备输出为准，完成分析后可关闭详细性能日志。

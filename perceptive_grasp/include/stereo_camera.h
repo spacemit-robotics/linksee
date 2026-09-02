@@ -43,11 +43,30 @@ struct SpacemitLas2CameraConfig {
     float max_depth_m = 2.0f;
 };
 
+/** Configuration for the MuJoCo rendered camera backend. */
+struct MujocoCameraConfig {
+    std::string xml_path;
+    std::string camera_name = "cam";
+    int width = 640;
+    int height = 480;
+    float min_depth_m = 0.05f;
+    float max_depth_m = 2.0f;
+};
+
+/** Configuration for a remote MuJoCo camera server. */
+struct RemoteMujocoCameraConfig {
+    std::string host = "127.0.0.1";
+    int port = 9090;
+    int timeout_ms = 5000;
+};
+
 /** Selectable stereo camera backend configuration. */
 struct StereoCameraConfig {
     std::string type = "realsense";
     RealSenseCameraConfig realsense;
     SpacemitLas2CameraConfig spacemit_las2;
+    MujocoCameraConfig mujoco;
+    RemoteMujocoCameraConfig remote_mujoco;
 };
 
 /**
@@ -85,6 +104,16 @@ public:
     /** Convert one depth pixel into camera-frame coordinates in meters. */
     virtual bool Deproject(int pixel_x, int pixel_y, uint16_t depth_mm,
                         float point_3d[3]) const = 0;
+
+    /** Return pinhole intrinsics when the backend can expose them. */
+    virtual bool GetIntrinsics(float* fx, float* fy,
+                            float* cx, float* cy) const {
+        (void)fx;
+        (void)fy;
+        (void)cx;
+        (void)cy;
+        return false;
+    }
 };
 
 /** Create the camera backend selected by config.type. */

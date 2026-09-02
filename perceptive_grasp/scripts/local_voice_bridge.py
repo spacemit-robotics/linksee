@@ -10,6 +10,7 @@ import argparse
 import collections
 import ctypes
 import ctypes.util
+import fcntl
 import os
 import queue
 import re
@@ -17,9 +18,15 @@ import signal
 import subprocess
 import threading
 import time
+import wave
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
+from asr_backend import (
+    create_asr_engine,
+    normalize_asr_backend,
+    select_capture_channel,
+)
 from asr_node import load_voice_config
 from tts_node import (
     engine_to_preset,
@@ -33,12 +40,84 @@ from tts_node import (
 STATUS_PREFIX = "VOICE_STATUS\t"
 READY_LOG_LINE = "[Pipeline] IDLE | Ready"
 READY_STATUS_EVENT = "state=IDLE;message=Ready"
-VOICE_BRIDGE_VERSION = "2026-07-21-webrtc-aec-v10"
+VOICE_BRIDGE_VERSION = "2026-08-13-audio-epoch-v19"
 CAPTURE_RATE_CANDIDATES = (48000, 44100, 32000, 16000, 8000)
 WAITING_PROMPT = "请继续说要抓取的物体。"
 TTS_ECHO_GUARD_MS = 600
 WEBRTC_AEC_TAIL_MS = 200
+DEFAULT_MAX_SPEECH_DURATION_MS = 8000
+DEFAULT_VAD_ENDPOINT_HOLD_MS = 600
+ASR_HOTWORD_BOOST = 2.0
 ECHO_CANCELLATION_MODES = ("hardware_aec", "webrtc_aec", "half_duplex")
+MAX_PENDING_ASR_SEGMENTS = 2
+MAX_ASR_SEGMENT_AGE_SEC = 5.0
+
+
+class AudioEpoch:
+    """Identify audio captured within the current command-ready period."""
+
+    def __init__(self):
+        self._value = 0
+        self._lock = threading.Lock()
+
+    def current(self):
+        with self._lock:
+            return self._value
+
+    def advance(self):
+        with self._lock:
+            self._value += 1
+            return self._value
+
+
+def resolve_audio_device(configured_index, configured_name, list_devices, role):
+    """Resolve a stable audio device name to the current numeric index."""
+    name = str(configured_name or "").strip()
+    if not name:
+        return int(configured_index)
+    normalized = name.casefold()
+    matches = [
+        (int(index), str(description))
+        for index, description in list_devices()
+        if normalized in str(description).casefold()
+    ]
+    if not matches:
+        raise RuntimeError(f"{role} audio device not found by name: {name!r}")
+    if len(matches) > 1:
+        exact = [item for item in matches if item[1].casefold() == normalized]
+        if len(exact) == 1:
+            matches = exact
+        else:
+            descriptions = ", ".join(
+                f"{index}:{description}" for index, description in matches
+            )
+            raise RuntimeError(
+                f"{role} audio device name is ambiguous: {name!r}; "
+                f"matches: {descriptions}"
+            )
+    index, description = matches[0]
+    print(
+        f"[VoiceBridge] {role} device resolved: "
+        f"name={name!r} -> {index}: {description}",
+        flush=True,
+    )
+    return index
+
+
+def acquire_voice_bridge_lock(path=None):
+    """Prevent concurrent bridges from remapping busy audio device indexes."""
+    lock_path = Path(path or f"/tmp/perceptive_grasp_voice_{os.getuid()}.lock")
+    lock_file = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return None
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
 
 
 def load_echo_cancellation_config(voice_cfg):
@@ -53,11 +132,81 @@ def load_echo_cancellation_config(voice_cfg):
     return mode, config
 
 
-def update_aec_tail(frame_end, playback_active, has_reference,
-                    tail_until, tail_ms=WEBRTC_AEC_TAIL_MS):
+def update_aec_tail(
+    frame_end, playback_active, has_reference, tail_until, tail_ms=WEBRTC_AEC_TAIL_MS
+):
     if playback_active or has_reference:
         return max(tail_until, frame_end + tail_ms / 1000.0)
     return tail_until
+
+
+def should_rearm_vad_for_audio_path(previous_path, current_path, in_speech):
+    """Return whether an idle VAD stream changed audio processing path."""
+    return not in_speech and previous_path is not None and current_path != previous_path
+
+
+def select_speech_samples(
+    in_speech, raw_samples, aec_samples, current_path=None, prefer_aec=False
+):
+    """Keep an active utterance on one audio path.
+
+    Switching from AEC output to raw microphone samples in the middle of an
+    utterance creates a discontinuity that can split or corrupt ASR input.
+    """
+    if in_speech and current_path == "aec":
+        return aec_samples, "aec"
+    if in_speech and current_path == "raw":
+        return raw_samples, "raw"
+    if prefer_aec and aec_samples is not None:
+        return aec_samples, "aec"
+    return raw_samples, "raw"
+
+
+def classify_vad_event(in_speech, result):
+    """Normalize VAD events without restarting an active utterance."""
+    if in_speech:
+        if result is not None and result.is_speech_end:
+            return "finish"
+        return "append"
+    if result is not None and result.is_speech_start:
+        return "start"
+    return "idle"
+
+
+def save_asr_audio_segment(directory, sequence, audio, sample_rate=16000):
+    """Save the exact mono waveform submitted to an ASR backend."""
+    import numpy as np
+
+    output_dir = Path(directory).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"segment_{int(sequence):04d}.wav"
+    normalized = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
+    pcm = (normalized * 32767.0).astype("<i2")
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(int(sample_rate))
+        output.writeframes(pcm.tobytes())
+    return path
+
+
+def update_vad_endpoint_hold(
+    in_speech, result, pending_samples, chunk_samples, resume_threshold=0.3
+):
+    """Delay utterance completion so short pauses do not split commands."""
+    if not in_speech:
+        return 0
+    if result is not None and result.is_speech_end:
+        return chunk_samples
+    if pending_samples > 0:
+        if result is not None and result.is_speech_start:
+            probability = float(getattr(result, "probability", 1.0) or 0.0)
+            if probability >= resume_threshold:
+                return 0
+        return pending_samples + chunk_samples
+    if result is not None and result.is_speech_start:
+        return 0
+    return 0
 
 
 class PlaybackReferenceTimeline:
@@ -122,21 +271,21 @@ class PlaybackReferenceTimeline:
                 overlap_end = min(end_time, segment_end)
                 if overlap_end <= overlap_start:
                     continue
-                output_offset = int(round(
-                    (overlap_start - start_time) * self.sample_rate
-                ))
-                segment_offset = int(round(
-                    (overlap_start - segment_start) * self.sample_rate
-                ))
+                output_offset = int(
+                    round((overlap_start - start_time) * self.sample_rate)
+                )
+                segment_offset = int(
+                    round((overlap_start - segment_start) * self.sample_rate)
+                )
                 count = min(
                     int(round((overlap_end - overlap_start) * self.sample_rate)),
                     frame_count - output_offset,
                     len(segment) - segment_offset,
                 )
                 if count > 0:
-                    output[output_offset:output_offset + count] = (
-                        segment[segment_offset:segment_offset + count]
-                    )
+                    output[output_offset : output_offset + count] = segment[
+                        segment_offset : segment_offset + count
+                    ]
         return output
 
 
@@ -145,14 +294,16 @@ def find_voice_aec_library(binary_path, environ=os.environ):
     candidates = []
     if configured:
         candidates.append(Path(configured).expanduser())
-    candidates.extend([
-        Path(binary_path).expanduser().resolve().parent /
-        "libperceptive_voice_aec.so",
-        Path(__file__).resolve().parents[1] / "build" /
-        "libperceptive_voice_aec.so",
-        Path(__file__).resolve().parents[3] / "lib" /
-        "libperceptive_voice_aec.so",
-    ])
+    candidates.extend(
+        [
+            Path(binary_path).expanduser().resolve().parent
+            / "libperceptive_voice_aec.so",
+            Path(__file__).resolve().parents[1]
+            / "build"
+            / "libperceptive_voice_aec.so",
+            Path(__file__).resolve().parents[3] / "lib" / "libperceptive_voice_aec.so",
+        ]
+    )
     discovered = ctypes.util.find_library("perceptive_voice_aec")
     for candidate in candidates:
         if candidate.is_file():
@@ -163,8 +314,9 @@ def find_voice_aec_library(binary_path, environ=os.environ):
 class WebRtcAecProcessor:
     """ctypes wrapper around the native WebRTC APM frontend."""
 
-    def __init__(self, library_path, sample_rate, noise_suppression=True,
-                 high_pass_filter=True):
+    def __init__(
+        self, library_path, sample_rate, noise_suppression=True, high_pass_filter=True
+    ):
         self.library = ctypes.CDLL(library_path)
         self.library.voice_aec_create.argtypes = [
             ctypes.c_int,
@@ -189,20 +341,16 @@ class WebRtcAecProcessor:
             int(high_pass_filter),
         )
         if not self.handle:
-            raise RuntimeError(
-                f"WebRTC AEC does not support sample rate {sample_rate}"
-            )
+            raise RuntimeError(f"WebRTC AEC does not support sample rate {sample_rate}")
         self.frame_size = self.library.voice_aec_frame_size(self.handle)
 
     def process(self, microphone, playback_reference):
         import numpy as np
 
-        microphone_int16 = (
-            np.clip(microphone, -1.0, 1.0) * 32767.0
-        ).astype(np.int16)
-        reference_int16 = (
-            np.clip(playback_reference, -1.0, 1.0) * 32767.0
-        ).astype(np.int16)
+        microphone_int16 = (np.clip(microphone, -1.0, 1.0) * 32767.0).astype(np.int16)
+        reference_int16 = (np.clip(playback_reference, -1.0, 1.0) * 32767.0).astype(
+            np.int16
+        )
         output = np.empty(self.frame_size, dtype=np.int16)
         result = self.library.voice_aec_process(
             self.handle,
@@ -221,8 +369,9 @@ class WebRtcAecProcessor:
             self.handle = None
 
 
-def build_grasp_command(binary: str, config: str,
-                        extra_args: Optional[Iterable[str]] = None) -> List[str]:
+def build_grasp_command(
+    binary: str, config: str, extra_args: Optional[Iterable[str]] = None
+) -> List[str]:
     """Build the perceptive_grasp command used by the local voice bridge."""
     cmd = [
         binary,
@@ -241,7 +390,7 @@ def extract_status_event(line: str) -> Optional[str]:
     prefix_offset = line.find(STATUS_PREFIX)
     if prefix_offset < 0:
         return None
-    event = line[prefix_offset + len(STATUS_PREFIX):].strip()
+    event = line[prefix_offset + len(STATUS_PREFIX) :].strip()
     return event if event.startswith("state=") else None
 
 
@@ -325,8 +474,16 @@ def _print_stream(prefix: str, stream):
         print(f"{prefix}{line.rstrip()}", flush=True)
 
 
-def _read_grasp_stdout(proc, text_queue, running, reverse_aliases,
-                       speak_all_states, status_queue=None):
+def _read_grasp_stdout(
+    proc,
+    text_queue,
+    running,
+    reverse_aliases,
+    speak_all_states,
+    status_queue=None,
+    vad_rearm_requested=None,
+    audio_epoch=None,
+):
     last_spoken = ""
     for line in iter(proc.stdout.readline, ""):
         if not line:
@@ -339,6 +496,19 @@ def _read_grasp_stdout(proc, text_queue, running, reverse_aliases,
             print(line, flush=True)
             continue
         print(line, flush=True)
+        fields = parse_status_fields(event)
+        if (
+            vad_rearm_requested is not None
+            and fields.get("state") == "IDLE"
+            and fields.get("message") in ("Ready", "Voice: waiting for next command")
+        ):
+            if audio_epoch is not None:
+                epoch = audio_epoch.advance()
+                print(
+                    f"[VoiceBridge] Audio epoch advanced: {epoch}",
+                    flush=True,
+                )
+            vad_rearm_requested.set()
         if status_queue is not None:
             try:
                 status_queue.put_nowait(event)
@@ -369,8 +539,26 @@ def default_asr_channels(asr_cfg) -> int:
     return int(asr_cfg.get("channels", 1))
 
 
-def _capture_hw_name_from_arecord(device: int,
-                                  runner=subprocess.run) -> Optional[str]:
+def build_asr_hotwords(voice_cfg) -> List[str]:
+    """Build a compact SenseVoice bias list from configured commands."""
+    triggers = [str(word).strip() for word in voice_cfg.get("trigger_words", [])]
+    aliases = [
+        str(word).strip() for word in (voice_cfg.get("target_aliases", {}) or {}).keys()
+    ]
+    commands = list(triggers)
+    commands.extend(str(word).strip() for word in voice_cfg.get("cancel_words", []))
+    commands.extend(str(word).strip() for word in voice_cfg.get("home_words", []))
+    commands.extend(aliases)
+    commands.extend(
+        trigger + alias
+        for trigger in triggers
+        for alias in aliases
+        if trigger and alias and not trigger.isascii()
+    )
+    return list(dict.fromkeys(word for word in commands if word))
+
+
+def _capture_hw_name_from_arecord(device: int, runner=subprocess.run) -> Optional[str]:
     try:
         result = runner(
             ["arecord", "-l"],
@@ -397,8 +585,7 @@ def _capture_hw_name_from_arecord(device: int,
     return None
 
 
-def capture_hw_name(device: int, list_devices,
-                    runner=subprocess.run) -> Optional[str]:
+def capture_hw_name(device: int, list_devices, runner=subprocess.run) -> Optional[str]:
     if device < 0:
         return None
     try:
@@ -422,8 +609,54 @@ def capture_hw_name(device: int, list_devices,
     return hw_name
 
 
-def _capture_rate_supported(hw_name: str, rate: int, channels: int,
-                            runner=subprocess.run) -> bool:
+def configure_capture_mixer(
+    device: int, mixer_volume: int, list_devices, runner=subprocess.run
+) -> bool:
+    """Set the ALSA microphone gain for the selected capture device."""
+    if mixer_volume < 0:
+        return True
+    hw_name = capture_hw_name(device, list_devices, runner)
+    match = re.fullmatch(r"hw:(\d+),\d+", hw_name or "")
+    if match is None:
+        print("[VoiceBridge] Cannot resolve capture mixer card", flush=True)
+        return False
+
+    volume = max(0, min(100, int(mixer_volume)))
+    command = [
+        "amixer",
+        "-c",
+        match.group(1),
+        "sset",
+        "Mic",
+        f"{volume}%",
+        "cap",
+    ]
+    try:
+        result = runner(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"[VoiceBridge] Capture mixer setup failed: {exc}", flush=True)
+        return False
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        print(f"[VoiceBridge] Capture mixer setup failed: {detail}", flush=True)
+        return False
+
+    print(
+        f"[VoiceBridge] Capture mixer: card={match.group(1)}, Mic={volume}%",
+        flush=True,
+    )
+    return True
+
+
+def _capture_rate_supported(
+    hw_name: str, rate: int, channels: int, runner=subprocess.run
+) -> bool:
     command = [
         "arecord",
         "-D",
@@ -454,13 +687,13 @@ def _capture_rate_supported(hw_name: str, rate: int, channels: int,
 
 def candidate_capture_rates(requested_rate: int) -> List[int]:
     rates = [requested_rate]
-    rates.extend(rate for rate in CAPTURE_RATE_CANDIDATES
-                 if rate != requested_rate)
+    rates.extend(rate for rate in CAPTURE_RATE_CANDIDATES if rate != requested_rate)
     return rates
 
 
-def candidate_capture_channels(device: int,
-                               requested_channels: Optional[int]) -> List[int]:
+def candidate_capture_channels(
+    device: int, requested_channels: Optional[int]
+) -> List[int]:
     if requested_channels is not None:
         return [int(requested_channels)]
     if device == 0:
@@ -482,9 +715,9 @@ def _stop_capture_quietly(capture) -> None:
             )
 
 
-def resolve_spacemit_capture_rate(device: int, requested_rate: int,
-                                  channels: int, audio_module,
-                                  capture_cls) -> int:
+def resolve_spacemit_capture_rate(
+    device: int, requested_rate: int, channels: int, audio_module, capture_cls
+) -> int:
     rate, _ = resolve_spacemit_capture_format(
         device,
         requested_rate,
@@ -495,9 +728,13 @@ def resolve_spacemit_capture_rate(device: int, requested_rate: int,
     return rate
 
 
-def resolve_spacemit_capture_format(device: int, requested_rate: int,
-                                    requested_channels: Optional[int],
-                                    audio_module, capture_cls):
+def resolve_spacemit_capture_format(
+    device: int,
+    requested_rate: int,
+    requested_channels: Optional[int],
+    audio_module,
+    capture_cls,
+):
     print(
         "[VoiceBridge] Probe SpaceMIT ASR capture formats: "
         f"device={device}, requested={requested_rate}Hz, "
@@ -554,8 +791,9 @@ def resolve_spacemit_capture_format(device: int, requested_rate: int,
     return requested_rate, requested_channels or 1
 
 
-def resolve_capture_rate(device: int, requested_rate: int, channels: int,
-                         list_devices, runner=subprocess.run) -> int:
+def resolve_capture_rate(
+    device: int, requested_rate: int, channels: int, list_devices, runner=subprocess.run
+) -> int:
     hw_name = capture_hw_name(device, list_devices, runner)
     if hw_name is None:
         print(
@@ -588,8 +826,9 @@ def resolve_capture_rate(device: int, requested_rate: int, channels: int,
     return requested_rate
 
 
-def wait_for_grasp_ready(proc, status_queue, running,
-                         timeout_sec: float = 20.0) -> bool:
+def wait_for_grasp_ready(
+    proc, status_queue, running, timeout_sec: float = 20.0
+) -> bool:
     deadline = time.monotonic() + timeout_sec
     while running.is_set() and time.monotonic() < deadline:
         if proc.poll() is not None:
@@ -611,8 +850,16 @@ def wait_for_grasp_ready(proc, status_queue, running,
     return False
 
 
-def run_asr_loop(args, proc, running, playback_active=None,
-                 playback_reference=None):
+def run_asr_loop(
+    args,
+    proc,
+    running,
+    playback_active=None,
+    playback_reference=None,
+    startup_prompt_complete=None,
+    vad_rearm_requested=None,
+    audio_epoch=None,
+):
     import numpy as np
     import spacemit_asr
     import spacemit_audio
@@ -625,8 +872,7 @@ def run_asr_loop(args, proc, running, playback_active=None,
     device = args.device if args.device is not None else int(asr_cfg.get("device", -1))
     rate = args.rate if args.rate is not None else int(asr_cfg.get("rate", 16000))
     configured_channels = (
-        args.channels if args.channels is not None
-        else asr_cfg.get("channels")
+        args.channels if args.channels is not None else asr_cfg.get("channels")
     )
     channels = int(configured_channels) if configured_channels is not None else None
     rate, channels = resolve_spacemit_capture_format(
@@ -637,22 +883,46 @@ def run_asr_loop(args, proc, running, playback_active=None,
         AudioCapture,
     )
     print(
-        "[VoiceBridge] ASR config: "
-        f"device={device}, {rate}Hz, channels={channels}",
+        f"[VoiceBridge] ASR config: device={device}, {rate}Hz, channels={channels}",
         flush=True,
     )
+    channel_index = (
+        getattr(args, "channel_index", None)
+        if getattr(args, "channel_index", None) is not None
+        else int(asr_cfg.get("channel_index", -1))
+    )
+    try:
+        select_capture_channel(
+            np.zeros(channels, dtype=np.float32), channels, channel_index
+        )
+    except ValueError as exc:
+        print(f"[VoiceBridge] Invalid ASR channel selection: {exc}", flush=True)
+        running.clear()
+        return
+    channel_label = "average" if channel_index < 0 else str(channel_index)
+    print(f"[VoiceBridge] ASR capture channel: {channel_label}", flush=True)
     trigger = (
-        args.vad_trigger_threshold if args.vad_trigger_threshold is not None
+        args.vad_trigger_threshold
+        if args.vad_trigger_threshold is not None
         else float(asr_cfg.get("vad_trigger_threshold", 0.4))
     )
     stop = (
-        args.vad_stop_threshold if args.vad_stop_threshold is not None
+        args.vad_stop_threshold
+        if args.vad_stop_threshold is not None
         else float(asr_cfg.get("vad_stop_threshold", 0.3))
     )
     min_speech_ms = (
         args.vad_min_speech_duration_ms
         if args.vad_min_speech_duration_ms is not None
         else int(asr_cfg.get("vad_min_speech_duration_ms", 100))
+    )
+    max_speech_ms = int(
+        asr_cfg.get("vad_max_speech_duration_ms", DEFAULT_MAX_SPEECH_DURATION_MS)
+    )
+    if max_speech_ms < min_speech_ms:
+        max_speech_ms = DEFAULT_MAX_SPEECH_DURATION_MS
+    endpoint_hold_ms = max(
+        0, int(asr_cfg.get("vad_endpoint_hold_ms", DEFAULT_VAD_ENDPOINT_HOLD_MS))
     )
 
     vad_config = (
@@ -665,15 +935,46 @@ def run_asr_loop(args, proc, running, playback_active=None,
     vad = spacemit_vad.VadEngine(vad_config)
     print(f"[VoiceBridge] VAD initialized: {vad.engine_name}", flush=True)
 
-    asr_config = spacemit_asr.Config()
-    asr_config.provider = "cpu"
-    asr_config._config.num_threads = args.asr_threads
-    asr_config.language = spacemit_asr.Language.ZH
-    asr_config.punctuation = True
-    asr = spacemit_asr.Engine(asr_config).initialize()
-    print(f"[VoiceBridge] ASR initialized: {asr.backend_name}", flush=True)
-    asr.recognize(np.zeros(16000, dtype=np.float32))
-    print("[VoiceBridge] ASR warmup done", flush=True)
+    hotwords = build_asr_hotwords(voice_cfg)
+    backend_override = getattr(args, "asr_backend", None)
+    backend_name = (
+        backend_override
+        if backend_override is not None
+        else asr_cfg.get("backend", "sensevoice")
+    )
+    backend_name = normalize_asr_backend(backend_name)
+    effective_asr_cfg = dict(asr_cfg)
+    effective_asr_cfg["backend"] = backend_name
+    sensevoice_cfg = asr_cfg.get("sensevoice", {}) or {}
+    asr_threads = (
+        args.asr_threads
+        if args.asr_threads is not None
+        else int(sensevoice_cfg.get("num_threads", 4))
+    )
+    try:
+        asr, warmup_required, hotword_count = create_asr_engine(
+            spacemit_asr, effective_asr_cfg, asr_threads, hotwords
+        )
+    except Exception as exc:
+        print(
+            f"[VoiceBridge] ASR initialization failed: backend={backend_name}; {exc}",
+            flush=True,
+        )
+        running.clear()
+        return
+    if backend_name == "qwen3_asr":
+        bias_summary = f"context_terms={hotword_count}"
+    else:
+        bias_summary = f"hotwords={hotword_count}, boost={ASR_HOTWORD_BOOST:g}"
+    print(
+        f"[VoiceBridge] ASR initialized: {asr.backend_name}; {bias_summary}",
+        flush=True,
+    )
+    if warmup_required:
+        asr.recognize(np.zeros(16000, dtype=np.float32))
+        print("[VoiceBridge] ASR warmup done", flush=True)
+    else:
+        print("[VoiceBridge] ASR endpoint ready", flush=True)
 
     target_rate = 16000
     resampler = None
@@ -701,8 +1002,7 @@ def run_asr_loop(args, proc, running, playback_active=None,
                 bool(echo_config.get("high_pass_filter", True)),
             )
         except Exception as exc:
-            print(f"[VoiceBridge] WebRTC AEC initialization failed: {exc}",
-                  flush=True)
+            print(f"[VoiceBridge] WebRTC AEC initialization failed: {exc}", flush=True)
             asr.shutdown()
             running.clear()
             return
@@ -712,7 +1012,7 @@ def run_asr_loop(args, proc, running, playback_active=None,
             flush=True,
         )
 
-    audio_queue = queue.Queue()
+    audio_queue = queue.Queue(maxsize=MAX_PENDING_ASR_SEGMENTS)
     state = {
         "in_speech": False,
         "playback_suppressed": False,
@@ -720,6 +1020,20 @@ def run_asr_loop(args, proc, running, playback_active=None,
         "aec_pending_start": None,
         "aec_tail_until": 0.0,
         "aec_output_active": False,
+        "speech_path": None,
+        "speech_samples": 0,
+        "endpoint_hold_samples": 0,
+        "startup_guard_release_at": None,
+        "startup_guard_active": startup_prompt_complete is not None,
+        "level_samples": 0,
+        "level_sum_squares": 0.0,
+        "level_peak": 0.0,
+        "level_reported": False,
+        "debug_samples": 0,
+        "debug_sum_squares": 0.0,
+        "debug_peak": 0.0,
+        "debug_vad_probability": 0.0,
+        "vad_audio_path": None,
     }
     speech_buffer = []
     pre_buffer = collections.deque()
@@ -736,8 +1050,50 @@ def run_asr_loop(args, proc, running, playback_active=None,
 
     def reset_speech_segment():
         state["in_speech"] = False
+        state["speech_path"] = None
+        state["speech_samples"] = 0
+        state["endpoint_hold_samples"] = 0
         speech_buffer.clear()
         pre_buffer.clear()
+
+    def reset_vad_state():
+        reset_vad = getattr(vad, "reset", None)
+        if callable(reset_vad):
+            try:
+                reset_vad()
+            except Exception as exc:
+                print(f"[VoiceBridge] VAD reset failed: {exc}", flush=True)
+
+    def finish_speech(reason=None):
+        if not speech_buffer:
+            reset_speech_segment()
+            reset_vad_state()
+            return
+        audio = np.concatenate(speech_buffer)
+        duration = len(audio) / target_rate
+        reset_speech_segment()
+        # Silero keeps endpoint state internally. Rearm after every completed
+        # utterance so the next command can produce a fresh speech-start event.
+        reset_vad_state()
+        suffix = f"; reason={reason}" if reason else ""
+        print(f"\r[VAD] 语音结束 ({duration:.1f}s{suffix})", flush=True)
+        item = (
+            audio_epoch.current() if audio_epoch is not None else 0,
+            time.monotonic(),
+            audio,
+        )
+        try:
+            audio_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                audio_queue.get_nowait()
+            except queue.Empty:
+                pass
+            audio_queue.put_nowait(item)
+            print(
+                "[VoiceBridge] ASR queue full; dropped oldest segment",
+                flush=True,
+            )
 
     def is_playback_active():
         return playback_active is not None and playback_active.is_set()
@@ -756,14 +1112,14 @@ def run_asr_loop(args, proc, running, playback_active=None,
             (state["aec_pending"], samples.astype(np.float32, copy=False))
         )
 
+        raw_frames = []
         processed_frames = []
+        use_aec_for_chunk = False
         frame_size = aec_processor.frame_size
         while len(state["aec_pending"]) >= frame_size:
             frame = state["aec_pending"][:frame_size]
             state["aec_pending"] = state["aec_pending"][frame_size:]
-            frame_end = (
-                state["aec_pending_start"] + frame_size / target_rate
-            )
+            frame_end = state["aec_pending_start"] + frame_size / target_rate
             reference = playback_reference.read(frame_size, frame_end)
             processed = aec_processor.process(frame, reference)
             has_reference = bool(np.any(np.abs(reference) > 1e-5))
@@ -774,34 +1130,114 @@ def run_asr_loop(args, proc, running, playback_active=None,
                 state["aec_tail_until"],
             )
             use_aec_output = frame_end <= state["aec_tail_until"]
+            use_aec_for_chunk = use_aec_for_chunk or use_aec_output
             if use_aec_output != state["aec_output_active"]:
                 state["aec_output_active"] = use_aec_output
                 path = "aec" if use_aec_output else "raw microphone"
                 print(f"\n[VoiceBridge] ASR audio path: {path}", flush=True)
-            processed_frames.append(processed if use_aec_output else frame.copy())
+            raw_frames.append(frame.copy())
+            processed_frames.append(processed)
             state["aec_pending_start"] = frame_end
         if not processed_frames:
-            return np.empty(0, dtype=np.float32)
-        return np.concatenate(processed_frames)
+            empty = np.empty(0, dtype=np.float32)
+            return empty, empty, False
+        return (
+            np.concatenate(raw_frames),
+            np.concatenate(processed_frames),
+            use_aec_for_chunk,
+        )
 
     def on_audio(data: bytes):
         samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-        if channels > 1:
-            samples = samples.reshape(-1, channels).mean(axis=1)
+        samples = select_capture_channel(samples, channels, channel_index)
         if resampler is not None:
             samples = resampler.process(samples)
         if len(samples) == 0:
             return
 
+        if not state["level_reported"]:
+            state["level_samples"] += len(samples)
+            state["level_sum_squares"] += float(np.dot(samples, samples))
+            state["level_peak"] = max(
+                state["level_peak"], float(np.max(np.abs(samples)))
+            )
+            if state["level_samples"] >= target_rate:
+                rms = (state["level_sum_squares"] / state["level_samples"]) ** 0.5
+                print(
+                    "\n[VoiceBridge] Microphone input active: "
+                    f"rms={rms:.4f}, peak={state['level_peak']:.4f}",
+                    flush=True,
+                )
+                state["level_reported"] = True
+
+        raw_samples = samples
+        aec_samples = None
+        use_aec_for_chunk = False
         if echo_mode == "webrtc_aec":
             try:
-                samples = apply_software_aec(samples)
+                raw_samples, aec_samples, use_aec_for_chunk = apply_software_aec(
+                    samples
+                )
             except Exception as exc:
                 print(f"\n[VoiceBridge] WebRTC AEC failed: {exc}", flush=True)
                 running.clear()
                 return
-            if len(samples) == 0:
+            if len(raw_samples) == 0:
                 return
+
+        if state["startup_guard_active"]:
+            now = time.monotonic()
+            if (
+                startup_prompt_complete is not None
+                and startup_prompt_complete.is_set()
+                and state["startup_guard_release_at"] is None
+            ):
+                state["startup_guard_release_at"] = now + TTS_ECHO_GUARD_MS / 1000.0
+            release_at = state["startup_guard_release_at"]
+            if release_at is None or now < release_at:
+                if state["in_speech"] or speech_buffer or pre_buffer:
+                    reset_speech_segment()
+                    reset_vad_state()
+                return
+            state["startup_guard_active"] = False
+            reset_speech_segment()
+            reset_vad_state()
+            print("[VoiceBridge] Startup prompt guard released", flush=True)
+
+        samples, selected_path = select_speech_samples(
+            state["in_speech"],
+            raw_samples,
+            aec_samples,
+            state["speech_path"],
+            use_aec_for_chunk,
+        )
+
+        path_rearm = should_rearm_vad_for_audio_path(
+            state["vad_audio_path"], selected_path, state["in_speech"]
+        )
+        requested_rearm = (
+            vad_rearm_requested is not None and vad_rearm_requested.is_set()
+        )
+        if path_rearm or requested_rearm:
+            previous_path = state["vad_audio_path"]
+            if requested_rearm:
+                reset_speech_segment()
+            reset_vad_state()
+            state["endpoint_hold_samples"] = 0
+            pre_buffer.clear()
+            if vad_rearm_requested is not None:
+                vad_rearm_requested.clear()
+            dropped = clear_pending_audio() if requested_rearm else 0
+            reason = (
+                f"audio path {previous_path} -> {selected_path}"
+                if path_rearm
+                else "pipeline ready"
+            )
+            print(
+                f"\n[VoiceBridge] VAD rearmed: {reason}; dropped_segments={dropped}",
+                flush=True,
+            )
+        state["vad_audio_path"] = selected_path
 
         if echo_mode == "half_duplex" and is_playback_active():
             if not state["playback_suppressed"]:
@@ -818,35 +1254,71 @@ def run_asr_loop(args, proc, running, playback_active=None,
         if echo_mode == "half_duplex" and state["playback_suppressed"]:
             state["playback_suppressed"] = False
             reset_speech_segment()
-            reset_vad = getattr(vad, "reset", None)
-            if callable(reset_vad):
-                try:
-                    reset_vad()
-                except Exception as exc:
-                    print(f"[VoiceBridge] VAD reset failed: {exc}", flush=True)
+            reset_vad_state()
             print("[VoiceBridge] ASR resumed after TTS echo guard", flush=True)
 
         result = vad.detect(samples, target_rate)
-        if result is None:
-            return
+        if getattr(args, "audio_debug", False):
+            state["debug_samples"] += len(samples)
+            state["debug_sum_squares"] += float(np.dot(samples, samples))
+            state["debug_peak"] = max(
+                state["debug_peak"], float(np.max(np.abs(samples)))
+            )
+            state["debug_vad_probability"] = max(
+                state["debug_vad_probability"],
+                float(getattr(result, "probability", 0.0) or 0.0),
+            )
+            if state["debug_samples"] >= target_rate:
+                rms = (state["debug_sum_squares"] / state["debug_samples"]) ** 0.5
+                print(
+                    "\n[VoiceBridge] Audio debug: "
+                    f"rms={rms:.4f}, peak={state['debug_peak']:.4f}, "
+                    "vad_max="
+                    f"{state['debug_vad_probability']:.4f}",
+                    flush=True,
+                )
+                state["debug_samples"] = 0
+                state["debug_sum_squares"] = 0.0
+                state["debug_peak"] = 0.0
+                state["debug_vad_probability"] = 0.0
+        vad_event = classify_vad_event(state["in_speech"], result)
 
-        if result.is_speech_start:
+        if vad_event == "start":
             state["in_speech"] = True
+            state["speech_path"] = selected_path
             speech_buffer.clear()
             if pre_buffer:
-                speech_buffer.append(np.concatenate(list(pre_buffer)))
+                buffered = np.concatenate(list(pre_buffer))
+                speech_buffer.append(buffered)
+                state["speech_samples"] = len(buffered)
+            else:
+                state["speech_samples"] = 0
             speech_buffer.append(samples.copy())
+            state["speech_samples"] += len(samples)
             print("\r[VAD] 检测到语音...", end="", flush=True)
-        elif state["in_speech"] and not result.is_speech_end:
+        elif vad_event in ("append", "finish"):
             speech_buffer.append(samples.copy())
-        elif result.is_speech_end and state["in_speech"]:
-            speech_buffer.append(samples.copy())
-            audio = np.concatenate(speech_buffer)
-            speech_buffer.clear()
-            state["in_speech"] = False
-            dur = len(audio) / target_rate
-            print(f"\r[VAD] 语音结束 ({dur:.1f}s)", flush=True)
-            audio_queue.put(audio)
+            state["speech_samples"] += len(samples)
+            state["endpoint_hold_samples"] = update_vad_endpoint_hold(
+                True,
+                result,
+                state["endpoint_hold_samples"],
+                len(samples),
+                trigger,
+            )
+
+        if (
+            state["in_speech"]
+            and state["endpoint_hold_samples"] > 0
+            and state["endpoint_hold_samples"] >= target_rate * endpoint_hold_ms // 1000
+        ):
+            finish_speech()
+
+        if (
+            state["in_speech"]
+            and state["speech_samples"] >= target_rate * max_speech_ms // 1000
+        ):
+            finish_speech("maximum duration")
 
         if not state["in_speech"]:
             pre_buffer.append(samples.copy())
@@ -878,14 +1350,67 @@ def run_asr_loop(args, proc, running, playback_active=None,
     )
 
     try:
+        segment_sequence = 0
         while running.is_set() and proc.poll() is None:
             try:
-                audio = audio_queue.get(timeout=0.2)
+                segment_epoch, captured_at, audio = audio_queue.get(timeout=0.2)
             except queue.Empty:
+                continue
+            current_epoch = audio_epoch.current() if audio_epoch is not None else 0
+            age_sec = time.monotonic() - captured_at
+            if segment_epoch != current_epoch or age_sec > MAX_ASR_SEGMENT_AGE_SEC:
+                print(
+                    "[VoiceBridge] Drop stale ASR segment: "
+                    f"segment_epoch={segment_epoch} "
+                    f"current_epoch={current_epoch} age_ms={age_sec * 1000:.0f}",
+                    flush=True,
+                )
                 continue
             if echo_mode == "half_duplex" and is_playback_active():
                 continue
-            result = asr.recognize(audio)
+            segment_sequence += 1
+            debug_path = None
+            if getattr(args, "asr_audio_dir", None):
+                try:
+                    debug_path = save_asr_audio_segment(
+                        args.asr_audio_dir,
+                        segment_sequence,
+                        audio,
+                        target_rate,
+                    )
+                except OSError as exc:
+                    print(
+                        f"[VoiceBridge] Failed to save ASR audio: {exc}",
+                        flush=True,
+                    )
+            request_started = time.monotonic()
+            if getattr(args, "audio_debug", False):
+                detail = f" file={debug_path}" if debug_path else ""
+                print(
+                    "[VoiceBridge] ASR request: "
+                    f"segment={segment_sequence} "
+                    f"duration_ms={len(audio) * 1000 // target_rate}"
+                    f"{detail}",
+                    flush=True,
+                )
+            try:
+                result = asr.recognize(audio)
+            except Exception as exc:
+                print(f"[VoiceBridge] ASR request failed: {exc}", flush=True)
+                continue
+            if getattr(args, "audio_debug", False):
+                elapsed_ms = int((time.monotonic() - request_started) * 1000)
+                print(
+                    "[VoiceBridge] ASR response: "
+                    f"segment={segment_sequence} elapsed_ms={elapsed_ms}",
+                    flush=True,
+                )
+            if audio_epoch is not None and segment_epoch != audio_epoch.current():
+                print(
+                    "[VoiceBridge] Drop ASR result from previous audio epoch",
+                    flush=True,
+                )
+                continue
             if not result or result.is_empty:
                 continue
             if echo_mode == "half_duplex" and is_playback_active():
@@ -911,22 +1436,49 @@ def parse_args():
     )
     parser.add_argument("--config", default="config/grasp_pipeline.yaml")
     parser.add_argument("--binary", default="build/perceptive_grasp")
-    parser.add_argument("--grasp-arg", action="append", default=[],
-                        help="透传给 perceptive_grasp 的额外参数，可重复")
+    parser.add_argument(
+        "--remote-host", default=None, help="覆盖 remote_mujoco 服务地址"
+    )
+    parser.add_argument(
+        "--remote-port", type=int, default=None, help="覆盖 remote_mujoco 服务端口"
+    )
+    parser.add_argument(
+        "--grasp-arg",
+        action="append",
+        default=[],
+        help="透传给 perceptive_grasp 的额外参数，可重复",
+    )
     parser.add_argument("-d", "--device", type=int, default=None)
     parser.add_argument("-r", "--rate", type=int, default=None)
-    parser.add_argument("-c", "--channels", type=int, choices=[1, 2],
-                        default=None)
+    parser.add_argument("-c", "--channels", type=int, choices=[1, 2], default=None)
+    parser.add_argument(
+        "--channel-index",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="覆盖双声道录音中送入 asr 的物理声道",
+    )
     parser.add_argument("--vad-trigger-threshold", type=float, default=None)
     parser.add_argument("--vad-stop-threshold", type=float, default=None)
     parser.add_argument("--vad-min-speech-duration-ms", type=int, default=None)
     parser.add_argument("--pre-buffer-ms", type=int, default=800)
-    parser.add_argument("--asr-threads", type=int, default=4)
+    parser.add_argument(
+        "--asr-backend",
+        choices=("sensevoice", "qwen3_asr"),
+        default=None,
+        help="覆盖 voice.asr.backend",
+    )
+    parser.add_argument("--asr-threads", type=int, default=None)
+    parser.add_argument(
+        "--audio-debug", action="store_true", help="每秒输出麦克风电平和 vad 最大概率"
+    )
+    parser.add_argument(
+        "--asr-audio-dir", default=None, help="保存实际提交给 asr 的单声道 wav 片段"
+    )
     parser.add_argument("--tts-engine", default=None)
     parser.add_argument("--tts-device", type=int, default=None)
     parser.add_argument("--tts-rate", type=int, default=None)
-    parser.add_argument("--tts-channels", type=int, choices=[1, 2],
-                        default=None)
+    parser.add_argument("--tts-channels", type=int, choices=[1, 2], default=None)
     parser.add_argument("--tts-speed", type=float, default=None)
     parser.add_argument("--tts-volume", type=int, default=None)
     parser.add_argument("--speak-all", action="store_true")
@@ -937,6 +1489,14 @@ def parse_args():
 
 def main():
     args = parse_args()
+    process_lock = acquire_voice_bridge_lock()
+    if process_lock is None:
+        print(
+            "[VoiceBridge] Another voice bridge is already running; "
+            "stop it before starting a new instance",
+            flush=True,
+        )
+        return 2
     voice_cfg = load_voice_config(args.config)
     try:
         echo_mode, echo_config = load_echo_cancellation_config(voice_cfg)
@@ -948,32 +1508,43 @@ def main():
 
     preset = engine_to_preset(args.tts_engine or tts_cfg.get("engine", "matcha:zh"))
     playback_device = (
-        args.tts_device if args.tts_device is not None
+        args.tts_device
+        if args.tts_device is not None
         else int(tts_cfg.get("playback_device", -1))
     )
     playback_rate = (
-        args.tts_rate if args.tts_rate is not None
+        args.tts_rate
+        if args.tts_rate is not None
         else int(tts_cfg.get("playback_rate", 48000))
     )
     tts_channels = (
-        args.tts_channels if args.tts_channels is not None
+        args.tts_channels
+        if args.tts_channels is not None
         else int(tts_cfg.get("channels", 1))
     )
     speed = (
-        args.tts_speed if args.tts_speed is not None
+        args.tts_speed
+        if args.tts_speed is not None
         else float(tts_cfg.get("speed", 1.0))
     )
     volume = (
-        args.tts_volume if args.tts_volume is not None
+        args.tts_volume
+        if args.tts_volume is not None
         else int(tts_cfg.get("volume", 80))
     )
     mixer_volume = int(tts_cfg.get("mixer_volume", -1))
-    speak_all_states = (
-        args.speak_all or bool(tts_cfg.get("speak_all_states", False))
-    )
+    speak_all_states = args.speak_all or bool(tts_cfg.get("speak_all_states", False))
     tts_enabled = bool(tts_cfg.get("enabled", True))
 
-    cmd = build_grasp_command(args.binary, args.config, args.grasp_arg)
+    grasp_args = list(args.grasp_arg)
+    if args.remote_host:
+        grasp_args.extend(["--remote-host", args.remote_host])
+    if args.remote_port is not None:
+        if args.remote_port < 1 or args.remote_port > 65535:
+            print("[VoiceBridge] Invalid remote port: expected 1-65535", flush=True)
+            return 2
+        grasp_args.extend(["--remote-port", str(args.remote_port)])
+    cmd = build_grasp_command(args.binary, args.config, grasp_args)
     print(f"[VoiceBridge] Version: {VOICE_BRIDGE_VERSION}", flush=True)
     print(f"[VoiceBridge] Echo cancellation: mode={echo_mode}", flush=True)
     print("[VoiceBridge] Start: " + " ".join(cmd), flush=True)
@@ -998,12 +1569,23 @@ def main():
     text_queue = queue.Queue(maxsize=8)
     status_queue = queue.Queue(maxsize=16)
     playback_active = threading.Event()
+    playback_startup_complete = threading.Event()
+    vad_rearm_requested = threading.Event()
+    audio_epoch = AudioEpoch()
     playback_reference = None
     if echo_mode == "webrtc_aec":
         playback_reference = PlaybackReferenceTimeline(
             16000,
             int(echo_config.get("delay_ms", 50)),
         )
+    startup_prompt_complete = None
+    if tts_enabled and not args.no_play:
+        startup_prompt_complete = threading.Event()
+
+    def on_playback_complete(text):
+        del text
+        if startup_prompt_complete is not None and not startup_prompt_complete.is_set():
+            startup_prompt_complete.set()
 
     def stop_handler(sig, frame):
         del sig, frame
@@ -1015,8 +1597,16 @@ def main():
     threads = [
         threading.Thread(
             target=_read_grasp_stdout,
-            args=(proc, text_queue, running, reverse_aliases, speak_all_states,
-                  status_queue),
+            args=(
+                proc,
+                text_queue,
+                running,
+                reverse_aliases,
+                speak_all_states,
+                status_queue,
+                vad_rearm_requested,
+                audio_epoch,
+            ),
             daemon=True,
         ),
         threading.Thread(
@@ -1028,10 +1618,8 @@ def main():
     for thread in threads:
         thread.start()
 
-    if not wait_for_grasp_ready(
-            proc, status_queue, running, args.startup_timeout_sec):
-        print("[VoiceBridge] perceptive_grasp not ready; stop voice bridge",
-              flush=True)
+    if not wait_for_grasp_ready(proc, status_queue, running, args.startup_timeout_sec):
+        print("[VoiceBridge] perceptive_grasp not ready; stop voice bridge", flush=True)
         request_shutdown(proc, running, text_queue)
         try:
             proc.wait(timeout=5.0)
@@ -1041,18 +1629,75 @@ def main():
             thread.join(timeout=2.0)
         return 1
 
+    asr_cfg = voice_cfg.get("asr", {}) or {}
+    try:
+        from spacemit_audio import AudioCapture, AudioPlayer
+
+        asr_device = (
+            args.device
+            if args.device is not None
+            else resolve_audio_device(
+                int(asr_cfg.get("device", -1)),
+                asr_cfg.get("device_name", ""),
+                AudioCapture.list_devices,
+                "capture",
+            )
+        )
+        if args.tts_device is None:
+            playback_device = resolve_audio_device(
+                playback_device,
+                tts_cfg.get("playback_device_name", ""),
+                AudioPlayer.list_devices,
+                "playback",
+            )
+        args.device = asr_device
+    except Exception as exc:
+        print(f"[VoiceBridge] Audio device resolution failed: {exc}", flush=True)
+        request_shutdown(proc, running, text_queue)
+        return 1
+    asr_mixer_volume = int(asr_cfg.get("mixer_volume", -1))
+    if asr_mixer_volume >= 0:
+        try:
+            configure_capture_mixer(
+                asr_device,
+                asr_mixer_volume,
+                AudioCapture.list_devices,
+            )
+        except Exception as exc:
+            print(
+                f"[VoiceBridge] Capture mixer setup skipped: {exc}",
+                flush=True,
+            )
+
     if tts_enabled:
         tts_thread = threading.Thread(
             target=run_tts_worker,
-            args=(text_queue, running, preset, playback_device, playback_rate,
-                  tts_channels, speed, volume, args.no_play, mixer_volume,
-                  playback_active,
-                  TTS_ECHO_GUARD_MS if echo_mode == "half_duplex" else 0,
-                  playback_reference.schedule if playback_reference else None),
+            args=(
+                text_queue,
+                running,
+                preset,
+                playback_device,
+                playback_rate,
+                tts_channels,
+                speed,
+                volume,
+                args.no_play,
+                mixer_volume,
+                playback_active,
+                TTS_ECHO_GUARD_MS if echo_mode == "half_duplex" else 0,
+                playback_reference.schedule if playback_reference else None,
+                on_playback_complete,
+                playback_startup_complete,
+            ),
             daemon=True,
         )
         threads.append(tts_thread)
         tts_thread.start()
+        if not playback_startup_complete.wait(timeout=5.0):
+            print(
+                "[VoiceBridge] TTS playback initialization timed out",
+                flush=True,
+            )
     else:
         print("[VoiceBridge] TTS disabled", flush=True)
 
@@ -1064,6 +1709,9 @@ def main():
                 running,
                 playback_active,
                 playback_reference,
+                startup_prompt_complete,
+                vad_rearm_requested,
+                audio_epoch,
             )
         return 0 if proc.poll() in (None, 0) else proc.poll()
     finally:

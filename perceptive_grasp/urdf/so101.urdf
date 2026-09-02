@@ -377,4 +377,21 @@
     <axis xyz="0 0 0"/>
   </joint>
 
+  <!-- Linksee's printed gripper mount shifts the physical pinch center from
+       the standard SO101 TCP. Keep both frames so non-Linksee users retain
+       the upstream geometry while the robot config can select this frame. -->
+  <link name="linksee_gripper_tcp_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="1e-9"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+  </link>
+
+  <joint name="linksee_gripper_tcp_joint" type="fixed">
+    <origin xyz="0.020 0.016 -0.088" rpy="0 3.14159 0"/>
+    <parent link="gripper_link"/>
+    <child link="linksee_gripper_tcp_link"/>
+  </joint>
+
 </robot>

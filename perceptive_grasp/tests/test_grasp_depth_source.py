@@ -47,19 +47,21 @@ class GraspDepthSourceTest(unittest.TestCase):
         self.assertNotIn("Target depth invalid at mask and center",
                          self.pipeline)
 
-    def test_top_grasp_uses_mask_pixel_depth_planning(self):
+    def test_top_grasp_uses_stable_mask_depth_planning(self):
         top_grasp = _function_body(
             self.pipeline, "bool GraspPipeline::BuildMaskTopGrasp")
         self.assertIn(
             "bool GraspPipeline::BuildMaskTopGrasp", self.pipeline)
         self.assertIn("ComputeGraspPixel(", self.pipeline)
-        self.assertIn("SampleMaskedDepthNearPixel(", top_grasp)
+        self.assertIn("ForegroundDepthFromMask(", top_grasp)
         self.assertLess(
             top_grasp.find("SampleMaskedDepthNearPixel("),
             top_grasp.find("ForegroundDepthFromMask("),
         )
-        self.assertIn("depth_sample.x", top_grasp)
-        self.assertIn("depth_sample.y", top_grasp)
+        self.assertIn("source=grasp_pixel_mask", top_grasp)
+        self.assertIn("source=target_mask_foreground", top_grasp)
+        self.assertIn("intended_grasp_x", top_grasp)
+        self.assertIn("intended_grasp_y", top_grasp)
         self.assertIn("planner_->PlanTopGrasp(", self.pipeline)
         self.assertIn("config_.top_grasp_point_x_ratio", self.pipeline)
         self.assertIn(
@@ -73,6 +75,19 @@ class GraspDepthSourceTest(unittest.TestCase):
             "preferred_candidate->strategy == GraspStrategy::TOP",
             self.pipeline,
         )
+
+    def test_low_profile_top_grasp_height_uses_support_plane(self):
+        top_grasp = _function_body(
+            self.pipeline, "bool GraspPipeline::BuildMaskTopGrasp")
+        self.assertIn("kTopGraspSupportClearanceM = 0.004f", top_grasp)
+        self.assertIn("kTopGraspFloorClearanceM", top_grasp)
+        self.assertIn("support_anchored_base_z", top_grasp)
+        self.assertIn(
+            "support_z + kTopGraspSupportClearanceM", top_grasp)
+        self.assertNotIn("kTopGraspMaximumPlaneCompensationM", top_grasp)
+        self.assertIn("config_.planner.workspace.z_min", top_grasp)
+        self.assertIn("config_.planner.grasp_depth", top_grasp)
+        self.assertIn("source=support_plane measured_surface_z=", top_grasp)
 
     def test_selected_top_uses_2d_candidate_with_3d_support_plane(self):
         planning = _function_body(
@@ -90,9 +105,12 @@ class GraspDepthSourceTest(unittest.TestCase):
         self.assertNotIn('current_target_.label_name != "bottle"', planning)
         self.assertIn("HandleTopPlanning()", planning)
         self.assertIn("BuildMaskTopGrasp(", top_planning)
+        self.assertIn("safety_geometry.candidates.empty()", top_planning)
+        self.assertIn(
+            "Top-grasp point cloud is sparse", top_planning)
         self.assertIn("PlanMobileBaseAlignment(", top_planning)
         self.assertIn(
-            "Mobile base alignment target center:", top_planning)
+            "Mobile base alignment source=", top_planning)
         self.assertIn(
             "config_.mobile_base, alignment_point", top_planning)
         self.assertIn("PipelineState::APPROACHING", top_planning)
@@ -178,6 +196,50 @@ class GraspDepthSourceTest(unittest.TestCase):
         self.assertIn("camera_->Deproject", estimate)
         self.assertIn("planner_->CameraToBase", estimate)
         self.assertIn("&support_plane", top_planning)
+        self.assertIn("EnforceTopSupportClearance(", build)
+        self.assertIn(
+            "config_.top_minimum_grasp_height_m",
+            build,
+        )
+
+    def test_top_minimum_height_is_relative_to_support_plane(self):
+        clearance = _function_body(
+            self.pipeline,
+            "float EnforceTopSupportClearance",
+        )
+        projected = _function_body(
+            self.pipeline,
+            "bool GraspPipeline::ProjectTopCandidateToMaskCenter",
+        )
+        self.assertIn("support_plane.normal_x", clearance)
+        self.assertIn("support_plane.normal_y", clearance)
+        self.assertIn("support_plane.normal_z", clearance)
+        self.assertIn("support_plane.d", clearance)
+        self.assertIn("minimum_clearance_m - current_clearance", clearance)
+        self.assertIn("shift_pose(candidate.grasp_pose)", clearance)
+        self.assertIn("shift_pose(candidate.pre_grasp_pose)", clearance)
+        self.assertIn("EnforceTopSupportClearance(", projected)
+        self.assertIn("SupportPlane center_plane = support_plane", projected)
+        self.assertIn("candidate, support_plane,", projected)
+        self.assertNotIn("candidate, center_plane,", projected)
+        self.assertNotIn(
+            "top_minimum_grasp_height_m - candidate.grasp_pose.z",
+            projected,
+        )
+
+    def test_top_grasp_rejects_near_arm_depth_against_support_plane(self):
+        build = _function_body(
+            self.pipeline,
+            "bool GraspPipeline::BuildMaskTopGrasp",
+        )
+        self.assertIn("kMaximumTopForegroundLeadMm = 100.0f", build)
+        self.assertIn(
+            "support_depth_mm - static_cast<float>(depth_mm)", build)
+        self.assertIn("support_plane_occlusion_recovery", build)
+        recovery_index = build.index("support_plane_occlusion_recovery")
+        deproject_index = build.index(
+            "camera_->Deproject(cx, cy, depth_mm")
+        self.assertLess(recovery_index, deproject_index)
 
     def test_post_motion_geometry_gets_one_bounded_refresh(self):
         self.assertIn("kMotionGeometryMaxRefreshes = 1", self.pipeline)
@@ -212,7 +274,7 @@ class GraspDepthSourceTest(unittest.TestCase):
         self.assertIn("FlushCameraAfterMotion(", retry)
         self.assertNotIn("PipelineState::OBSERVING", retry)
 
-    def test_top_base_alignment_uses_stable_mask_depth(self):
+    def test_top_base_alignment_uses_validated_grasp_point(self):
         top_planning = _function_body(
             self.pipeline,
             "void GraspPipeline::HandleTopPlanning",
@@ -221,7 +283,10 @@ class GraspDepthSourceTest(unittest.TestCase):
             self.pipeline,
             "bool GraspPipeline::ConfirmTopAlignmentPoint",
         )
-        self.assertIn("ForegroundDepthFromMask(", top_planning)
+        self.assertNotIn("ForegroundDepthFromMask(", top_planning)
+        self.assertIn("candidate.grasp_pose.x", top_planning)
+        self.assertIn("candidate.grasp_pose.y", top_planning)
+        self.assertIn("validated_top_grasp_point", top_planning)
         self.assertIn("ConfirmTopAlignmentPoint(", top_planning)
         self.assertIn(
             "kTopAlignmentMaximumFrameDeltaM", confirmation)

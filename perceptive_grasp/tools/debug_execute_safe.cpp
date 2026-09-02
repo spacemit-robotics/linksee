@@ -3,7 +3,7 @@
     * SPDX-License-Identifier: Apache-2.0
     *
     * @file debug_execute_safe.cpp
-    * @brief 安全执行调试工具：只执行 observe -> pre_grasp
+    * @brief 安全执行调试工具：执行不抓取或释放的受限运动验证
     */
 
 #include <cmath>
@@ -30,6 +30,7 @@ using perceptive_grasp::GraspExecutor;
 using perceptive_grasp::GraspResult;
 using perceptive_grasp::JointConstraint;
 using perceptive_grasp::Pose3D;
+using perceptive_grasp::SupportPlane;
 
 static constexpr const char* kDefaultConfigPath = "../config/grasp_pipeline.yaml";
 
@@ -83,6 +84,10 @@ struct DebugExecuteSafeAppConfig {
     float wrist_pitch = -1.0f;  // <0 表示不覆盖, 朝下范围 [1.102, 1.667]
     float wrist_yaw = -999.0f;  // -999 表示不覆盖
     bool has_joints = false;    // --joints 模式: 直接指定5个关节角
+    bool place_cycle = false;   // --place-cycle 模式: place -> home
+    bool recover_held_object = false;
+    bool has_support_plane = false;
+    SupportPlane support_plane;
     std::vector<float> target_joints;
     bool auto_yes = false;
     int dwell_ms = 2000;
@@ -94,16 +99,25 @@ static void PrintUsage(const char* prog) {
     std::cout << "Usage:\n"
                 << "  " << prog << " --pose x y z [--yaw DEG] [options]\n"
                 << "  " << prog << " --joints j1 j2 j3 j4 j5 [options]\n"
+                << "  " << prog << " --place-cycle [options]\n"
+                << "  " << prog << " --recover-held-object [options]\n"
                 << "\n"
-                << "Safe sequence:\n"
+                << "Pose/joints sequence:\n"
                 << "  1. Init manipulator + gripper\n"
                 << "  2. Move to observe_joints\n"
                 << "  3. Move to given pre_grasp pose / joints\n"
                 << "  4. Stop\n"
+                << "Place-cycle sequence:\n"
+                << "  1. Init manipulator + gripper\n"
+                << "  2. Move to configured observe_joints staging pose\n"
+                << "  3. Move to configured place_joints\n"
+                << "  4. Return to configured home_joints\n"
                 << "\n"
                 << "Modes:\n"
                 << "  --pose x y z             Target position (auto top-down orientation)\n"
                 << "  --joints j1 j2 j3 j4 j5 Direct joint angles (rad), skip IK\n"
+                << "  --place-cycle           Move to configured place pose, then return home\n"
+                << "  --recover-held-object   From current pose: place, release, close, then home\n"
                 << "\n"
                 << "Orientation control:\n"
                 << "  --yaw DEG              Gripper yaw around vertical axis (degrees)\n"
@@ -115,9 +129,12 @@ static void PrintUsage(const char* prog) {
                 << "  --dwell-ms N          Hold after each pose in milliseconds (default: 2000)\n"
                 << "  --wait-done-ms N      Max wait for motion completion in ms (default: 15000)\n"
                 << "  --safe-move-speed S   Joint move speed for step 3 (default: 0.2)\n"
+                << "  --support-plane nx ny nz d minx maxx miny maxy\n"
+                << "                         Use a measured bounded support plane\n"
                 << "  --yes                 Skip confirmation prompts\n"
                 << "\n"
-                << "This tool will NOT descend and will NOT close the gripper.\n";
+                << "Pose/joints modes do not descend or close the gripper.\n"
+                << "Place-cycle closes only for observe staging; it does not grasp or release.\n";
 }
 
 static void DwellAfterPose(const char* stage_name, int dwell_ms) {
@@ -160,6 +177,22 @@ static DebugExecuteSafeAppConfig ParseArgs(int argc, char* argv[]) {
             for (int j = 0; j < 5; ++j) {
                 cfg.target_joints.push_back(std::stof(argv[++i]));
             }
+        } else if (arg == "--place-cycle") {
+            cfg.place_cycle = true;
+        } else if (arg == "--recover-held-object") {
+            cfg.recover_held_object = true;
+        } else if (arg == "--support-plane" && i + 8 < argc) {
+            cfg.has_support_plane = true;
+            cfg.support_plane.normal_x = std::stof(argv[++i]);
+            cfg.support_plane.normal_y = std::stof(argv[++i]);
+            cfg.support_plane.normal_z = std::stof(argv[++i]);
+            cfg.support_plane.d = std::stof(argv[++i]);
+            cfg.support_plane.min_x = std::stof(argv[++i]);
+            cfg.support_plane.max_x = std::stof(argv[++i]);
+            cfg.support_plane.min_y = std::stof(argv[++i]);
+            cfg.support_plane.max_y = std::stof(argv[++i]);
+            cfg.support_plane.valid = true;
+            cfg.support_plane.bounds_valid = true;
         } else if (arg == "--yaw" && i + 1 < argc) {
             cfg.yaw_deg = std::stof(argv[++i]);
         } else if (arg == "--wrist-pitch" && i + 1 < argc) {
@@ -257,6 +290,15 @@ static ExecutorConfig LoadExecutorConfig(const std::string& config_path) {
         }
     }
 
+    if (auto p = root["place"]) {
+        if (auto pj = p["place_joints"]) {
+            cfg.place_joints.clear();
+            for (size_t i = 0; i < pj.size(); ++i) {
+                cfg.place_joints.push_back(pj[i].as<float>());
+            }
+        }
+    }
+
     if (!cfg.urdf_path.empty() && !fs::path(cfg.urdf_path).is_absolute()) {
         fs::path config_dir = fs::path(config_path).parent_path();
         fs::path resolved = config_dir / cfg.urdf_path;
@@ -266,10 +308,58 @@ static ExecutorConfig LoadExecutorConfig(const std::string& config_path) {
     return cfg;
 }
 
+static bool LoadWorkspaceSupportPlane(
+    const std::string& config_path,
+    SupportPlane& support_plane) {
+    const YAML::Node root = YAML::LoadFile(config_path);
+    const YAML::Node workspace = root["grasp"]["workspace"];
+    if (!workspace) return false;
+
+    support_plane.normal_x = 0.0f;
+    support_plane.normal_y = 0.0f;
+    support_plane.normal_z = 1.0f;
+    support_plane.min_x = workspace["x_min"].as<float>(NAN);
+    support_plane.max_x = workspace["x_max"].as<float>(NAN);
+    support_plane.min_y = workspace["y_min"].as<float>(NAN);
+    support_plane.max_y = workspace["y_max"].as<float>(NAN);
+    const float z_min = workspace["z_min"].as<float>(NAN);
+    if (!std::isfinite(support_plane.min_x) ||
+        !std::isfinite(support_plane.max_x) ||
+        !std::isfinite(support_plane.min_y) ||
+        !std::isfinite(support_plane.max_y) ||
+        !std::isfinite(z_min) ||
+        support_plane.min_x > support_plane.max_x ||
+        support_plane.min_y > support_plane.max_y) {
+        return false;
+    }
+    support_plane.d = -z_min;
+    support_plane.valid = true;
+    support_plane.bounds_valid = true;
+    return true;
+}
+
+static bool IsSupportPlaneUsable(const SupportPlane& support_plane) {
+    const float normal_norm = std::sqrt(
+        support_plane.normal_x * support_plane.normal_x +
+        support_plane.normal_y * support_plane.normal_y +
+        support_plane.normal_z * support_plane.normal_z);
+    return support_plane.valid && support_plane.bounds_valid &&
+        std::isfinite(normal_norm) && normal_norm > 0.9f &&
+        normal_norm < 1.1f && std::isfinite(support_plane.d) &&
+        std::isfinite(support_plane.min_x) &&
+        std::isfinite(support_plane.max_x) &&
+        std::isfinite(support_plane.min_y) &&
+        std::isfinite(support_plane.max_y) &&
+        support_plane.min_x <= support_plane.max_x &&
+        support_plane.min_y <= support_plane.max_y;
+}
+
 int main(int argc, char* argv[]) {
     try {
         DebugExecuteSafeAppConfig app = ParseArgs(argc, argv);
-        if (app.config_path.empty() || (!app.has_pose && !app.has_joints)) {
+        if (app.config_path.empty() ||
+            (!app.has_pose && !app.has_joints && !app.place_cycle &&
+                !app.recover_held_object)) {
             PrintUsage(argv[0]);
             return 1;
         }
@@ -279,7 +369,15 @@ int main(int argc, char* argv[]) {
         std::cout << "[debug_execute_safe] config: " << app.config_path << std::endl;
         std::cout << "[debug_execute_safe] uart:   " << exec_cfg.uart_device << std::endl;
         std::cout << "[debug_execute_safe] urdf:   " << exec_cfg.urdf_path << std::endl;
-        if (app.has_joints) {
+        if (app.recover_held_object) {
+            std::cout
+                << "[debug_execute_safe] mode: recover held object at "
+                << "configured place -> release -> home" << std::endl;
+        } else if (app.place_cycle) {
+            std::cout
+                << "[debug_execute_safe] mode: configured place -> home cycle"
+                << std::endl;
+        } else if (app.has_joints) {
             std::cout << "[debug_execute_safe] mode: direct joints [";
             for (size_t i = 0; i < app.target_joints.size(); ++i) {
                 if (i > 0) std::cout << ", ";
@@ -307,7 +405,11 @@ int main(int argc, char* argv[]) {
         std::cout << "[debug_execute_safe] wait done timeout: " << app.wait_done_ms << " ms" << std::endl;
         std::cout << "[debug_execute_safe] safe move speed: " << app.safe_move_speed << std::endl;
 
-        if (!ConfirmStep("[step 1/3] Confirm hardware area is clear and power is on.", app.auto_yes)) {
+        const char* initial_prompt =
+            (app.place_cycle || app.recover_held_object)
+            ? "[step 1/4] Confirm hardware area is clear and power is on."
+            : "[step 1/3] Confirm hardware area is clear and power is on.";
+        if (!ConfirmStep(initial_prompt, app.auto_yes)) {
             std::cout << "[debug_execute_safe] aborted." << std::endl;
             return 2;
         }
@@ -317,6 +419,168 @@ int main(int argc, char* argv[]) {
         if (!executor.Init()) {
             std::cerr << "[debug_execute_safe] executor init failed" << std::endl;
             return 1;
+        }
+
+        if (app.recover_held_object) {
+            SupportPlane active_support_plane = app.support_plane;
+            if (!app.has_support_plane && !LoadWorkspaceSupportPlane(
+                    app.config_path, active_support_plane)) {
+                std::cerr << "[debug_execute_safe] valid support plane is "
+                    << "required for held-object recovery" << std::endl;
+                return 1;
+            }
+            if (!IsSupportPlaneUsable(active_support_plane)) {
+                std::cerr << "[debug_execute_safe] recovery support plane "
+                    << "is invalid" << std::endl;
+                return 1;
+            }
+            executor.SetSupportPlane(active_support_plane);
+            if (!ConfirmStep(
+                    "[recovery] Move from current pose to configured place, "
+                    "release possible object, and return home?",
+                    app.auto_yes)) {
+                std::cout << "[debug_execute_safe] recovery aborted."
+                    << std::endl;
+                return 2;
+            }
+            auto place_result = executor.MoveToPlace();
+            if (place_result != GraspResult::SUCCESS) {
+                std::cerr
+                    << "[debug_execute_safe] direct recovery place path "
+                    << "failed, result="
+                    << static_cast<int>(place_result)
+                    << "; retrying through coordinated observe staging"
+                    << std::endl;
+                const auto staging_result = executor.MoveToObserve();
+                if (staging_result != GraspResult::SUCCESS) {
+                    std::cerr
+                        << "[debug_execute_safe] recovery observe staging "
+                        << "failed, result="
+                        << static_cast<int>(staging_result) << std::endl;
+                    return 1;
+                }
+                place_result = executor.MoveToPlace();
+                if (place_result != GraspResult::SUCCESS) {
+                    std::cerr
+                        << "[debug_execute_safe] staged recovery place "
+                        << "failed, result="
+                        << static_cast<int>(place_result) << std::endl;
+                    return 1;
+                }
+            }
+            auto recovery_result = executor.ReleaseObject();
+            if (recovery_result != GraspResult::SUCCESS) {
+                std::cerr << "[debug_execute_safe] recovery release failed"
+                    << std::endl;
+                return 1;
+            }
+            recovery_result = executor.CloseGripper();
+            if (recovery_result != GraspResult::SUCCESS) {
+                std::cerr << "[debug_execute_safe] recovery close failed"
+                    << std::endl;
+                return 1;
+            }
+            recovery_result = executor.MoveToHome();
+            if (recovery_result != GraspResult::SUCCESS) {
+                std::cerr << "[debug_execute_safe] recovery home failed"
+                    << std::endl;
+                return 1;
+            }
+            std::cout << "[debug_execute_safe] held-object recovery "
+                << "completed successfully." << std::endl;
+            return 0;
+        }
+
+        if (app.place_cycle) {
+            SupportPlane active_support_plane = app.support_plane;
+            if (!app.has_support_plane && !LoadWorkspaceSupportPlane(
+                    app.config_path, active_support_plane)) {
+                std::cerr
+                    << "[debug_execute_safe] valid grasp.workspace support "
+                    << "plane is required for place-cycle" << std::endl;
+                return 1;
+            }
+            if (!IsSupportPlaneUsable(active_support_plane)) {
+                std::cerr
+                    << "[debug_execute_safe] support plane is invalid"
+                    << std::endl;
+                return 1;
+            }
+            std::cout
+                << "[debug_execute_safe] support plane normal=["
+                << active_support_plane.normal_x << ","
+                << active_support_plane.normal_y << ","
+                << active_support_plane.normal_z << "] d="
+                << active_support_plane.d << " bounds=["
+                << active_support_plane.min_x << ","
+                << active_support_plane.max_x << ","
+                << active_support_plane.min_y << ","
+                << active_support_plane.max_y << "]" << std::endl;
+            executor.SetSupportPlane(active_support_plane);
+
+            if (!ConfirmStep(
+                    "[step 2/4] Move arm to observe staging pose?",
+                    app.auto_yes)) {
+                std::cout
+                    << "[debug_execute_safe] aborted before observe move."
+                    << std::endl;
+                return 2;
+            }
+            const auto observe_result = executor.MoveToObserve();
+            if (observe_result != GraspResult::SUCCESS) {
+                std::cerr
+                    << "[debug_execute_safe] MoveToObserve failed, result="
+                    << static_cast<int>(observe_result)
+                    << "; attempting direct home recovery" << std::endl;
+                executor.MoveToHome();
+                return 1;
+            }
+            DwellAfterPose("observe staging pose", app.dwell_ms);
+
+            if (!ConfirmStep(
+                    "[step 3/4] Move arm to configured place pose?",
+                    app.auto_yes)) {
+                std::cout
+                    << "[debug_execute_safe] aborted before place move."
+                    << std::endl;
+                return 2;
+            }
+
+            const auto place_result = executor.MoveToPlace();
+            if (place_result == GraspResult::SUCCESS) {
+                DwellAfterPose("place pose", app.dwell_ms);
+            } else {
+                std::cerr
+                    << "[debug_execute_safe] MoveToPlace failed, result="
+                    << static_cast<int>(place_result)
+                    << "; attempting direct home recovery" << std::endl;
+            }
+
+            if (!ConfirmStep(
+                    "[step 4/4] Return arm to configured home pose?",
+                    app.auto_yes)) {
+                std::cerr
+                    << "[debug_execute_safe] refusing to leave arm at place; "
+                    << "home confirmation is required" << std::endl;
+                return 2;
+            }
+            const auto home_result = executor.MoveToHome();
+            if (home_result != GraspResult::SUCCESS) {
+                std::cerr
+                    << "[debug_execute_safe] MoveToHome failed, result="
+                    << static_cast<int>(home_result) << std::endl;
+                return 1;
+            }
+            std::cout
+                << "[debug_execute_safe] returned home successfully."
+                << std::endl;
+            if (place_result != GraspResult::SUCCESS) {
+                return 1;
+            }
+            std::cout
+                << "[debug_execute_safe] place -> home cycle succeeded. "
+                << "No grasp or release action was executed." << std::endl;
+            return 0;
         }
 
         if (!ConfirmStep("[step 2/3] Move arm to observe pose?", app.auto_yes)) {

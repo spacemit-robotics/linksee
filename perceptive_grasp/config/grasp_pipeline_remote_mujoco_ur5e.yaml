@@ -1,0 +1,179 @@
+# perceptive_grasp k3 remote mujoco configuration
+# Start the pc simulation service before running this pipeline.
+
+# Shared endpoint for the remote camera and robot executor.
+remote_mujoco:
+  host: "10.0.91.182"
+  port: 9090
+  frame_timeout_ms: 5000
+  action_timeout_ms: 20000
+
+camera:
+  type: "remote_mujoco"
+
+detection:
+  config_path: yolov8_seg.yaml
+  target_labels: []
+  min_confidence: 0.10
+  min_area: 1000
+  stable_frames: 3
+  allow_color_only_fallback: true
+  refine_with_simulation_colors: true
+  # Keep the simulation labels aligned with the scene object names.
+  label_remap:
+    "sports ball": "apple"
+    "umbrella": "banana"
+    "book": "cube"
+  # Refine synthetic instance masks after yolo classification and provide a
+  # fallback when yolo misses the same scene object.
+  simulation_color_targets:
+    - {label: apple, hsv_min: [0, 100, 80], hsv_max: [10, 255, 255], min_area: 80, max_area: 15000}
+    - {label: apple, hsv_min: [170, 80, 60], hsv_max: [179, 255, 255], min_area: 80, max_area: 15000}
+    - {label: banana, hsv_min: [15, 100, 80], hsv_max: [38, 255, 255], min_area: 120, max_area: 20000}
+    - {label: cup, hsv_min: [112, 140, 30], hsv_max: [130, 255, 255], min_area: 100, max_area: 30000}
+    - {label: cube, hsv_min: [140, 100, 60], hsv_max: [175, 255, 255], min_area: 80, max_area: 10000}
+
+calibration:
+  remote_mujoco:
+    T_base_camera:
+      translation: [-0.020684, 0.043910, 0.300747]
+      rotation: [-2.088074, 0.015059, -1.529363]
+
+grasp:
+  strategy: "auto"
+  top:
+    approach_height: 0.25
+    grasp_depth: 0.020
+    gripper_offset: 0.0
+    grasp_point_x_ratio: 0.0
+    position_source: "projected_geometry_center"
+    safe_mask_interior: true
+    support_plane_occlusion_recovery: true
+    support_plane_height_anchor: true
+    projected_center_blend: 1.0
+    sparse_projected_center_blend: 0.3
+    minimum_grasp_height: 0.045
+    gripper_open: 0.6
+  side:
+    min_height_m: 0.140
+    min_height_width_ratio: 1.2
+    approach_distance_m: 0.100
+    entry_clearance_m: 0.180
+    pregrasp_min_x_m: 0.270
+    single_sided_gripper: false
+    gripper_offset_m: 0.0
+    # Move the reconstructed visible surface toward the estimated volume center.
+    visible_surface_offset_m: 0.025
+    grasp_forward_offset_m: 0.0
+    grasp_height_ratio: 0.95
+    initial_lift_m: 0.050
+    lift_retreat_m: 0.025
+  gripper_effort: 0.8
+  gripper_hold_load_threshold: 100.0
+  gripper_empty_position_margin: 0.03
+  gripper_timeout_ms: 3000
+  geometry:
+    sample_stride: 2
+    max_object_points: 4000
+    min_object_points: 80
+    plane_distance_threshold_m: 0.008
+    table_clearance_m: 0.040
+    footprint_padding_m: 0.005
+    gripper_max_width_m: 0.10
+    planning_timeout_ms: 750
+    perception_budget_ms: 500
+  workspace:
+    x_min: 0.0
+    x_max: 1.1
+    y_min: -0.6
+    y_max: 0.6
+    z_min: 0.0
+    z_max: 0.5
+
+orientation:
+  enabled: true
+  aspect_ratio_threshold: 1.2
+
+manipulator:
+  driver: "remote_mujoco"
+  legacy_top_ik: false
+  home_joints: [-1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
+  observe_joints: [-1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
+  side_ready_joints: [0.20, -0.90, 1.30, -1.80, -1.57, 0.0]
+  joint_limits:
+    - {joint: 0, min: -6.28, max: 6.28}
+    - {joint: 1, min: -6.28, max: 6.28}
+    - {joint: 2, min: -6.28, max: 6.28}
+    - {joint: 3, min: -6.28, max: 6.28}
+    - {joint: 4, min: -6.28, max: 6.28}
+    - {joint: 5, min: -6.28, max: 6.28}
+  move_speed: 1.0
+  line_speed: 0.5
+
+place:
+  place_joints: [-1.20, -1.00, 1.40, -1.90, -1.57, 0.0]
+  release_open: 0.5
+
+mobile_base:
+  enabled: false
+
+voice:
+  trigger_words: ["抓", "拿", "摘取", "转取", "捉取", "pick", "grab"]
+  cancel_words: ["停止", "停", "取消", "别抓", "不要抓", "stop", "cancel"]
+  home_words: ["结束", "待命", "休息", "回家", "home"]
+  split_command_timeout_ms: 5000
+
+  echo_cancellation:
+    # 2K USB Camera 同时提供录音和播放，使用软件 aec。
+    mode: "webrtc_aec"
+    delay_ms: 50
+    noise_suppression: true
+    high_pass_filter: true
+
+  asr:
+    backend: "qwen3_asr"
+    device: 1
+    device_name: "2K USB Camera"
+    rate: 16000
+    channels: 1
+    channel_index: -1
+    mixer_volume: 40
+    sensevoice:
+      model_dir: "~/.cache/models/asr/sensevoice"
+      provider: "cpu"
+      num_threads: 4
+    qwen3_asr:
+      endpoint: "http://127.0.0.1:8063/v1/chat/completions"
+      model: "qwen3-asr"
+      timeout_sec: 10
+      context_max_terms: 0
+      max_transcript_chars: 32
+      auto_start: true
+      model_dir: "~/.cache/models/asr/qwen3asr/qwen3-asr-0.6B-dynq-q40"
+      server_threads: 4
+      startup_timeout_sec: 90
+    vad_trigger_threshold: 0.2
+    vad_stop_threshold: 0.1
+    vad_min_speech_duration_ms: 200
+    vad_endpoint_hold_ms: 600
+    vad_max_speech_duration_ms: 4000
+
+  tts:
+    enabled: true
+    engine: "matcha:zh"
+    playback_device: 1
+    playback_device_name: "2K USB Camera"
+    playback_rate: 48000
+    channels: 1
+    speed: 1.0
+    volume: 80
+    mixer_volume: 80
+    speak_all_states: false
+
+  target_aliases:
+    苹果: "apple"
+    香蕉: "banana"
+    杯子: "cup"
+    水杯: "cup"
+    木块: "cube"
+    方块: "cube"

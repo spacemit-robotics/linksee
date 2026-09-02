@@ -10,12 +10,20 @@
 
 #include <iostream>
 
+#ifdef HAVE_REMOTE_MUJOCO
+#include "remote_mujoco_camera.h"
+#endif
+
 #ifdef HAVE_REALSENSE_CAMERA
 #include "depth_camera.h"
 #endif
 
 #ifdef HAVE_LAS2_CAMERA
 #include "las2_stereo_camera.h"
+#endif
+
+#ifdef HAVE_MUJOCO_CAMERA
+#include "mujoco_stereo_camera.h"
 #endif
 
 namespace perceptive_grasp {
@@ -59,6 +67,44 @@ public:
     }
 };
 
+class UnsupportedMujocoCamera final : public StereoCamera {
+public:
+    bool Init() override {
+        std::cerr << "[StereoCamera] camera.type=mujoco requested, but the "
+                << "MuJoCo camera backend is not available in this build. "
+                << "Configure with -DENABLE_MUJOCO_EXECUTOR=ON and install "
+                << "glfw3." << std::endl;
+        return false;
+    }
+
+    bool GetFrames(cv::Mat&, cv::Mat&) override { return false; }
+
+    std::int64_t LastFrameId() const override { return -1; }
+
+    bool Deproject(int, int, uint16_t, float[3]) const override {
+        return false;
+    }
+};
+
+class UnsupportedRemoteMujocoCamera final : public StereoCamera {
+public:
+    bool Init() override {
+        std::cerr << "[StereoCamera] camera.type=remote_mujoco requested, "
+                << "but the remote MuJoCo client backend is not available "
+                << "in this build. Configure with "
+                << "-DENABLE_REMOTE_MUJOCO=ON." << std::endl;
+        return false;
+    }
+
+    bool GetFrames(cv::Mat&, cv::Mat&) override { return false; }
+
+    std::int64_t LastFrameId() const override { return -1; }
+
+    bool Deproject(int, int, uint16_t, float[3]) const override {
+        return false;
+    }
+};
+
 }  // namespace
 
 std::unique_ptr<StereoCamera> CreateStereoCamera(
@@ -77,6 +123,22 @@ std::unique_ptr<StereoCamera> CreateStereoCamera(
         return CreateLas2StereoCamera(config);
 #else
         return std::make_unique<UnsupportedSpacemitLas2Camera>();
+#endif
+    }
+
+    if (config.type == "mujoco") {
+#ifdef HAVE_MUJOCO_CAMERA
+        return CreateMujocoStereoCamera(config);
+#else
+        return std::make_unique<UnsupportedMujocoCamera>();
+#endif
+    }
+
+    if (config.type == "remote_mujoco") {
+#ifdef HAVE_REMOTE_MUJOCO
+        return CreateRemoteMujocoCamera(config);
+#else
+        return std::make_unique<UnsupportedRemoteMujocoCamera>();
 #endif
     }
 

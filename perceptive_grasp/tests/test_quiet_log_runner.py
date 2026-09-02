@@ -60,9 +60,19 @@ class QuietLogRunnerTest(unittest.TestCase):
         self.assertTrue(MODULE.should_keep_line(
             "[Pipeline] IDLE | Home position reached; exiting\n"))
         self.assertTrue(MODULE.should_keep_line(
+            "[Pipeline] Failed to init stereo camera backend: unavailable\n"))
+        self.assertTrue(MODULE.should_keep_line(
+            "[StereoCamera] camera.type=remote_mujoco requested, but disabled\n"))
+        self.assertTrue(MODULE.should_keep_line(
+            "[MockDetector] Running in dummy mode (no detection)\n"))
+        self.assertTrue(MODULE.should_keep_line(
             "[Main] Graceful shutdown requested\n"))
         self.assertTrue(MODULE.should_keep_line(
             "Usage: ./perceptive_grasp_core [options]\n"))
+        self.assertTrue(MODULE.should_keep_line(
+            "Error loading config: unsupported camera.type: remote_mujoco\n"))
+        self.assertTrue(MODULE.should_keep_line(
+            "Failed to start ./perceptive_grasp_core: permission denied\n"))
 
     def test_extracts_status_event_from_interleaved_module_log(self):
         line = (
@@ -95,6 +105,49 @@ class QuietLogRunnerTest(unittest.TestCase):
             "--binary", "/tmp/perceptive_grasp_core", "--help",
         ])
         self.assertFalse(debug_mode)
+
+    def test_simulation_server_uses_sibling_binary(self):
+        with mock.patch.object(
+                MODULE, "_default_simulation_server_binary",
+                return_value="/tmp/mujoco_grasp_sim_server"):
+            command = MODULE._parse_simulation_server_command([
+                "--serve-simulation", "--config", "simulation.yaml",
+                "--viewer",
+            ])
+        self.assertEqual(command, [
+            "/tmp/mujoco_grasp_sim_server",
+            "--config", "simulation.yaml", "--viewer",
+        ])
+
+    def test_normal_pipeline_does_not_select_simulation_server(self):
+        self.assertIsNone(MODULE._parse_simulation_server_command([
+            "--config", "hardware.yaml", "--target", "cup",
+        ]))
+
+    def test_voice_control_uses_sibling_bridge_and_same_launcher(self):
+        with mock.patch.object(
+                MODULE, "_default_voice_bridge",
+                return_value="/tmp/local_voice_bridge.py"), \
+             mock.patch.object(
+                 MODULE, "_current_launcher",
+                 return_value="/tmp/perceptive_grasp"):
+            command = MODULE._parse_voice_control_command([
+                "--voice-control",
+                "--config", "config/remote.yaml",
+                "--remote-host", "10.0.91.182",
+            ])
+        self.assertEqual(command, [
+            MODULE.sys.executable,
+            "/tmp/local_voice_bridge.py",
+            "--binary", "/tmp/perceptive_grasp",
+            "--config", "config/remote.yaml",
+            "--remote-host", "10.0.91.182",
+        ])
+
+    def test_voice_control_is_not_selected_for_normal_pipeline(self):
+        self.assertIsNone(MODULE._parse_voice_control_command([
+            "--config", "config/hardware.yaml",
+        ]))
 
     def test_normal_mode_filters_stdout_and_stderr_together(self):
         source = inspect.getsource(MODULE.main)

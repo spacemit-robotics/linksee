@@ -89,6 +89,17 @@ int main() {
     assert(transient.result == GripperHoldingResult::EMPTY);
     assert(transient.contact_count == 1);
 
+    std::vector<GripperFeedbackSample> released_after_contact =
+        RepeatedSamples(0.14f, 200.0f, false, false, 3);
+    released_after_contact.insert(
+        released_after_contact.end(),
+        empty_samples.begin(), empty_samples.end());
+    const auto released = EvaluateGripperHolding(
+        released_after_contact, baseline, config);
+    assert(released.result == GripperHoldingResult::EMPTY);
+    assert(released.contact_count == 3);
+    assert(released.empty_count == 3);
+
     const auto high_load_closed = EvaluateGripperHolding(
         RepeatedSamples(0.002f, 200.0f, false, true, 3),
         baseline, config);

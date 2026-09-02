@@ -82,9 +82,15 @@ bool TargetDetector::Detect(const cv::Mat& image,
         if (r.label >= 0 && r.label < static_cast<int>(label_names_.size())) {
             target.label_name = label_names_[r.label];
         }
+        const auto remap = config_.label_remap.find(target.label_name);
+        if (remap != config_.label_remap.end()) {
+            target.label_name = remap->second;
+        }
 
         targets.push_back(std::move(target));
     }
+
+    AppendSimulationColorTargets(image, config_, &targets);
 
     // 按面积降序排列
     std::sort(targets.begin(), targets.end(),

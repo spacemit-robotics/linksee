@@ -23,6 +23,14 @@ int main() {
     assert(english.has_value());
     assert(*english == "banana");
 
+    const auto asr_variant = parser.ParseTarget("转取香蕉");
+    assert(asr_variant.has_value());
+    assert(*asr_variant == "banana");
+
+    const auto asr_variant_2 = parser.ParseTarget("摘取苹果");
+    assert(asr_variant_2.has_value());
+    assert(*asr_variant_2 == "apple");
+
     const auto missing_target = parser.ParseTarget("抓");
     assert(missing_target.has_value());
     assert(missing_target->empty());

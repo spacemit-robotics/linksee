@@ -261,6 +261,35 @@ static StereoCameraConfig LoadCameraConfig(
             settings.max_depth_m = depth["max_m"].as<float>(
                 settings.max_depth_m);
         }
+    } else if (config.type == "mujoco") {
+        const YAML::Node mujoco = camera["mujoco"];
+        if (!mujoco || !mujoco.IsMap()) {
+            throw std::runtime_error("camera.mujoco configuration is required");
+        }
+        auto& settings = config.mujoco;
+        settings.xml_path = mujoco["xml_path"].as<std::string>(
+            settings.xml_path);
+        settings.camera_name = mujoco["camera_name"].as<std::string>(
+            settings.camera_name);
+        settings.width = mujoco["width"].as<int>(settings.width);
+        settings.height = mujoco["height"].as<int>(settings.height);
+        if (const YAML::Node depth = mujoco["depth"]) {
+            settings.min_depth_m = depth["min_m"].as<float>(
+                settings.min_depth_m);
+            settings.max_depth_m = depth["max_m"].as<float>(
+                settings.max_depth_m);
+        }
+    } else if (config.type == "remote_mujoco") {
+        const YAML::Node remote = camera["remote_mujoco"];
+        if (!remote || !remote.IsMap()) {
+            throw std::runtime_error(
+                "camera.remote_mujoco configuration is required");
+        }
+        auto& settings = config.remote_mujoco;
+        settings.host = remote["host"].as<std::string>(settings.host);
+        settings.port = remote["port"].as<int>(settings.port);
+        settings.timeout_ms =
+            remote["timeout_ms"].as<int>(settings.timeout_ms);
     } else {
         throw std::runtime_error("unsupported camera.type: " + config.type);
     }
@@ -269,6 +298,7 @@ static StereoCameraConfig LoadCameraConfig(
     if (config_dir.empty()) config_dir = ".";
     ResolveConfigPath(config_dir, &config.spacemit_las2.model_path);
     ResolveConfigPath(config_dir, &config.spacemit_las2.calib_path);
+    ResolveConfigPath(config_dir, &config.mujoco.xml_path);
     return config;
 }
 
@@ -357,8 +387,14 @@ static GraspGeometryConfig LoadGeometryConfig(
         config.side_pregrasp_min_x_m =
             side["pregrasp_min_x_m"].as<float>(
                 config.side_pregrasp_min_x_m);
+        config.side_single_sided_gripper =
+            side["single_sided_gripper"].as<bool>(
+                config.side_single_sided_gripper);
         config.side_gripper_offset_m = side["gripper_offset_m"].as<float>(
             config.side_gripper_offset_m);
+        config.side_visible_surface_offset_m =
+            side["visible_surface_offset_m"].as<float>(
+                config.side_visible_surface_offset_m);
         config.side_grasp_forward_offset_m =
             side["grasp_forward_offset_m"].as<float>(
                 config.side_grasp_forward_offset_m);
@@ -459,7 +495,10 @@ int main(int argc, char* argv[]) {
     }
 
     if (app.warmup_frames < 0) {
-        app.warmup_frames = camera_config.type == "spacemit_las2" ? 1 : 30;
+        app.warmup_frames =
+            (camera_config.type == "spacemit_las2" ||
+                camera_config.type == "mujoco" ||
+                camera_config.type == "remote_mujoco") ? 1 : 30;
     }
     try {
         SaveCaptureContext(app, camera_config);
@@ -702,7 +741,16 @@ int main(int argc, char* argv[]) {
                 out << "  dimensions_m:  ["
                     << geometry_result.geometry.length_m << ", "
                     << geometry_result.geometry.width_m << ", "
-                    << geometry_result.geometry.height_m << "]\n";
+                    << geometry_result.geometry.height_m << "]\n"
+                    << std::setprecision(6)
+                    << "  support_plane: normal=["
+                    << geometry_result.geometry.table.normal.x << ", "
+                    << geometry_result.geometry.table.normal.y << ", "
+                    << geometry_result.geometry.table.normal.z << "] d="
+                    << geometry_result.geometry.table.d
+                    << " inliers="
+                    << geometry_result.geometry.table.inlier_count << "\n"
+                    << std::setprecision(3);
             }
             if (in_workspace) {
                 out << "  selected: "

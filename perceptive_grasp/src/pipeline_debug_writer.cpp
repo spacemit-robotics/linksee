@@ -163,6 +163,8 @@ bool SavePipelinePlanDebug(
             directory / ("grasp_" + task_id + ".png");
         const fs::path output_json =
             directory / ("grasp_" + task_id + ".json");
+        const fs::path output_mask =
+            directory / ("grasp_" + task_id + "_mask.png");
         image_path = output_image.string();
         json_path = output_json.string();
 
@@ -198,6 +200,9 @@ bool SavePipelinePlanDebug(
                 cv::Scalar(0, 255, 0), 2);
             cv::imwrite(output_image.string(), annotated);
         }
+        if (!data.target_mask.empty()) {
+            cv::imwrite(output_mask.string(), data.target_mask);
+        }
 
         std::ofstream output(output_json);
         output << "{\n";
@@ -206,6 +211,13 @@ bool SavePipelinePlanDebug(
             << JsonEscape(data.target_detected) << "\",\n";
         output << "  \"target_requested\": \""
             << JsonEscape(data.target_requested) << "\",\n";
+        output << "  \"target_mask\": ";
+        if (!data.target_mask.empty()) {
+            output << "\"" << JsonEscape(output_mask.filename().string())
+                << "\",\n";
+        } else {
+            output << "null,\n";
+        }
         output << "  \"score\": " << data.target_score << ",\n";
         output << "  \"bbox\": [" << data.target_bbox[0] << ", "
             << data.target_bbox[1] << ", " << data.target_bbox[2] << ", "

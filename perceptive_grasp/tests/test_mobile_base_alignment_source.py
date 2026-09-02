@@ -70,19 +70,41 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
 
     def test_alignment_has_progress_and_travel_safety_guards(self):
         body = _function_body(self.pipeline, "void GraspPipeline::HandlePlanning")
-        self.assertIn("MeasureMobileBaseAlignmentProgress", body)
-        self.assertIn("RequiredMobileBaseAlignmentProgress", body)
-        self.assertIn("required_progress", body)
-        self.assertIn("limited but valid", body)
-        self.assertIn("max_visual_regression_m", body)
-        self.assertIn("visual progress regressed", body)
+        visual = _function_body(
+            self.pipeline,
+            "bool GraspPipeline::ValidateMobileBaseVisualProgress",
+        )
+        self.assertIn("ValidateMobileBaseVisualProgress", body)
+        self.assertIn("MeasureMobileBaseAlignmentProgress", visual)
+        self.assertIn("RequiredMobileBaseAlignmentProgress", visual)
+        self.assertIn("required_progress", visual)
+        self.assertIn("visual motion confirmed", visual)
+        self.assertIn("max_visual_regression_m", visual)
+        self.assertIn("visual progress regressed", visual)
+        self.assertIn(
+            "visual feedback did not confirm", visual
+        )
+        self.assertIn("SetState(PipelineState::ERROR", visual)
         self.assertIn("base_alignment_soft_stopped", body)
         self.assertIn("max_total_travel_m", body)
         self.assertIn("base_align_travel_m_", body)
-        self.assertIn("visual progress", body)
+        self.assertIn("visual progress", visual)
+        self.assertIn("last_base_motion_odometry_confirmed_", visual)
+        self.assertIn("odometry already confirmed", visual)
+        self.assertIn("progress >= -maximum_regression", visual)
         self.assertIn(
             "arm safety validation remains required", body)
         self.assertIn("ValidateBaseAlignmentCommandTransition", body)
+
+    def test_top_planning_uses_same_visual_progress_gate(self):
+        body = _function_body(
+            self.pipeline, "void GraspPipeline::HandleTopPlanning"
+        )
+        self.assertIn(
+            "if (!ValidateMobileBaseVisualProgress(alignment_point)) "
+            "return;",
+            body,
+        )
 
     def test_unconfirmed_odometry_falls_back_to_visual_confirmation(self):
         execute = _function_body(
@@ -174,7 +196,7 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
         self.assertIn(
             "alignment_config, alignment_point, base_align_attempts_", body)
         self.assertIn(
-            "previous_base_alignment_point_.data(), alignment_point", body)
+            "ValidateMobileBaseVisualProgress(alignment_point)", body)
 
     def test_base_alignment_moves_base_then_detects_again(self):
         body = _function_body(
@@ -183,6 +205,8 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
         self.assertIn("mobile_base_->LastMotionReport()", body)
         self.assertIn("motion_report.odometry_available", body)
         self.assertIn("motion_report.translation_m", body)
+        self.assertIn("motion_report.motion_confirmed", body)
+        self.assertIn("last_base_motion_odometry_confirmed_", body)
         self.assertIn('SetState(PipelineState::DETECTING', body)
         self.assertIn("stable_count_ = 0", body)
         self.assertIn('FlushCameraAfterMotion("base motion")', body)
@@ -190,7 +214,7 @@ class MobileBaseAlignmentSourceTest(unittest.TestCase):
     def test_config_and_loader_expose_mobile_base_settings(self):
         self.assertIn("mobile_base:", self.config)
         self.assertIn("target_x: 0.275", self.config)
-        self.assertIn("x_tolerance:", self.config)
+        self.assertIn("x_tolerance: 0.035", self.config)
         self.assertIn("y_tolerance: 0.15", self.config)
         self.assertIn("min_cmd_duration_ms: 350", self.config)
         self.assertIn("cfg.mobile_base.enabled", self.main)

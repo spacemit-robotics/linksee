@@ -3,14 +3,22 @@ repos:
     hooks:
       - id: perceptive-grasp-cpp-lint
         name: perceptive_grasp C++ lint
-        entry: bash -c '../../../scripts/lint/lint_cpp.sh "$PWD/perceptive_grasp"'
+        entry: >-
+          bash -c 'set -e;
+          root="$PWD/perceptive_grasp";
+          for path in "$root/include" "$root/src" "$root/tests" "$root/tools";
+          do ../../../scripts/lint/lint_cpp.sh "$path"; done'
         language: system
         pass_filenames: false
         types_or: [c, c++]
 
       - id: perceptive-grasp-python-lint
         name: perceptive_grasp Python lint
-        entry: bash -c '../../../scripts/lint/lint_python.sh "$PWD/perceptive_grasp"'
+        entry: >-
+          bash -c 'set -e;
+          root="$PWD/perceptive_grasp";
+          for path in "$root/scripts" "$root/tests";
+          do ../../../scripts/lint/lint_python.sh "$path"; done'
         language: system
         pass_filenames: false
         types: [python]

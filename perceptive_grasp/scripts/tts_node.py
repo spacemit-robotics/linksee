@@ -416,7 +416,8 @@ def write_audio_bytes(player, audio_bytes: bytes, channels: int,
 def run_tts_worker(text_queue, running, preset, playback_device, playback_rate,
                    channels, speed, volume, no_play, mixer_volume=-1,
                    playback_active=None, echo_guard_ms=0,
-                   playback_observer=None):
+                   playback_observer=None, playback_complete_observer=None,
+                   playback_startup_complete=None):
     try:
         import numpy as np
         import spacemit_tts
@@ -429,8 +430,9 @@ def run_tts_worker(text_queue, running, preset, playback_device, playback_rate,
         return
 
     player = None
-    if not no_play:
-        try:
+    playback_failed = False
+    try:
+        if not no_play:
             import spacemit_audio
             from spacemit_audio import AudioPlayer
             configure_playback_mixer(
@@ -448,9 +450,13 @@ def run_tts_worker(text_queue, running, preset, playback_device, playback_rate,
                 raise RuntimeError("AudioPlayer.start() returned false")
             print(f"[TTS] AudioPlayer started: device={playback_device}, "
                   f"{playback_rate}Hz, channels={channels}")
-        except Exception as exc:
-            print(f"[TTS] 播放器启动失败，改为只合成不播放: {exc}")
-            player = None
+    except Exception as exc:
+        print(f"[TTS] Playback unavailable; disable speech: {exc}")
+        player = None
+        playback_failed = True
+    finally:
+        if playback_startup_complete is not None:
+            playback_startup_complete.set()
 
     config = spacemit_tts.Config.preset(preset)
     config.speech_rate = speed
@@ -466,11 +472,18 @@ def run_tts_worker(text_queue, running, preset, playback_device, playback_rate,
         if text is None:
             break
 
+        if playback_failed:
+            if playback_complete_observer is not None:
+                playback_complete_observer(text)
+            continue
+
         print(f"[TTS] Speak: {text}")
         result = engine.synthesize(text)
         if not result or not result.is_success:
             message = result.message if result else "unknown error"
             print(f"[TTS] Synthesis failed: {message}")
+            if playback_complete_observer is not None:
+                playback_complete_observer(text)
             continue
 
         audio = result.audio_int16
@@ -501,6 +514,8 @@ def run_tts_worker(text_queue, running, preset, playback_device, playback_rate,
                     time.sleep(echo_guard_ms / 1000.0)
                 if playback_active is not None:
                     playback_active.clear()
+        if playback_complete_observer is not None:
+            playback_complete_observer(text)
         print(f"[TTS] Done: {result.duration_ms}ms, RTF={result.rtf:.3f}")
 
     if playback_active is not None:

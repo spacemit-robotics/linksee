@@ -28,6 +28,10 @@ struct OrientationConfig {
     // 从图像坐标系角度到基座坐标系角度的偏移
     // 对于前视相机: 图像 X 轴 ≈ 基座 Y 轴 (左右), 图像 Y 轴 ≈ 基座 X 轴 (前后)
     float camera_yaw_offset = 1.57f;
+
+    // When enabled, select a safe interior cross-section for concave masks.
+    // When disabled, derive the grasp pixel from the minimum-area rectangle.
+    bool safe_mask_interior = false;
 };
 
 /**
