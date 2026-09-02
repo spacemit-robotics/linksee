@@ -294,6 +294,29 @@ int main() {
                     << std::endl;
         return 1;
     }
+    GraspGeometryConfig symmetric_gripper = config;
+    symmetric_gripper.side_single_sided_gripper = false;
+    symmetric_gripper.side_gripper_offset_m = 0.0f;
+    const std::vector<GraspCandidate> symmetric_candidates =
+        GraspGeometryPlanner::GenerateCandidates(
+            tall_geometry, tall_filtered, symmetric_gripper, planner_config);
+    if (symmetric_candidates.empty() ||
+        symmetric_candidates.front().strategy != GraspStrategy::SIDE) {
+        std::cerr << "symmetric gripper did not generate a side grasp"
+                << std::endl;
+        return 1;
+    }
+    const GraspCandidate& symmetric_side = symmetric_candidates.front();
+    const cv::Point3f symmetric_center_to_grasp(
+        symmetric_side.grasp_pose.x - side_center.x,
+        symmetric_side.grasp_pose.y - side_center.y,
+        symmetric_side.grasp_pose.z - side_center.z);
+    if (!Near(symmetric_center_to_grasp.dot(symmetric_side.opening_axis),
+            0.0f, 0.003f)) {
+        std::cerr << "symmetric gripper side grasp is not object-centered"
+                << std::endl;
+        return 1;
+    }
     if (side.width_margin_m < 0.0f ||
         side.depth_quality <= 0.0f ||
         side.path_clearance_m <= 0.0f ||
@@ -359,6 +382,33 @@ int main() {
             side.grasp_pose.y + side.approach_axis.y * 0.015f, 1e-5f)) {
         std::cerr << "side forward offset changed the approach distance"
                     << std::endl;
+        return 1;
+    }
+    GraspGeometryConfig changed_visible_surface = config;
+    changed_visible_surface.side_visible_surface_offset_m = 0.015f;
+    const std::vector<GraspCandidate> visible_surface_candidates =
+        GraspGeometryPlanner::GenerateCandidates(
+            tall_geometry, tall_filtered, changed_visible_surface,
+            planner_config);
+    const float visible_radial_norm = std::hypot(
+        tall_geometry.center.x, tall_geometry.center.y);
+    const cv::Point3f visible_radial_axis(
+        tall_geometry.center.x / visible_radial_norm,
+        tall_geometry.center.y / visible_radial_norm,
+        0.0f);
+    if (visible_surface_candidates.empty() ||
+        visible_surface_candidates.front().strategy != GraspStrategy::SIDE ||
+        !Near(visible_surface_candidates.front().grasp_pose.x,
+            side.grasp_pose.x + visible_radial_axis.x * 0.015f, 1e-5f) ||
+        !Near(visible_surface_candidates.front().grasp_pose.y,
+            side.grasp_pose.y + visible_radial_axis.y * 0.015f, 1e-5f) ||
+        !Near(visible_surface_candidates.front().pre_grasp_pose.x,
+            side.pre_grasp_pose.x + visible_radial_axis.x * 0.015f, 1e-5f) ||
+        !Near(visible_surface_candidates.front().pre_grasp_pose.y,
+            side.pre_grasp_pose.y + visible_radial_axis.y * 0.015f, 1e-5f)) {
+        std::cerr
+            << "side visible-surface offset did not move the side grasp radially"
+            << std::endl;
         return 1;
     }
     GraspGeometryConfig changed_entry_clearance = config;
@@ -641,6 +691,49 @@ int main() {
         return 1;
     }
 
+    // A nearby robot link can overlap one side of a portrait-oriented target
+    // mask. It must not turn a flat object into an upright silhouette or win
+    // foreground-cluster selection merely by occupying the lower quartile of
+    // the depth samples.
+    cv::Mat portrait_occluded_depth(120, 160, CV_16UC1,
+                                    cv::Scalar(1000));
+    cv::Mat portrait_occluded_mask =
+        cv::Mat::zeros(120, 160, CV_8UC1);
+    const cv::Rect portrait_object_region(64, 30, 33, 61);
+    portrait_occluded_depth(portrait_object_region).setTo(900);
+    portrait_occluded_mask(portrait_object_region).setTo(255);
+    portrait_occluded_depth(cv::Rect(64, 39, 9, 43)).setTo(300);
+
+    DetectionTarget portrait_occluded_target;
+    portrait_occluded_target.x1 = portrait_object_region.x;
+    portrait_occluded_target.y1 = portrait_object_region.y;
+    portrait_occluded_target.x2 =
+        portrait_object_region.x + portrait_object_region.width;
+    portrait_occluded_target.y2 =
+        portrait_object_region.y + portrait_object_region.height;
+    portrait_occluded_target.center = cv::Point2f(80.0f, 60.0f);
+    portrait_occluded_target.label_name = "banana";
+    portrait_occluded_target.mask = portrait_occluded_mask;
+
+    GraspGeometryResult portrait_occluded_result;
+    if (!image_planner.Plan(
+            portrait_occluded_depth, portrait_occluded_target,
+            synthetic_camera, coordinate_planner,
+            portrait_occluded_result)) {
+        std::cerr << "portrait near-occluder filtering failed: "
+            << portrait_occluded_result.error << std::endl;
+        return 1;
+    }
+    if (!Near(
+            portrait_occluded_result.foreground_depth_mm,
+            900.0f, 1.0f)) {
+        std::cerr << "portrait near occluder won foreground selection"
+            << " foreground_depth="
+            << portrait_occluded_result.foreground_depth_mm
+            << std::endl;
+        return 1;
+    }
+
     cv::Mat sparse_container_depth(120, 160, CV_16UC1);
     for (int y = 0; y < sparse_container_depth.rows; ++y) {
         const float ray_z =
@@ -688,6 +781,38 @@ int main() {
         !HasValidStrategy(
             sparse_container_result.candidates, GraspStrategy::SIDE)) {
         std::cerr << "sparse container silhouette geometry is invalid"
+                    << std::endl;
+        return 1;
+    }
+
+    cv::Mat handled_container_mask = cv::Mat::zeros(
+        sparse_container_mask.size(), CV_8UC1);
+    handled_container_mask(cv::Rect(65, 30, 31, 51)).setTo(255);
+    handled_container_mask(cv::Rect(96, 50, 17, 16)).setTo(255);
+    cv::Mat handled_container_depth = sparse_container_depth.clone();
+    handled_container_depth.setTo(0, handled_container_mask);
+    DetectionTarget handled_container_target = sparse_container_target;
+    handled_container_target.y1 = 30.0f;
+    handled_container_target.x2 = 113.0f;
+    handled_container_target.center = cv::Point2f(80.0f, 55.0f);
+    handled_container_target.mask = handled_container_mask;
+    GraspGeometryConfig handled_container_config = sparse_container_config;
+    handled_container_config.gripper_max_width_m = 0.10f;
+    GraspGeometryPlanner handled_container_planner(
+        handled_container_config, oblique_planner_config);
+    GraspGeometryResult handled_container_result;
+    if (!handled_container_planner.Plan(
+            handled_container_depth, handled_container_target,
+            oblique_camera, oblique_coordinate_planner,
+            handled_container_result)) {
+        std::cerr << "handled container silhouette fallback failed: "
+                    << handled_container_result.error << std::endl;
+        return 1;
+    }
+    if (handled_container_result.geometry.width_m > 0.10f ||
+        !HasValidStrategy(
+            handled_container_result.candidates, GraspStrategy::SIDE)) {
+        std::cerr << "one-sided handle inflated the graspable body width"
                     << std::endl;
         return 1;
     }

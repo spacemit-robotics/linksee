@@ -17,6 +17,12 @@
 #ifdef MOCK_EXECUTOR
 #include "mock/mock_executor.h"
 #endif
+#ifdef HAVE_MUJOCO_EXECUTOR
+#include "mujoco_grasp_executor.h"
+#endif
+#ifdef HAVE_REMOTE_MUJOCO
+#include "remote_mujoco_grasp_executor.h"
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -94,6 +100,56 @@ bool BuildWorkspaceSupportPlane(
     return true;
 }
 
+float EnforceTopSupportClearance(
+    GraspCandidate& candidate,
+    const SupportPlane& support_plane,
+    float minimum_clearance_m) {
+    const float normal_norm = std::sqrt(
+        support_plane.normal_x * support_plane.normal_x +
+        support_plane.normal_y * support_plane.normal_y +
+        support_plane.normal_z * support_plane.normal_z);
+    if (!support_plane.valid || minimum_clearance_m <= 0.0f ||
+        !std::isfinite(normal_norm) || normal_norm < 1e-6f) {
+        return 0.0f;
+    }
+
+    float normal_x = support_plane.normal_x / normal_norm;
+    float normal_y = support_plane.normal_y / normal_norm;
+    float normal_z = support_plane.normal_z / normal_norm;
+    float plane_d = support_plane.d / normal_norm;
+    if (normal_z < 0.0f) {
+        normal_x = -normal_x;
+        normal_y = -normal_y;
+        normal_z = -normal_z;
+        plane_d = -plane_d;
+    }
+
+    const float current_clearance =
+        normal_x * candidate.grasp_pose.x +
+        normal_y * candidate.grasp_pose.y +
+        normal_z * candidate.grasp_pose.z + plane_d;
+    if (!std::isfinite(current_clearance)) {
+        return 0.0f;
+    }
+    const float adjustment = std::max(
+        0.0f, minimum_clearance_m - current_clearance);
+    if (adjustment <= 0.0f) {
+        return 0.0f;
+    }
+
+    auto shift_pose = [normal_x, normal_y, normal_z, adjustment](
+        Pose3D& pose) {
+        pose.x += normal_x * adjustment;
+        pose.y += normal_y * adjustment;
+        pose.z += normal_z * adjustment;
+    };
+    shift_pose(candidate.grasp_pose);
+    shift_pose(candidate.pre_grasp_pose);
+    shift_pose(candidate.retreat_pose);
+    shift_pose(candidate.lift_pose);
+    return adjustment;
+}
+
 void WriteStructuredLine(const std::string& text) {
     const std::string line = text + "\n";
     ssize_t written;
@@ -160,7 +216,7 @@ bool MedianDepthAtPixel(const cv::Mat& depth, int cx, int cy, int roi_size,
     for (int y = y_start; y <= y_end; y++) {
         for (int x = x_start; x <= x_end; x++) {
             uint16_t d = depth.at<uint16_t>(y, x);
-            if (d > 0) {
+            if (IsValidGraspDepth(d)) {
                 depth_values.push_back(d);
             }
         }
@@ -213,7 +269,8 @@ bool ForegroundDepthFromMask(const cv::Mat& depth, const cv::Mat& input_mask,
         const auto* depth_row = depth.ptr<uint16_t>(y);
         const auto* mask_row = inner_mask.ptr<uint8_t>(y);
         for (int x = 0; x < depth.cols; ++x) {
-            if (mask_row[x] != 0 && depth_row[x] > 0) {
+            if (mask_row[x] != 0 &&
+                IsValidGraspDepth(depth_row[x])) {
                 depth_values.push_back(depth_row[x]);
             }
         }
@@ -364,11 +421,34 @@ bool GraspPipeline::Init() {
     std::cout << "[Init] START module=executor" << std::endl;
     const auto executor_start = std::chrono::steady_clock::now();
     const auto executor_cpu_start = ProcessCpuMillis();
-#ifdef MOCK_EXECUTOR
-    executor_ = std::make_unique<MockExecutor>(config_.executor);
+    if (config_.executor.manip_driver == "remote_mujoco") {
+#ifdef HAVE_REMOTE_MUJOCO
+        executor_ = std::make_unique<RemoteMujocoGraspExecutor>(
+            config_.executor);
 #else
-    executor_ = std::make_unique<GraspExecutor>(config_.executor);
+        std::cerr << "[Pipeline] manipulator.driver=remote_mujoco requires "
+                << "-DENABLE_REMOTE_MUJOCO=ON" << std::endl;
+        log_init_failure("executor");
+        return false;
 #endif
+    } else if (config_.executor.manip_driver == "mujoco" ||
+        config_.executor.manip_driver == "mujoco_ur5e") {
+#ifdef HAVE_MUJOCO_EXECUTOR
+        executor_ = std::make_unique<MujocoGraspExecutor>(config_.executor);
+#else
+        std::cerr << "[Pipeline] manipulator.driver="
+                << config_.executor.manip_driver
+                << " requires -DENABLE_MUJOCO_EXECUTOR=ON" << std::endl;
+        log_init_failure("executor");
+        return false;
+#endif
+    } else {
+#ifdef MOCK_EXECUTOR
+        executor_ = std::make_unique<MockExecutor>(config_.executor);
+#else
+        executor_ = std::make_unique<GraspExecutor>(config_.executor);
+#endif
+    }
     if (!executor_->Init()) {
         std::cerr << "[Pipeline] Failed to init executor" << std::endl;
         log_init_failure("executor");
@@ -426,6 +506,7 @@ bool GraspPipeline::TriggerGrasp() {
     top_alignment_reference_valid_ = false;
     have_previous_base_alignment_point_ = false;
     previous_base_alignment_command_ = MobileBaseAlignmentCommand{};
+    last_base_motion_odometry_confirmed_ = false;
     base_align_travel_m_ = 0.0f;
     base_align_direction_reversals_ = 0;
     task_id_.clear();
@@ -467,6 +548,9 @@ bool GraspPipeline::TriggerGrasp(const std::string& target_label) {
         return false;
     }
     target_label_ = target_label;
+    if (executor_) {
+        executor_->SetTargetLabel(target_label_);
+    }
     retry_count_ = 0;
     stable_count_ = 0;
     missing_count_ = 0;
@@ -482,6 +566,7 @@ bool GraspPipeline::TriggerGrasp(const std::string& target_label) {
     top_alignment_reference_valid_ = false;
     have_previous_base_alignment_point_ = false;
     previous_base_alignment_command_ = MobileBaseAlignmentCommand{};
+    last_base_motion_odometry_confirmed_ = false;
     base_align_travel_m_ = 0.0f;
     base_align_direction_reversals_ = 0;
     task_id_.clear();
@@ -708,6 +793,7 @@ void GraspPipeline::ResetTaskState() {
     top_alignment_reference_valid_ = false;
     have_previous_base_alignment_point_ = false;
     previous_base_alignment_command_ = MobileBaseAlignmentCommand{};
+    last_base_motion_odometry_confirmed_ = false;
     base_align_travel_m_ = 0.0f;
     base_align_direction_reversals_ = 0;
     {
@@ -929,6 +1015,7 @@ void GraspPipeline::SaveGraspDebug(float grasp_px, float grasp_py,
 
     PipelinePlanDebugData data;
     data.color = current_color_;
+    data.target_mask = current_target_.mask;
     data.target_detected = current_target_.label_name;
     data.target_score = current_target_.score;
     data.target_bbox = {
@@ -1641,11 +1728,82 @@ bool GraspPipeline::BuildMaskTopGrasp(
         }
     }
 
+    // At the top observation pose the arm can overlap a valid target mask.
+    // A mask-local sample then reports the much nearer gripper rather than the
+    // low-profile object. Top grasps are selected below the side-grasp height
+    // threshold, so a sample more than 100 mm in front of the measured support
+    // plane cannot belong to the intended object. Recover at the same pixel
+    // with the support-plane intersection; PlanTopGrasp applies the configured
+    // grasp depth from that surface.
+    float support_depth_mm = NAN;
+    constexpr float kMaximumTopForegroundLeadMm = 100.0f;
+    if (config_.top_support_plane_occlusion_recovery &&
+        fallback_support_plane != nullptr &&
+        EstimateSupportPlaneDepth(
+            *fallback_support_plane, cx, cy, support_depth_mm) &&
+        support_depth_mm - static_cast<float>(depth_mm) >
+            kMaximumTopForegroundLeadMm) {
+        const uint16_t occluded_depth_mm = depth_mm;
+        depth_mm = static_cast<uint16_t>(std::clamp(
+            std::lround(support_depth_mm),
+            1L, static_cast<long>(UINT16_MAX)));
+        std::cout
+            << "[Pipeline] Top-grasp depth "
+            << "source=support_plane_occlusion_recovery value="
+            << depth_mm << "mm rejected_mask_depth="
+            << occluded_depth_mm << "mm lead="
+            << support_depth_mm - static_cast<float>(occluded_depth_mm)
+            << "mm" << std::endl;
+    }
+
     if (!camera_->Deproject(cx, cy, depth_mm, cam_point)) {
         error = "top-grasp camera deprojection failed";
         return false;
     }
     planner_->CameraToBase(cam_point, base_point);
+
+    // The mask-local depth is the top surface of a low-profile object. A
+    // fixed 15 mm descent from a 30-40 mm-tall banana leaves the fingers well
+    // above the support surface, while historical boundary pixels only worked
+    // because they accidentally sampled the table. Anchor the final TCP
+    // height to the already validated support plane instead. The calibrated
+    // support plane can sit several millimetres above the manipulator's known
+    // workspace floor. Keep the requested TCP slightly above that measured
+    // plane: the finger envelope still spans the low-profile object, while
+    // the SO101 can preserve the safety-critical top-down wrist constraint.
+    // Requesting the TCP at or below the plane drives joint 4 into its top-
+    // grasp limit and leaves an otherwise safe pose outside the vertical IK
+    // residual.
+    // PlanTopGrasp() subtracts grasp_depth from base_point.z, so include it in
+    // the synthetic surface point passed to the planner.
+    constexpr float kTopGraspSupportClearanceM = 0.004f;
+    if (config_.top_support_plane_height_anchor &&
+        fallback_support_plane != nullptr &&
+        fallback_support_plane->valid &&
+        std::fabs(fallback_support_plane->normal_z) > 0.5f) {
+        const float measured_base_z = base_point[2];
+        const float support_z = -(
+            fallback_support_plane->normal_x * base_point[0] +
+            fallback_support_plane->normal_y * base_point[1] +
+            fallback_support_plane->d) /
+            fallback_support_plane->normal_z;
+        constexpr float kTopGraspFloorClearanceM = 0.001f;
+        const float planned_tcp_z = std::max(
+            config_.planner.workspace.z_min +
+                kTopGraspFloorClearanceM,
+            support_z + kTopGraspSupportClearanceM);
+        const float support_anchored_base_z =
+            planned_tcp_z + config_.planner.grasp_depth;
+        if (std::isfinite(support_anchored_base_z)) {
+            base_point[2] = support_anchored_base_z;
+            std::cout
+                << "[Pipeline] Top-grasp height "
+                << "source=support_plane measured_surface_z="
+                << measured_base_z << "m support_z=" << support_z
+                << "m planned_tcp_z=" << planned_tcp_z << "m"
+                << std::endl;
+        }
+    }
     grasp_px = static_cast<float>(cx);
     grasp_py = static_cast<float>(cy);
     std::cout << "[Pipeline] Top-grasp pixel (offset_ratio="
@@ -1691,13 +1849,31 @@ bool GraspPipeline::BuildMaskTopGrasp(
     candidate.grasp_pose = grasp_pose;
     candidate.pre_grasp_pose = pre_grasp_pose;
     candidate.retreat_pose = pre_grasp_pose;
+    if (config_.top_verification_lift_m > 0.0f) {
+        candidate.retreat_pose = grasp_pose;
+        candidate.retreat_pose.z = std::min(
+            pre_grasp_pose.z,
+            grasp_pose.z + config_.top_verification_lift_m);
+    }
     candidate.lift_pose = pre_grasp_pose;
     candidate.grasp_yaw_rad = grasp_yaw;
     candidate.geometry_valid = true;
     candidate.rejection_reason.clear();
+    float support_clearance_adjustment = 0.0f;
+    if (fallback_support_plane != nullptr) {
+        support_clearance_adjustment = EnforceTopSupportClearance(
+            candidate, *fallback_support_plane,
+            config_.top_minimum_grasp_height_m);
+    }
+    base_point[0] = candidate.grasp_pose.x;
+    base_point[1] = candidate.grasp_pose.y;
+    base_point[2] = candidate.grasp_pose.z;
     std::cout << "[Pipeline] Top-grasp plan: target=["
-                << grasp_pose.x << "," << grasp_pose.y << ","
-                << grasp_pose.z << "] yaw=" << grasp_yaw << std::endl;
+                << candidate.grasp_pose.x << ","
+                << candidate.grasp_pose.y << ","
+                << candidate.grasp_pose.z << "] yaw=" << grasp_yaw
+                << " support_clearance_adjustment="
+                << support_clearance_adjustment << "m" << std::endl;
     error.clear();
     return true;
 }
@@ -1755,19 +1931,110 @@ bool GraspPipeline::EstimateSupportPlaneDepth(
     return true;
 }
 
+bool GraspPipeline::ProjectTopCandidateToMaskCenter(
+    const ObjectGeometry3D& geometry,
+    GraspCandidate& candidate,
+    float& grasp_px,
+    float& grasp_py,
+    uint16_t& depth_mm,
+    float cam_point[3],
+    float base_point[3],
+    std::string& error) {
+    SupportPlane support_plane;
+    std::string support_source;
+    if (!ResolveTopSupportPlane(
+            geometry.table, support_plane, support_source)) {
+        error = "projected center requires a support plane";
+        return false;
+    }
+
+    const float center_height = 0.5f * geometry.height_m;
+    SupportPlane center_plane = support_plane;
+    center_plane.d -= center_height;
+    grasp_px = current_target_.center.x;
+    grasp_py = current_target_.center.y;
+    const int cx = ClampPixel(
+        static_cast<int>(std::lround(grasp_px)), current_depth_.cols);
+    const int cy = ClampPixel(
+        static_cast<int>(std::lround(grasp_py)), current_depth_.rows);
+    float center_depth_mm = NAN;
+    if (!EstimateSupportPlaneDepth(
+            center_plane, cx, cy, center_depth_mm)) {
+        error = "projected center ray is invalid";
+        return false;
+    }
+    depth_mm = static_cast<uint16_t>(std::clamp(
+        std::lround(center_depth_mm),
+        1L, static_cast<long>(UINT16_MAX)));
+    if (!camera_->Deproject(cx, cy, depth_mm, cam_point)) {
+        error = "projected center deprojection failed";
+        return false;
+    }
+
+    float projected_center[3] = {};
+    planner_->CameraToBase(cam_point, projected_center);
+    const float footprint_aspect_ratio = geometry.width_m > 1e-6f
+        ? geometry.length_m / geometry.width_m
+        : 1.0f;
+    constexpr float kProjectionBlendStartAspectRatio = 2.5f;
+    constexpr float kProjectionBlendEndAspectRatio = 4.5f;
+    const float geometry_blend_scale = std::clamp(
+        (kProjectionBlendEndAspectRatio - footprint_aspect_ratio) /
+            (kProjectionBlendEndAspectRatio -
+                kProjectionBlendStartAspectRatio),
+        0.0f, 1.0f);
+    const float blend =
+        config_.top_projected_center_blend * geometry_blend_scale;
+    const float dx = blend *
+        (projected_center[0] - candidate.grasp_pose.x);
+    const float dy = blend *
+        (projected_center[1] - candidate.grasp_pose.y);
+    candidate.grasp_pose.x += dx;
+    candidate.grasp_pose.y += dy;
+    candidate.pre_grasp_pose.x += dx;
+    candidate.pre_grasp_pose.y += dy;
+    candidate.retreat_pose.x += dx;
+    candidate.retreat_pose.y += dy;
+    candidate.lift_pose.x += dx;
+    candidate.lift_pose.y += dy;
+    const float support_clearance_adjustment = EnforceTopSupportClearance(
+        candidate, support_plane, config_.top_minimum_grasp_height_m);
+    base_point[0] = candidate.grasp_pose.x;
+    base_point[1] = candidate.grasp_pose.y;
+    base_point[2] = candidate.grasp_pose.z;
+    std::cout << "[Pipeline] Top-grasp position "
+            << "source=projected_geometry_center support="
+            << support_source << " center_height="
+            << center_height << "m support_clearance_adjustment="
+            << support_clearance_adjustment
+            << "m projected_center_blend="
+            << config_.top_projected_center_blend
+            << " effective_blend=" << blend
+            << " footprint_aspect_ratio=" << footprint_aspect_ratio
+            << " center_shift=[" << dx << "," << dy
+            << "]m" << std::endl;
+    error.clear();
+    return true;
+}
+
 bool GraspPipeline::ResolveTopSupportPlane(
     const TablePlane& table,
     SupportPlane& support_plane,
     std::string& source) {
+    if (last_top_support_plane_valid_) {
+        support_plane = last_top_support_plane_;
+        source = "cached_pre_motion_depth";
+        std::cout << "[Pipeline] Reusing pre-motion support surface: normal=["
+                    << support_plane.normal_x << ","
+                    << support_plane.normal_y << ","
+                    << support_plane.normal_z << "] d="
+                    << support_plane.d << std::endl;
+        return true;
+    }
     if (BuildSupportPlane(table, support_plane)) {
         last_top_support_plane_ = support_plane;
         last_top_support_plane_valid_ = true;
         source = "current_depth";
-        return true;
-    }
-    if (last_top_support_plane_valid_) {
-        support_plane = last_top_support_plane_;
-        source = "cached_depth";
         return true;
     }
     if (BuildWorkspaceSupportPlane(
@@ -1948,7 +2215,15 @@ void GraspPipeline::HandleTopPlanning() {
         return;
     }
     std::cout << "[Pipeline] Top-grasp support surface source="
-                << support_plane_source << std::endl;
+                << support_plane_source << " normal=["
+                << support_plane.normal_x << ","
+                << support_plane.normal_y << ","
+                << support_plane.normal_z << "] d="
+                << support_plane.d << " bounds=["
+                << support_plane.min_x << ","
+                << support_plane.max_x << ","
+                << support_plane.min_y << ","
+                << support_plane.max_y << "]" << std::endl;
     executor_->SetSupportPlane(support_plane);
 
     GraspCandidate candidate;
@@ -1958,11 +2233,114 @@ void GraspPipeline::HandleTopPlanning() {
     float cam_point[3] = {};
     float base_point[3] = {};
     std::string error;
-    if (!BuildMaskTopGrasp(
+    bool top_grasp_built = false;
+    if (config_.top_position_source == "projected_geometry_center") {
+        const GraspCandidate* geometry_candidate = nullptr;
+        for (const GraspCandidate& current : safety_geometry.candidates) {
+            if (current.strategy != GraspStrategy::TOP ||
+                !current.geometry_valid) {
+                continue;
+            }
+            if (geometry_candidate == nullptr ||
+                current.score > geometry_candidate->score) {
+                geometry_candidate = &current;
+            }
+        }
+        if (geometry_candidate == nullptr) {
+            if (safety_geometry.candidates.empty()) {
+                top_grasp_built = BuildMaskTopGrasp(
+                    candidate, grasp_px, grasp_py, depth_mm,
+                    cam_point, base_point, error,
+                    safety_geometry.foreground_depth_mm,
+                    &support_plane);
+                if (top_grasp_built) {
+                    const int projected_x = ClampPixel(
+                        static_cast<int>(std::lround(grasp_px)),
+                        current_depth_.cols);
+                    const int projected_y = ClampPixel(
+                        static_cast<int>(std::lround(grasp_py)),
+                        current_depth_.rows);
+                    float support_depth_mm = NAN;
+                    float support_camera_point[3] = {};
+                    float support_base_point[3] = {};
+                    if (!EstimateSupportPlaneDepth(
+                            support_plane, projected_x, projected_y,
+                            support_depth_mm) ||
+                        !camera_->Deproject(
+                            projected_x, projected_y,
+                            static_cast<uint16_t>(std::clamp(
+                                std::lround(support_depth_mm),
+                                1L, static_cast<long>(UINT16_MAX))),
+                            support_camera_point)) {
+                        top_grasp_built = false;
+                        error = "sparse top-grasp support projection failed";
+                    } else {
+                        planner_->CameraToBase(
+                            support_camera_point, support_base_point);
+                        const float blend =
+                            config_.top_sparse_projected_center_blend;
+                        const float dx = blend *
+                            (support_base_point[0] -
+                                candidate.grasp_pose.x);
+                        const float dy = blend *
+                            (support_base_point[1] -
+                                candidate.grasp_pose.y);
+                        candidate.grasp_pose.x += dx;
+                        candidate.grasp_pose.y += dy;
+                        candidate.pre_grasp_pose.x += dx;
+                        candidate.pre_grasp_pose.y += dy;
+                        candidate.retreat_pose.x += dx;
+                        candidate.retreat_pose.y += dy;
+                        candidate.lift_pose.x += dx;
+                        candidate.lift_pose.y += dy;
+                        base_point[0] = candidate.grasp_pose.x;
+                        base_point[1] = candidate.grasp_pose.y;
+                        std::cout
+                            << "[Pipeline] Sparse top-grasp position "
+                            << "source=projected_support_footprint"
+                            << " sparse_projected_center_blend=" << blend
+                            << " center_shift=[" << dx << "," << dy
+                            << "]m" << std::endl;
+                    }
+                }
+                if (top_grasp_built) {
+                    std::cout
+                        << "[Pipeline] Top-grasp point cloud is sparse; "
+                        << "using the mask footprint projected onto the "
+                        << "validated support plane" << std::endl;
+                }
+            }
+            if (!top_grasp_built) {
+                std::ostringstream diagnostic;
+                diagnostic
+                    << "point-cloud geometry did not produce a top candidate";
+                for (const GraspCandidate& current :
+                        safety_geometry.candidates) {
+                    if (current.strategy == GraspStrategy::TOP) {
+                        diagnostic << ": " << current.rejection_reason;
+                        break;
+                    }
+                }
+                if (!safety_geometry.error.empty()) {
+                    diagnostic << ": " << safety_geometry.error;
+                }
+                error = diagnostic.str();
+            }
+        } else {
+            candidate = *geometry_candidate;
+            top_grasp_built = ProjectTopCandidateToMaskCenter(
+                safety_geometry.geometry, candidate,
+                grasp_px, grasp_py, depth_mm,
+                cam_point, base_point, error);
+        }
+    } else {
+        top_grasp_built = BuildMaskTopGrasp(
             candidate, grasp_px, grasp_py, depth_mm,
             cam_point, base_point, error,
             safety_geometry.foreground_depth_mm,
-            &support_plane)) {
+            &support_plane);
+    }
+    if (!top_grasp_built) {
         if (RetryTransientTopPlanning(error)) return;
         SetState(PipelineState::ERROR,
                 "Top-grasp planning failed: " + error);
@@ -1974,32 +2352,18 @@ void GraspPipeline::HandleTopPlanning() {
     std::cout << "[Pipeline] 3D position (base): [" << base_point[0] << ", "
                 << base_point[1] << ", " << base_point[2] << "]" << std::endl;
 
+    // Align against the validated 3D grasp point. At the top observation
+    // pose, the gripper can overlap the segmentation mask and make its center
+    // depth refer to the arm (for example 166 mm) instead of the object
+    // (roughly 360 mm). Re-deprojecting that contaminated center would command
+    // a large, incorrect base reversal even though the selected grasp point is
+    // already in the reachable window.
     float alignment_point[3] = {
-        base_point[0], base_point[1], base_point[2]};
-    const int center_x = ClampPixel(
-        static_cast<int>(std::lround(current_target_.center.x)),
-        current_depth_.cols);
-    const int center_y = ClampPixel(
-        static_cast<int>(std::lround(current_target_.center.y)),
-        current_depth_.rows);
-    uint16_t center_depth_mm = 0;
-    size_t center_depth_sample_count = 0;
-    if (ForegroundDepthFromMask(
-            current_depth_, current_target_.mask,
-            center_depth_mm, center_depth_sample_count)) {
-        float center_cam_point[3] = {};
-        if (camera_->Deproject(
-                center_x, center_y, center_depth_mm,
-                center_cam_point)) {
-            planner_->CameraToBase(center_cam_point, alignment_point);
-            std::cout
-                << "[Pipeline] Mobile base alignment depth "
-                << "source=target_mask value=" << center_depth_mm
-                << "mm samples=" << center_depth_sample_count
-                << std::endl;
-        }
-    }
-    std::cout << "[Pipeline] Mobile base alignment target center: ["
+        candidate.grasp_pose.x,
+        candidate.grasp_pose.y,
+        candidate.grasp_pose.z};
+    std::cout << "[Pipeline] Mobile base alignment source="
+                << "validated_top_grasp_point target=["
                 << alignment_point[0] << ", " << alignment_point[1] << ", "
                 << alignment_point[2] << "]" << std::endl;
 
@@ -2009,42 +2373,7 @@ void GraspPipeline::HandleTopPlanning() {
     base_alignment_command_ = PlanMobileBaseAlignment(
         config_.mobile_base, alignment_point, base_align_attempts_);
 
-    if (have_previous_base_alignment_point_) {
-        const float progress = MeasureMobileBaseAlignmentProgress(
-            previous_base_alignment_point_.data(), alignment_point,
-            previous_base_alignment_command_);
-        const float required_progress = RequiredMobileBaseAlignmentProgress(
-            config_.mobile_base, previous_base_alignment_point_.data(),
-            previous_base_alignment_command_);
-        std::cout << "[Pipeline] Mobile base visual progress: "
-                    << progress << "m (required >= "
-                    << required_progress << "m)" << std::endl;
-        const bool still_needs_alignment =
-            base_alignment_command_.type !=
-                MobileBaseAlignmentCommand::Type::NONE ||
-            base_alignment_command_.max_attempts_reached;
-        const float maximum_regression =
-            std::max(0.0f,
-                    config_.mobile_base.max_visual_regression_m);
-        if (still_needs_alignment &&
-            progress < -maximum_regression) {
-            std::cout
-                << "[Pipeline] Mobile base visual progress regressed by "
-                << progress << "m; stopping chassis correction and "
-                << "continuing with workspace, IK and path validation"
-                << std::endl;
-            base_alignment_command_ = MobileBaseAlignmentCommand{};
-            base_alignment_soft_stopped = true;
-        }
-        if (base_alignment_command_.type !=
-                MobileBaseAlignmentCommand::Type::NONE &&
-            still_needs_alignment && progress < required_progress) {
-            std::cout << "[Pipeline] Mobile base made limited but valid "
-                        "progress; continuing closed-loop alignment"
-                        << std::endl;
-        }
-        have_previous_base_alignment_point_ = false;
-    }
+    if (!ValidateMobileBaseVisualProgress(alignment_point)) return;
 
     if (base_alignment_command_.type !=
         MobileBaseAlignmentCommand::Type::NONE) {
@@ -2529,6 +2858,25 @@ void GraspPipeline::HandlePlanning() {
             "3D grasp safety validation failed: support surface is invalid");
         return;
     }
+    std::cout << "[Pipeline] Grasp support surface normal=["
+                << support_plane.normal_x << ","
+                << support_plane.normal_y << ","
+                << support_plane.normal_z << "] d="
+                << support_plane.d << " bounds=["
+                << support_plane.min_x << ","
+                << support_plane.max_x << ","
+                << support_plane.min_y << ","
+                << support_plane.max_y << "]" << std::endl;
+    if (!observation_strategy_selected_ &&
+        !last_top_support_plane_valid_) {
+        last_top_support_plane_ = support_plane;
+        last_top_support_plane_valid_ = true;
+        std::cout << "[Pipeline] Cached pre-motion support surface: normal=["
+                    << support_plane.normal_x << ","
+                    << support_plane.normal_y << ","
+                    << support_plane.normal_z << "] d="
+                    << support_plane.d << std::endl;
+    }
     executor_->SetSupportPlane(support_plane);
 
     const auto matches_observation_strategy =
@@ -2653,12 +3001,31 @@ void GraspPipeline::HandlePlanning() {
         grasp_geometry_result_.geometry.center.z};
 
     if (preferred_candidate &&
-        preferred_candidate->strategy == GraspStrategy::TOP) {
+        preferred_candidate->strategy == GraspStrategy::TOP &&
+        config_.top_position_source == "mask_depth") {
         std::string top_error;
         if (!BuildMaskTopGrasp(
                 *preferred_candidate, debug_grasp_px, debug_grasp_py,
                 depth_mm, cam_point, base_point, top_error,
                 grasp_geometry_result_.foreground_depth_mm)) {
+            SetState(PipelineState::ERROR,
+                    "Top-grasp planning failed: " + top_error);
+            return;
+        }
+        cx = ClampPixel(
+            static_cast<int>(std::lround(debug_grasp_px)),
+            current_depth_.cols);
+        cy = ClampPixel(
+            static_cast<int>(std::lround(debug_grasp_py)),
+            current_depth_.rows);
+    } else if (preferred_candidate &&
+            preferred_candidate->strategy == GraspStrategy::TOP) {
+        std::string top_error;
+        if (!ProjectTopCandidateToMaskCenter(
+                grasp_geometry_result_.geometry,
+                *preferred_candidate,
+                debug_grasp_px, debug_grasp_py,
+                depth_mm, cam_point, base_point, top_error)) {
             SetState(PipelineState::ERROR,
                     "Top-grasp planning failed: " + top_error);
             return;
@@ -2768,45 +3135,7 @@ void GraspPipeline::HandlePlanning() {
             << std::endl;
     }
 
-    if (have_previous_base_alignment_point_) {
-        const float progress = MeasureMobileBaseAlignmentProgress(
-            previous_base_alignment_point_.data(), alignment_point,
-            previous_base_alignment_command_);
-        const float required_progress =
-            RequiredMobileBaseAlignmentProgress(
-                config_.mobile_base,
-                previous_base_alignment_point_.data(),
-                previous_base_alignment_command_);
-        std::cout << "[Pipeline] Mobile base visual progress: "
-                    << progress << "m (required >= "
-                    << required_progress << "m)"
-                    << std::endl;
-        const bool still_needs_alignment =
-            base_alignment_command_.type !=
-                MobileBaseAlignmentCommand::Type::NONE ||
-            base_alignment_command_.max_attempts_reached;
-        const float maximum_regression =
-            std::max(0.0f,
-                    config_.mobile_base.max_visual_regression_m);
-        if (still_needs_alignment &&
-            progress < -maximum_regression) {
-            std::cout
-                << "[Pipeline] Mobile base visual progress regressed by "
-                << progress << "m; stopping chassis correction and "
-                << "continuing with workspace, IK and path validation"
-                << std::endl;
-            base_alignment_command_ = MobileBaseAlignmentCommand{};
-            base_alignment_soft_stopped = true;
-        }
-        if (base_alignment_command_.type !=
-                MobileBaseAlignmentCommand::Type::NONE &&
-            still_needs_alignment && progress < required_progress) {
-            std::cout << "[Pipeline] Mobile base made limited but valid "
-                        "progress; continuing closed-loop alignment"
-                        << std::endl;
-        }
-        have_previous_base_alignment_point_ = false;
-    }
+    if (!ValidateMobileBaseVisualProgress(alignment_point)) return;
 
     if (base_alignment_command_.type !=
         MobileBaseAlignmentCommand::Type::NONE) {
@@ -3068,6 +3397,60 @@ void GraspPipeline::HandlePlanning() {
     SetState(PipelineState::APPROACHING, "Moving to pre-grasp...");
 }
 
+bool GraspPipeline::ValidateMobileBaseVisualProgress(
+    const float alignment_point[3]) {
+    if (!have_previous_base_alignment_point_) return true;
+
+    const float progress = MeasureMobileBaseAlignmentProgress(
+        previous_base_alignment_point_.data(), alignment_point,
+        previous_base_alignment_command_);
+    const float required_progress = RequiredMobileBaseAlignmentProgress(
+        config_.mobile_base, previous_base_alignment_point_.data(),
+        previous_base_alignment_command_);
+    std::cout << "[Pipeline] Mobile base visual progress: "
+                << progress << "m (required >= "
+                << required_progress << "m)" << std::endl;
+
+    const bool still_needs_alignment =
+        base_alignment_command_.type !=
+            MobileBaseAlignmentCommand::Type::NONE ||
+        base_alignment_command_.max_attempts_reached;
+    const bool odometry_confirmed =
+        last_base_motion_odometry_confirmed_;
+    have_previous_base_alignment_point_ = false;
+    last_base_motion_odometry_confirmed_ = false;
+    if (!still_needs_alignment) return true;
+
+    const float maximum_regression = std::max(
+        0.0f, config_.mobile_base.max_visual_regression_m);
+    if (odometry_confirmed && progress >= -maximum_regression) {
+        std::cout
+            << "[Pipeline] Mobile base odometry already confirmed the "
+            << "commanded motion; using refreshed vision for the next "
+            << "closed-loop correction" << std::endl;
+        return true;
+    }
+    if (progress >= required_progress) {
+        std::cout << "[Pipeline] Mobile base visual motion confirmed; "
+                    "continuing closed-loop alignment" << std::endl;
+        return true;
+    }
+
+    std::ostringstream message;
+    if (progress < -maximum_regression) {
+        message << "Base alignment stopped: visual progress regressed";
+    } else {
+        message << "Base alignment stopped: visual feedback did not confirm "
+                    "commanded motion";
+    }
+    message << " (measured_m=" << progress
+            << " required_m=" << required_progress << ")";
+    base_alignment_command_ = MobileBaseAlignmentCommand{};
+    stable_count_ = 0;
+    SetState(PipelineState::ERROR, message.str());
+    return false;
+}
+
 bool GraspPipeline::ValidateBaseAlignmentCommandTransition(
     const MobileBaseAlignmentCommand& command,
     std::string& error) {
@@ -3102,6 +3485,7 @@ void GraspPipeline::HandleBaseAligning() {
     }
     if (!action_.active) {
         if (!WaitForConfirm("即将移动底盘对齐目标")) return;
+        last_base_motion_odometry_confirmed_ = false;
         StartAction(PipelineState::BASE_ALIGNING, "mobile_base_align",
                     [this]() {
                         return mobile_base_->Execute(base_alignment_command_);
@@ -3114,6 +3498,9 @@ void GraspPipeline::HandleBaseAligning() {
     if (*result == GraspResult::SUCCESS) {
         const MobileBaseMotionReport motion_report =
             mobile_base_->LastMotionReport();
+        last_base_motion_odometry_confirmed_ =
+            motion_report.odometry_available &&
+            motion_report.motion_confirmed;
         std::cout << "[Pipeline] Mobile base motion: odom="
                     << (motion_report.odometry_available
                         ? "available" : "unavailable")
@@ -3131,6 +3518,16 @@ void GraspPipeline::HandleBaseAligning() {
                 : commanded_travel;
         }
         base_align_attempts_++;
+        if (motion_report.odometry_available &&
+            !motion_report.motion_confirmed) {
+            base_align_attempts_ = std::max(
+                base_align_attempts_,
+                config_.mobile_base.max_align_attempts);
+            std::cout
+                << "[Pipeline] Mobile base odometry did not confirm motion; "
+                << "disabling further chassis corrections for this task"
+                << std::endl;
+        }
         stable_count_ = 0;
         missing_count_ = 0;
         top_alignment_reference_valid_ = false;

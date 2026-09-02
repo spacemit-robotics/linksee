@@ -1,4 +1,4 @@
-# perceptive grasp 发布配置
+# perceptive_grasp 发布配置
 # 包含部署必填项和现场常用调节项，完整说明见 ../docs/grasp_config.md。
 
 # 立体相机与目标检测
@@ -37,8 +37,8 @@ detection:
 calibration:
   realsense:
     T_base_camera:
-      translation: [-0.020684, 0.043910, 0.300747]
-      rotation: [-2.088074, 0.015059, -1.529363]
+      translation: [-0.0280, 0.0544, 0.2986]
+      rotation: [-2.2174, 0.0245, -1.6811]
   spacemit_las2:
     T_base_camera:
       translation: [-0.019765, 0.048938, 0.312118]
@@ -49,10 +49,17 @@ calibration:
 grasp:
   strategy: "auto"  # auto、top 或 side
   top:
+    # Linksee SO101 真机参数。MuJoCo 使用独立配置文件。
     approach_height: 0.10
     grasp_depth: 0.015
-    gripper_offset: 0.02
+    gripper_offset: 0.0
     grasp_point_x_ratio: 1.0
+    position_source: "mask_depth"
+    safe_mask_interior: false
+    support_plane_occlusion_recovery: false
+    support_plane_height_anchor: false
+    minimum_grasp_height: 0.0
+    verification_lift_m: 0.0
     gripper_open: 0.6
   side:
     min_height_m: 0.060
@@ -60,6 +67,7 @@ grasp:
     approach_distance_m: 0.020
     entry_clearance_m: 0.030
     pregrasp_min_x_m: 0.270
+    single_sided_gripper: true
     gripper_offset_m: 0.010
     grasp_forward_offset_m: 0.020
     grasp_height_ratio: 0.60
@@ -93,28 +101,30 @@ orientation:
 
 # 机械臂与放置姿态
 manipulator:
-  uart_device: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A7A057974-if00"
+  uart_device: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14113459-if00"
   urdf_path: "../urdf/so101.urdf"
+  tip_link: "gripper_frame_link"
+  legacy_top_ik: true
   move_speed: 1.0
   line_speed: 0.5
-  home_joints: [1.546, -1.765, 1.563, 1.093, 0.186]
+  home_joints: [1.546, -1.765, 1.400, 1.093, 0.186]
   observe_joints: [1.544, -0.067, 0.101, 1.382, 0.188]
-  side_ready_joints: [1.550, 0.021, 1.490, -1.700, -0.036]
+  side_ready_joints: [1.550, 0.021, 1.400, -1.700, -0.036]
   joint_limits:
-    - {joint: 0, min: -1.700, max: 1.630}
+    - {joint: 0, min: -1.540, max: 1.630}
     - {joint: 1, min: -1.770, max: 1.680}
-    - {joint: 2, min: -1.840, max: 1.570}
+    - {joint: 2, min: -1.840, max: 1.430}
     - {joint: 3, min: -1.790, max: 1.670}
     - {joint: 4, min: -2.700, max: 2.800}
 
 place:
-  place_joints: [-1.669, -0.122, 0.101, 1.383, 0.188]
+  place_joints: [-1.500, -0.122, 0.101, 1.383, 0.330]
   release_open: 0.5
 
 # 底盘辅助对齐
 mobile_base:
   enabled: true
-  dev_path: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5958002008-if00"
+  dev_path: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A99050376-if00"
   target_x: 0.275
   x_tolerance: 0.035
   y_tolerance: 0.15
@@ -122,10 +132,12 @@ mobile_base:
   linear_speed: 0.20
   angular_speed: 1.2
   min_cmd_duration_ms: 350
+  max_align_attempts: 6
+  max_total_travel_m: 0.24
 
 # 语音交互
 voice:
-  trigger_words: ["抓", "拿", "pick", "grab"]
+  trigger_words: ["抓", "拿", "摘取", "转取", "捉取", "pick", "grab"]
   cancel_words: ["停止", "停", "取消", "别抓", "不要抓", "stop", "cancel"]
   home_words: ["结束", "待命", "休息", "回家", "回home", "回到home", "回初始", "回到初始", "end", "home"]
   split_command_timeout_ms: 5000
@@ -138,12 +150,32 @@ voice:
     high_pass_filter: true
 
   asr:
+    # 选择 sensevoice 或 qwen3_asr；也可在启动时使用 --asr-backend 指定。
+    backend: "sensevoice"
     device: 1
     rate: 16000
     channels: 1
+    channel_index: -1
+    mixer_volume: 40
+    sensevoice:
+      model_dir: "~/.cache/models/asr/sensevoice"
+      provider: "cpu"
+      num_threads: 4
+    qwen3_asr:
+      endpoint: "http://127.0.0.1:8063/v1/chat/completions"
+      model: "qwen3-asr"
+      timeout_sec: 10
+      context_max_terms: 0
+      max_transcript_chars: 32
+      auto_start: true
+      model_dir: "~/.cache/models/asr/qwen3asr/qwen3-asr-0.6B-dynq-q40"
+      server_threads: 4
+      startup_timeout_sec: 90
     vad_trigger_threshold: 0.4
     vad_stop_threshold: 0.3
     vad_min_speech_duration_ms: 100
+    vad_endpoint_hold_ms: 600
+    vad_max_speech_duration_ms: 4000
 
   tts:
     enabled: true

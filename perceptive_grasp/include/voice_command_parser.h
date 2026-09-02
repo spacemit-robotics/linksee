@@ -21,7 +21,8 @@ struct VoiceCommandConfig {
     std::string input_topic = "asr_text";
     std::string status_topic = "grasp_status_text";
     std::string node_name = "perceptive_grasp_voice";
-    std::vector<std::string> trigger_words = {"抓", "拿", "pick", "grab"};
+    std::vector<std::string> trigger_words = {
+        "抓", "拿", "摘取", "转取", "捉取", "pick", "grab"};
     std::vector<std::string> cancel_words = {
         "停止", "停", "取消", "别抓", "不要抓", "stop", "cancel"
     };

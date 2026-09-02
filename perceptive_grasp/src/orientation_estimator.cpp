@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 namespace perceptive_grasp {
@@ -25,6 +26,221 @@ float NormalizeAnglePi(float angle) {
         angle += 2.0f * static_cast<float>(M_PI);
     }
     return angle;
+}
+
+bool FindSafeMaskInterior(
+    const cv::Mat& mask, float center_x, float center_y,
+    float& grasp_x, float& grasp_y,
+    float* grasp_clearance = nullptr,
+    float* maximum_mask_clearance = nullptr,
+    cv::Point2f* deepest_interior = nullptr) {
+    if (mask.empty()) return false;
+
+    cv::Mat binary;
+    cv::threshold(mask, binary, 0, 255, cv::THRESH_BINARY);
+    cv::Mat distance;
+    cv::distanceTransform(binary, distance, cv::DIST_L2, 5);
+    double maximum_clearance = 0.0;
+    cv::Point maximum_location;
+    cv::minMaxLoc(
+        distance, nullptr, &maximum_clearance,
+        nullptr, &maximum_location);
+    if (maximum_clearance < 1.0) return false;
+    if (maximum_mask_clearance != nullptr) {
+        *maximum_mask_clearance = static_cast<float>(maximum_clearance);
+    }
+    if (deepest_interior != nullptr) {
+        *deepest_interior = cv::Point2f(
+            static_cast<float>(maximum_location.x),
+            static_cast<float>(maximum_location.y));
+    }
+
+    const float minimum_clearance = std::max(
+        2.0f, 0.70f * static_cast<float>(maximum_clearance));
+    float best_distance_squared = std::numeric_limits<float>::max();
+    cv::Point best(-1, -1);
+    for (int row = 0; row < distance.rows; ++row) {
+        const float* values = distance.ptr<float>(row);
+        for (int column = 0; column < distance.cols; ++column) {
+            if (values[column] < minimum_clearance) continue;
+            const float dx = static_cast<float>(column) - center_x;
+            const float dy = static_cast<float>(row) - center_y;
+            const float distance_squared = dx * dx + dy * dy;
+            if (distance_squared < best_distance_squared) {
+                best_distance_squared = distance_squared;
+                best = cv::Point(column, row);
+            }
+        }
+    }
+    if (best.x < 0) return false;
+
+    grasp_x = static_cast<float>(best.x);
+    grasp_y = static_cast<float>(best.y);
+    if (grasp_clearance != nullptr) {
+        *grasp_clearance = distance.at<float>(best.y, best.x);
+    }
+    return true;
+}
+
+bool SnapCenterToMaskInterior(
+    const cv::Mat& mask, float center_x, float center_y,
+    float& grasp_x, float& grasp_y,
+    float* grasp_clearance = nullptr) {
+    if (mask.empty()) return false;
+
+    const int x = std::clamp(
+        static_cast<int>(std::lround(grasp_x)), 0, mask.cols - 1);
+    const int y = std::clamp(
+        static_cast<int>(std::lround(grasp_y)), 0, mask.rows - 1);
+    if (mask.at<uint8_t>(y, x) != 0) return false;
+
+    return FindSafeMaskInterior(
+        mask, center_x, center_y, grasp_x, grasp_y, grasp_clearance);
+}
+
+bool FindStableDeepConcaveInterior(
+    const cv::Mat& mask, float long_axis_angle,
+    float reference_x, float reference_y,
+    float& center_x, float& center_y,
+    float& center_clearance) {
+    if (mask.empty()) return false;
+    cv::Mat binary;
+    cv::threshold(mask, binary, 0, 255, cv::THRESH_BINARY);
+    cv::Mat distance;
+    cv::distanceTransform(binary, distance, cv::DIST_L2, 5);
+    double maximum_clearance = 0.0;
+    cv::minMaxLoc(distance, nullptr, &maximum_clearance);
+    if (maximum_clearance < 2.0) return false;
+
+    constexpr float kDeepRidgeRatio = 0.90f;
+    const float minimum_clearance =
+        kDeepRidgeRatio * static_cast<float>(maximum_clearance);
+    const float axis_x = std::cos(long_axis_angle);
+    const float axis_y = std::sin(long_axis_angle);
+    float minimum_projection = std::numeric_limits<float>::max();
+    for (int y = 0; y < distance.rows; ++y) {
+        const float* row = distance.ptr<float>(y);
+        for (int x = 0; x < distance.cols; ++x) {
+            if (row[x] < minimum_clearance) continue;
+            minimum_projection = std::min(
+                minimum_projection, axis_x * x + axis_y * y);
+        }
+    }
+    if (!std::isfinite(minimum_projection)) return false;
+
+    // Pick the deepest ridge point within a small band at a deterministic
+    // end of the global long axis. This avoids both the curved middle and
+    // frame-to-frame jumps between equal distance-transform maxima.
+    constexpr float kProjectionBandPx = 5.0f;
+    float best_clearance = -1.0f;
+    float best_reference_distance = std::numeric_limits<float>::max();
+    cv::Point best(-1, -1);
+    for (int y = 0; y < distance.rows; ++y) {
+        const float* row = distance.ptr<float>(y);
+        for (int x = 0; x < distance.cols; ++x) {
+            if (row[x] < minimum_clearance ||
+                axis_x * x + axis_y * y >
+                    minimum_projection + kProjectionBandPx) {
+                continue;
+            }
+            const float dx = static_cast<float>(x) - reference_x;
+            const float dy = static_cast<float>(y) - reference_y;
+            const float reference_distance = dx * dx + dy * dy;
+            if (row[x] > best_clearance + 1e-4f ||
+                (std::fabs(row[x] - best_clearance) <= 1e-4f &&
+                reference_distance < best_reference_distance)) {
+                best_clearance = row[x];
+                best_reference_distance = reference_distance;
+                best = cv::Point(x, y);
+            }
+        }
+    }
+    if (best.x < 0) return false;
+    center_x = static_cast<float>(best.x);
+    center_y = static_cast<float>(best.y);
+    center_clearance = best_clearance;
+    return true;
+}
+
+bool LocalMaskOrientation(
+    const cv::Mat& mask, float center_x, float center_y,
+    float center_clearance, float preferred_short_axis_angle,
+    float& long_axis_angle, float& short_half) {
+    if (mask.empty() || center_clearance < 1.0f) return false;
+
+    // Keep the PCA neighbourhood local to one straight section. A wider
+    // radius around a banana bend includes both arms of the crescent and
+    // estimates a closing axis that wedges the object out of the gripper.
+    const float radius = std::max(12.0f, 1.5f * center_clearance);
+    const float radius_squared = radius * radius;
+    std::vector<cv::Point2f> samples;
+    for (int y = std::max(
+            0, static_cast<int>(std::floor(center_y - radius)));
+        y <= std::min(
+            mask.rows - 1,
+            static_cast<int>(std::ceil(center_y + radius))); ++y) {
+        const uint8_t* row = mask.ptr<uint8_t>(y);
+        for (int x = std::max(
+                0, static_cast<int>(std::floor(center_x - radius)));
+            x <= std::min(
+                mask.cols - 1,
+                static_cast<int>(std::ceil(center_x + radius))); ++x) {
+            if (row[x] == 0) continue;
+            const float dx = static_cast<float>(x) - center_x;
+            const float dy = static_cast<float>(y) - center_y;
+            if (dx * dx + dy * dy <= radius_squared) {
+                samples.emplace_back(static_cast<float>(x),
+                    static_cast<float>(y));
+            }
+        }
+    }
+    if (samples.size() < 20) return false;
+
+    cv::Mat values(static_cast<int>(samples.size()), 2, CV_32F);
+    for (int row = 0; row < values.rows; ++row) {
+        values.at<float>(row, 0) = samples[row].x;
+        values.at<float>(row, 1) = samples[row].y;
+    }
+    cv::PCA pca(values, cv::Mat(), cv::PCA::DATA_AS_ROW);
+    const float secondary_variance = pca.eigenvalues.at<float>(1, 0);
+    if (secondary_variance <= 1e-6f ||
+        pca.eigenvalues.at<float>(0, 0) / secondary_variance < 1.2f) {
+        return false;
+    }
+
+    long_axis_angle = std::atan2(
+        pca.eigenvectors.at<float>(0, 1),
+        pca.eigenvectors.at<float>(0, 0));
+    float short_axis_angle =
+        long_axis_angle + static_cast<float>(M_PI) / 2.0f;
+    const float alignment =
+        std::cos(short_axis_angle - preferred_short_axis_angle);
+    if (alignment < 0.0f) {
+        long_axis_angle += static_cast<float>(M_PI);
+        short_axis_angle += static_cast<float>(M_PI);
+    }
+    long_axis_angle = NormalizeAnglePi(long_axis_angle);
+
+    const float direction_x = std::cos(short_axis_angle);
+    const float direction_y = std::sin(short_axis_angle);
+    float last_inside_distance = 0.0f;
+    const float maximum_distance = std::max(
+        2.0f * center_clearance, center_clearance + 8.0f);
+    for (float distance = 0.5f;
+        distance <= maximum_distance; distance += 0.5f) {
+        const int x = static_cast<int>(std::lround(
+            center_x + direction_x * distance));
+        const int y = static_cast<int>(std::lround(
+            center_y + direction_y * distance));
+        if (x < 0 || x >= mask.cols || y < 0 || y >= mask.rows ||
+            mask.at<uint8_t>(y, x) == 0) {
+            break;
+        }
+        last_inside_distance = distance;
+    }
+    if (last_inside_distance < 1.0f) return false;
+    short_half = last_inside_distance;
+    return true;
 }
 
 }  // namespace
@@ -226,6 +442,75 @@ bool ComputeGraspPixel(const DetectionTarget& target,
                 // 使用 mask 的中心 (可能比 bbox 中心更准)
                 cx = rect.center.x;
                 cy = rect.center.y;
+
+                if (config.safe_mask_interior) {
+                    const int rect_center_x = std::clamp(
+                        static_cast<int>(std::lround(cx)), 0,
+                        target.mask.cols - 1);
+                    const int rect_center_y = std::clamp(
+                        static_cast<int>(std::lround(cy)), 0,
+                        target.mask.rows - 1);
+                    const bool center_outside_mask =
+                        target.mask.at<uint8_t>(
+                            rect_center_y, rect_center_x) == 0;
+
+                    std::vector<cv::Point> hull;
+                    cv::convexHull(contours[max_idx], hull);
+                    const double hull_area = cv::contourArea(hull);
+                    const float solidity = hull_area > 1.0
+                        ? static_cast<float>(max_area / hull_area)
+                        : 1.0f;
+
+                    float safe_x = cx;
+                    float safe_y = cy;
+                    float safe_clearance = 0.0f;
+                    float maximum_clearance = 0.0f;
+                    cv::Point2f deepest_interior(cx, cy);
+                    const bool has_safe_interior = FindSafeMaskInterior(
+                        target.mask, cx, cy, safe_x, safe_y,
+                        &safe_clearance, &maximum_clearance,
+                        &deepest_interior);
+                    const bool curved_concave_mask =
+                        solidity < 0.80f && maximum_clearance >= 2.0f &&
+                        short_half > 1.50f * maximum_clearance;
+                    if ((center_outside_mask || curved_concave_mask) &&
+                        has_safe_interior) {
+                        if (curved_concave_mask &&
+                            !FindStableDeepConcaveInterior(
+                                target.mask, image_angle, cx, cy,
+                                safe_x, safe_y, safe_clearance)) {
+                            safe_x = deepest_interior.x;
+                            safe_y = deepest_interior.y;
+                            safe_clearance = maximum_clearance;
+                        }
+                        const float preferred_short_axis_angle =
+                            image_angle + static_cast<float>(M_PI) / 2.0f;
+                        float local_angle = image_angle;
+                        float local_short_half = short_half;
+                        if (LocalMaskOrientation(
+                                target.mask, safe_x, safe_y,
+                                safe_clearance,
+                                preferred_short_axis_angle,
+                                local_angle, local_short_half)) {
+                            image_angle = local_angle;
+                            short_half = local_short_half;
+                        } else {
+                            short_half = std::min(
+                                short_half, safe_clearance);
+                        }
+                        cx = safe_x;
+                        cy = safe_y;
+                        std::cout
+                            << "[GraspPixel] Concave mask uses local cross-section"
+                            << " center=[" << cx << "," << cy << "]"
+                            << " solidity=" << solidity
+                            << " global_short_half=" << short_side / 2.0f
+                            << "px max_clearance=" << maximum_clearance
+                            << "px local_clearance=" << safe_clearance << "px"
+                            << " center_outside=" << center_outside_mask
+                            << std::endl;
+                    }
+                }
             }
         }
     } else {
@@ -248,6 +533,12 @@ bool ComputeGraspPixel(const DetectionTarget& target,
     if (aspect_ratio < config.aspect_ratio_threshold || short_half < 5.0f) {
         grasp_px = cx;
         grasp_py = cy;
+        if (config.safe_mask_interior && SnapCenterToMaskInterior(
+                target.mask, cx, cy, grasp_px, grasp_py)) {
+            std::cout << "[GraspPixel] Geometric center is outside mask; "
+                        "snapped to safe interior point=["
+                    << grasp_px << "," << grasp_py << "]" << std::endl;
+        }
         if (offset_dir_angle) *offset_dir_angle = NAN;
         std::cout << "[GraspPixel] Object nearly symmetric, using center"
                     << " (ratio=" << aspect_ratio
@@ -270,6 +561,15 @@ bool ComputeGraspPixel(const DetectionTarget& target,
 
     grasp_px = cx + dir_x * offset_px;
     grasp_py = cy + dir_y * offset_px;
+
+    if (config.safe_mask_interior &&
+        std::fabs(offset_ratio) <= 1e-6f &&
+        SnapCenterToMaskInterior(
+            target.mask, cx, cy, grasp_px, grasp_py)) {
+        std::cout << "[GraspPixel] Geometric center is outside mask; "
+                    "snapped to safe interior point=["
+                << grasp_px << "," << grasp_py << "]" << std::endl;
+    }
 
     // 输出实际偏移方向角
     if (offset_dir_angle) {

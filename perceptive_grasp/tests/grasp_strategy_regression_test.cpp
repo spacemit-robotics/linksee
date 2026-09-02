@@ -283,6 +283,54 @@ bool CheckLyingObjectUsesTop(
     return true;
 }
 
+bool CheckRoundObjectUsesTop(
+    const GraspGeometryConfig& geometry_config,
+    const GraspPlannerConfig& planner_config) {
+    const ObjectGeometry3D round_object =
+        MakeGeometry(0.0f, 0.075f, 0.070f, 0.075f);
+    const std::vector<cv::Point3f> points =
+        MakeObjectPoints(round_object);
+    const std::vector<GraspCandidate> candidates =
+        GraspGeometryPlanner::GenerateCandidates(
+            round_object, points, geometry_config, planner_config);
+    const GraspCandidate* selected = FirstValid(candidates);
+    if (selected == nullptr ||
+        selected->strategy != GraspStrategy::TOP ||
+        HasValidStrategy(candidates, GraspStrategy::SIDE)) {
+        std::cerr
+            << "round tabletop object did not select top grasp"
+            << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool CheckShortRoundObjectUsesTopWithReleaseThresholds(
+    const GraspGeometryConfig& geometry_config,
+    const GraspPlannerConfig& planner_config) {
+    GraspGeometryConfig release_config = geometry_config;
+    release_config.side_min_height_m = 0.080f;
+    release_config.side_min_height_width_ratio = 1.2f;
+
+    const ObjectGeometry3D short_round_object =
+        MakeGeometry(0.0f, 0.047f, 0.047f, 0.065f);
+    const std::vector<cv::Point3f> points =
+        MakeObjectPoints(short_round_object);
+    const std::vector<GraspCandidate> candidates =
+        GraspGeometryPlanner::GenerateCandidates(
+            short_round_object, points, release_config, planner_config);
+    const GraspCandidate* selected = FirstValid(candidates);
+    if (selected == nullptr ||
+        selected->strategy != GraspStrategy::TOP ||
+        HasValidStrategy(candidates, GraspStrategy::SIDE)) {
+        std::cerr
+            << "short round tabletop object did not select top grasp"
+            << std::endl;
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -300,8 +348,8 @@ int main() {
 
     GraspPlannerConfig planner_config;
     planner_config.approach_height = 0.10f;
-    planner_config.grasp_depth = 0.015f;
-    planner_config.gripper_offset = 0.020f;
+    planner_config.grasp_depth = 0.010f;
+    planner_config.gripper_offset = 0.005f;
     planner_config.workspace.z_max = 0.30f;
 
     const std::vector<float> angles = {
@@ -321,6 +369,14 @@ int main() {
         return 1;
     }
     if (!CheckLyingObjectUsesTop(
+            geometry_config, planner_config)) {
+        return 1;
+    }
+    if (!CheckRoundObjectUsesTop(
+            geometry_config, planner_config)) {
+        return 1;
+    }
+    if (!CheckShortRoundObjectUsesTopWithReleaseThresholds(
             geometry_config, planner_config)) {
         return 1;
     }

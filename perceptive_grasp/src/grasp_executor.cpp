@@ -7,6 +7,7 @@
     */
 
 #include "grasp_executor.h"
+#include "motion_completion.h"
 
 extern "C" {
 #include "grasp.h"
@@ -24,6 +25,7 @@ extern "C" {
 #include <iostream>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <thread>
 
 namespace perceptive_grasp {
@@ -35,6 +37,7 @@ constexpr float kSideStagingJointToleranceRad = 0.080f;
 constexpr float kSideCorrectionJointToleranceRad = 0.080f;
 constexpr float kTopGraspJointToleranceRad = 0.020f;
 constexpr float kTopLiftJointToleranceRad = 0.060f;
+constexpr float kHomeJointToleranceRad = 0.060f;
 
 bool ResolveFixedJawWristYaw(float target_yaw,
                             float joint0,
@@ -415,6 +418,34 @@ GraspResult GraspExecutor::MoveToSideObserve() {
     constexpr float kOtherJointLeadProgress = 0.45f;
     constexpr float kFourthJointLeadProgress = 0.65f;
     constexpr float kSideObserveFinalToleranceRad = 0.080f;
+
+    // An empty side grasp leaves the tool at the contact waypoint. Consume
+    // the validated retreat/lift suffix before planning a normal-clearance
+    // return to side observation; a direct path starting at contact is
+    // correctly rejected by the regular support-surface clearance check.
+    if (validated_side_path_index_ > 0 &&
+        validated_side_path_index_ < validated_side_joint_path_.size()) {
+        std::vector<std::vector<float>> retreat_path(
+            validated_side_joint_path_.begin() +
+                static_cast<std::ptrdiff_t>(validated_side_path_index_),
+            validated_side_joint_path_.end());
+        std::cout << "[GraspExecutor] side observation retry: retreating "
+            << "from contact along " << retreat_path.size()
+            << " validated waypoint(s)" << std::endl;
+        const GraspResult retreat_result = ExecuteContinuousJointPath(
+            retreat_path, config_.line_speed, config_.line_speed,
+            kSideObserveFinalToleranceRad, -1, true);
+        if (retreat_result != GraspResult::SUCCESS) {
+            const std::string detail = diagnostics_.last_detail.empty()
+                ? "validated side contact retreat failed"
+                : diagnostics_.last_detail;
+            RecordResult(
+                retreat_result, "move_to_side_observe", detail);
+            return retreat_result;
+        }
+        validated_side_path_index_ = validated_side_joint_path_.size();
+    }
+
     std::vector<float> current_joints;
     if (!GetCurrentJoints(current_joints) ||
         current_joints.size() != config_.side_ready_joints.size() ||
@@ -520,9 +551,11 @@ GraspResult GraspExecutor::MoveToSideObserve() {
         joint_path, config_.move_speed, config_.move_speed,
         kSideObserveFinalToleranceRad);
     if (result != GraspResult::SUCCESS) {
+        const std::string detail = diagnostics_.last_detail.empty()
+            ? "coordinated side-observation motion failed"
+            : diagnostics_.last_detail;
         RecordResult(
-            result, "move_to_side_observe",
-            "coordinated side-observation motion failed");
+            result, "move_to_side_observe", detail);
         return result;
     }
 
@@ -533,7 +566,8 @@ GraspResult GraspExecutor::MoveToSideObserve() {
 
 GraspResult GraspExecutor::MoveToHome() {
     std::vector<float> current_joints;
-    constexpr float kHomeNoOpToleranceRad = 0.12f;
+    const float home_completion_tolerance_rad =
+        EffectiveMotionTargetToleranceRad(kHomeJointToleranceRad);
     bool already_at_home =
         GetCurrentJoints(current_joints) &&
         current_joints.size() == config_.home_joints.size();
@@ -541,7 +575,7 @@ GraspResult GraspExecutor::MoveToHome() {
         for (size_t index = 0; index < current_joints.size(); ++index) {
             if (std::fabs(
                     current_joints[index] - config_.home_joints[index]) >
-                kHomeNoOpToleranceRad) {
+                home_completion_tolerance_rad) {
                 already_at_home = false;
                 break;
             }
@@ -563,7 +597,8 @@ GraspResult GraspExecutor::MoveToHome() {
         RecordResult(result, "move_to_home", detail);
         return result;
     }
-    const GraspResult wait_result = WaitMotionDone();
+    const GraspResult wait_result = WaitMotionDone(
+        -1, kHomeJointToleranceRad);
     if (wait_result != GraspResult::SUCCESS) {
         RecordResult(
             wait_result, "move_to_home", last_motion_wait_detail_);
@@ -622,7 +657,35 @@ GraspResult GraspExecutor::MoveToPreGrasp(const Pose3D& pre_grasp_pose,
         RecordResult(result, "move_to_pre_grasp", detail);
         return result;
     }
-    const GraspResult wait_result = WaitMotionDone();
+    constexpr float kMaximumTopPreGraspHeightShortfallM = 0.010f;
+    const auto top_pre_grasp_pose_acceptance = [
+        this, use_top_constraints, pre_grasp_pose]() {
+        if (!use_top_constraints) return false;
+        Pose3D actual_pose{};
+        if (!GetCurrentPose(actual_pose)) return false;
+        const float position_error =
+            PosePositionError(actual_pose, pre_grasp_pose);
+        const bool safely_at_pre_grasp =
+            position_error <= config_.pose_position_tolerance &&
+            actual_pose.z >= pre_grasp_pose.z -
+                kMaximumTopPreGraspHeightShortfallM;
+        std::cout
+            << "[GraspExecutor] top pre-grasp settled-pose verification: "
+            << "target=[" << pre_grasp_pose.x << ","
+            << pre_grasp_pose.y << "," << pre_grasp_pose.z
+            << "] actual=[" << actual_pose.x << ","
+            << actual_pose.y << "," << actual_pose.z << "]"
+            << " position_error=" << position_error
+            << " minimum_safe_z="
+            << pre_grasp_pose.z -
+                kMaximumTopPreGraspHeightShortfallM
+            << " result="
+            << (safely_at_pre_grasp ? "SAFE" : "UNSAFE")
+            << std::endl;
+        return safely_at_pre_grasp;
+    };
+    const GraspResult wait_result = WaitMotionDone(
+        -1, 0.060f, top_pre_grasp_pose_acceptance);
     if (wait_result != GraspResult::SUCCESS) {
         RecordResult(
             wait_result, "move_to_pre_grasp",
@@ -778,6 +841,49 @@ GraspResult GraspExecutor::LiftFromGrasp(const Pose3D& retreat_pose,
 }
 
 GraspResult GraspExecutor::MoveToPlace() {
+    std::vector<float> current_joints;
+    const bool have_current_joints = GetCurrentJoints(current_joints) &&
+        current_joints.size() >= config_.place_joints.size();
+    if (have_current_joints) {
+        float maximum_error = 0.0f;
+        for (size_t joint = 0; joint < config_.place_joints.size(); ++joint) {
+            float error = std::fabs(
+                current_joints[joint] - config_.place_joints[joint]);
+            if (joint == 4 && error > static_cast<float>(M_PI)) {
+                error = static_cast<float>(2.0 * M_PI) - error;
+            }
+            maximum_error = std::max(maximum_error, error);
+        }
+        std::cout << "[GraspExecutor] place precheck: target=[";
+        for (size_t joint = 0; joint < config_.place_joints.size(); ++joint) {
+            if (joint > 0) std::cout << ",";
+            std::cout << config_.place_joints[joint];
+        }
+        std::cout << "] actual=[";
+        for (size_t joint = 0; joint < config_.place_joints.size(); ++joint) {
+            if (joint > 0) std::cout << ",";
+            std::cout << current_joints[joint];
+        }
+        std::cout << "] maximum_joint_error_rad=" << maximum_error
+            << std::endl;
+        if (maximum_error <= config_.place_joint_tolerance_rad) {
+            std::cout << "[GraspExecutor] already at place pose: "
+                << "maximum_joint_error_rad=" << maximum_error
+                << " tolerance_rad="
+                << config_.place_joint_tolerance_rad << std::endl;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(config_.timing.place_settle_ms));
+            RecordResult(
+                GraspResult::SUCCESS, "move_to_place",
+                "current joints already satisfy place tolerance");
+            return GraspResult::SUCCESS;
+        }
+    } else {
+        std::cout << "[GraspExecutor] place precheck: current joint state "
+            << "unavailable; validating a normal place move"
+            << std::endl;
+    }
+
     GraspResult result = MoveToJointsCollisionSafe(config_.place_joints);
     if (result != GraspResult::SUCCESS) {
         RecordResult(result, "move_to_place", "move_joints failed");
@@ -1794,7 +1900,9 @@ GraspResult GraspExecutor::SolveIKConstrained(
     std::vector<float>& joints,
     const std::vector<float>* seed_joints,
     int timeout_ms,
-    std::function<bool(std::vector<float>&)> candidate_validator) {
+    std::function<bool(std::vector<float>&)> candidate_validator,
+    float position_weight,
+    float ik_epsilon) {
     if (!kin_) return GraspResult::MOVE_FAILED;
 
     const auto ik_start = std::chrono::steady_clock::now();
@@ -1914,8 +2022,8 @@ GraspResult GraspExecutor::SolveIKConstrained(
         }
 
         kin_ik_params_t ik_params = {};
-        ik_params.epsilon = 1e-3;
-        ik_params.position_weight = 1.0;
+        ik_params.epsilon = ik_epsilon;
+        ik_params.position_weight = position_weight;
         ik_params.timeout_s = std::clamp(
             std::chrono::duration<float>(deadline - now).count(),
             0.005f, 0.1f);
@@ -2019,7 +2127,362 @@ bool GraspExecutor::ApplyWristYaw(
     return true;
 }
 
-GraspResult GraspExecutor::PlanTopJointPath(
+GraspResult GraspExecutor::SolveTopIKWithWristYaw(
+    const Pose3D& pose,
+    float grasp_yaw_rad,
+    std::vector<float>& joints,
+    const std::vector<float>* seed_joints,
+    int timeout_ms,
+    std::function<bool(std::vector<float>&)> candidate_validator,
+    std::string* detail) {
+    if (!kin_) return GraspResult::MOVE_FAILED;
+
+    Pose3D oriented_pose = pose;
+    if (!std::isnan(grasp_yaw_rad)) {
+        // Expected tool axes after rotating the top-down grasp about base Z.
+        const float half_yaw = 0.5f * grasp_yaw_rad;
+        const float c = std::cos(half_yaw);
+        const float s = std::sin(half_yaw);
+        oriented_pose.qw = c * pose.qw - s * pose.qz;
+        oriented_pose.qx = c * pose.qx - s * pose.qy;
+        oriented_pose.qy = c * pose.qy + s * pose.qx;
+        oriented_pose.qz = c * pose.qz + s * pose.qw;
+    }
+
+    // The SO101 has five arm DOF; with a yaw-constrained offset TCP, lateral
+    // position and jaw yaw cannot both be exact. Bound total error below the
+    // banana half-width while keeping the safety-critical vertical component
+    // substantially tighter.
+    constexpr double kMaximumTcpPositionErrorM = 0.020;
+    constexpr double kMaximumTcpVerticalErrorM = 0.008;
+    constexpr double kVerticalResidualWeight =
+        kMaximumTcpPositionErrorM / kMaximumTcpVerticalErrorM;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(std::max(20, timeout_ms));
+
+    const int joint_count = kin_get_num_joints(kin_);
+    if (joint_count < 5 || joint_count > KIN_MAX_JOINTS) {
+        if (detail) *detail = "top yaw IK requires five arm joints";
+        return GraspResult::IK_FAILED;
+    }
+    std::vector<double> lower(joint_count);
+    std::vector<double> upper(joint_count);
+    if (kin_get_joint_limits(
+            kin_, lower.data(), upper.data()) != KIN_OK ||
+        !ApplyJointLimits(config_.joint_limits, lower, upper, detail)) {
+        return GraspResult::IK_FAILED;
+    }
+
+    const auto forward = [this](
+        const std::vector<float>& candidate,
+        kin_pose_t& achieved) {
+        kin_joints_t arm_joints = {};
+        arm_joints.count = static_cast<uint8_t>(candidate.size());
+        for (size_t joint = 0; joint < candidate.size(); ++joint) {
+            arm_joints.q[joint] = candidate[joint];
+        }
+        return kin_forward(kin_, &arm_joints, &achieved) == KIN_OK;
+    };
+    const auto position_error = [&pose](const kin_pose_t& achieved) {
+        const double dx = pose.x - achieved.x;
+        const double dy = pose.y - achieved.y;
+        const double dz = pose.z - achieved.z;
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    };
+    const auto acceptance_score = [&pose, &position_error](
+        const kin_pose_t& achieved) {
+        return std::max(
+            position_error(achieved) / kMaximumTcpPositionErrorM,
+            std::fabs(achieved.z - pose.z) /
+                kMaximumTcpVerticalErrorM);
+    };
+    const auto constraints_valid = [this, &lower, &upper](
+        const std::vector<float>& candidate) {
+        for (size_t joint = 0;
+            joint < candidate.size() && joint < lower.size(); ++joint) {
+            if (candidate[joint] < lower[joint] ||
+                candidate[joint] > upper[joint]) {
+                return false;
+            }
+        }
+        for (const JointConstraint& constraint :
+            config_.joint_constraints) {
+            if (constraint.joint_index >= 0 &&
+                constraint.joint_index <
+                    static_cast<int>(candidate.size())) {
+                const float value = candidate[constraint.joint_index];
+                if (value < constraint.min_rad ||
+                    value > constraint.max_rad) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    const auto wrist_yaw_error = [this, grasp_yaw_rad](
+        const std::vector<float>& candidate) {
+        std::vector<float> mapped = candidate;
+        std::string ignored;
+        if (!ApplyWristYaw(
+                grasp_yaw_rad, mapped, &ignored, false)) {
+            return std::numeric_limits<double>::infinity();
+        }
+        return std::fabs(
+            static_cast<double>(candidate[4] - mapped[4]));
+    };
+
+    std::vector<float> candidate;
+    bool use_seed_directly = false;
+    // Cartesian top paths are sampled every 10 mm. Refine nearby waypoints
+    // locally from the previous joint solution so the full-pose IK cannot
+    // switch wrist branches at an orientation singularity. The first,
+    // distant pre-grasp waypoint still uses the global constrained solver.
+    constexpr double kMaximumLocalSeedDistanceM = 0.025;
+    if (seed_joints && seed_joints->size() >= 5) {
+        candidate = *seed_joints;
+        std::string yaw_detail;
+        if (ApplyWristYaw(
+                grasp_yaw_rad, candidate, &yaw_detail, false)) {
+            kin_pose_t seed_pose = {};
+            use_seed_directly = forward(candidate, seed_pose) &&
+                position_error(seed_pose) <=
+                    kMaximumLocalSeedDistanceM;
+        }
+    }
+    if (!use_seed_directly) {
+        const int remaining_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count());
+        const std::vector<float> path_seed = candidate;
+        const GraspResult ik_result = SolveIKConstrained(
+            pose, candidate,
+            path_seed.empty() ? nullptr : &path_seed,
+            std::max(1, remaining_ms));
+        if (ik_result != GraspResult::SUCCESS) return ik_result;
+        std::string yaw_detail;
+        if (!ApplyWristYaw(
+                grasp_yaw_rad, candidate, &yaw_detail, false)) {
+            if (detail) *detail = yaw_detail;
+            return GraspResult::IK_FAILED;
+        }
+    }
+
+    // Refine all five joints on one continuous branch. Keep wrist yaw near the
+    // requested jaw direction while allowing a small coupled correction that
+    // restores the fifth degree of freedom needed by an offset TCP.
+    kin_pose_t achieved = {};
+    double current_error_m = std::numeric_limits<double>::infinity();
+    constexpr double kFiniteDifferenceRad = 0.002;
+    constexpr double kDamping = 1e-5;
+    constexpr double kMaximumStepRad = 0.15;
+    constexpr double kMaximumWristYawErrorRad = 0.18;
+    for (int iteration = 0; iteration < 30; ++iteration) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            if (detail) *detail = "fixed-yaw top IK timed out";
+            return GraspResult::TIMEOUT;
+        }
+        if (!forward(candidate, achieved)) {
+            if (detail) *detail = "FK failed during fixed-yaw top IK";
+            return GraspResult::IK_FAILED;
+        }
+        current_error_m = position_error(achieved);
+        if (current_error_m <= kMaximumTcpPositionErrorM &&
+            std::fabs(achieved.z - pose.z) <=
+                kMaximumTcpVerticalErrorM) {
+            break;
+        }
+
+        double jacobian[3][5] = {};
+        for (int joint = 0; joint < 5; ++joint) {
+            std::vector<float> plus = candidate;
+            std::vector<float> minus = candidate;
+            plus[joint] = std::min(
+                plus[joint] + static_cast<float>(kFiniteDifferenceRad),
+                static_cast<float>(upper[joint]));
+            minus[joint] = std::max(
+                minus[joint] - static_cast<float>(kFiniteDifferenceRad),
+                static_cast<float>(lower[joint]));
+            kin_pose_t plus_pose = {};
+            kin_pose_t minus_pose = {};
+            const double denominator = plus[joint] - minus[joint];
+            if (denominator <= 1e-8 ||
+                !forward(plus, plus_pose) ||
+                !forward(minus, minus_pose)) {
+                continue;
+            }
+            jacobian[0][joint] =
+                (plus_pose.x - minus_pose.x) / denominator;
+            jacobian[1][joint] =
+                (plus_pose.y - minus_pose.y) / denominator;
+            jacobian[2][joint] =
+                (plus_pose.z - minus_pose.z) / denominator;
+        }
+        double augmented[3][4] = {};
+        const double residual[3] = {
+            pose.x - achieved.x,
+            pose.y - achieved.y,
+            (pose.z - achieved.z) * kVerticalResidualWeight,
+        };
+        for (int joint = 0; joint < 5; ++joint) {
+            jacobian[2][joint] *= kVerticalResidualWeight;
+        }
+        for (int row = 0; row < 3; ++row) {
+            for (int column = 0; column < 3; ++column) {
+                for (int joint = 0; joint < 5; ++joint) {
+                    augmented[row][column] +=
+                        jacobian[row][joint] *
+                        jacobian[column][joint];
+                }
+            }
+            augmented[row][row] += kDamping;
+            augmented[row][3] = residual[row];
+        }
+        bool invertible = true;
+        for (int pivot = 0; pivot < 3; ++pivot) {
+            int best_row = pivot;
+            for (int row = pivot + 1; row < 3; ++row) {
+                if (std::fabs(augmented[row][pivot]) >
+                    std::fabs(augmented[best_row][pivot])) {
+                    best_row = row;
+                }
+            }
+            if (std::fabs(augmented[best_row][pivot]) < 1e-10) {
+                invertible = false;
+                break;
+            }
+            if (best_row != pivot) {
+                for (int column = pivot; column < 4; ++column) {
+                    std::swap(
+                        augmented[pivot][column],
+                        augmented[best_row][column]);
+                }
+            }
+            const double divisor = augmented[pivot][pivot];
+            for (int column = pivot; column < 4; ++column) {
+                augmented[pivot][column] /= divisor;
+            }
+            for (int row = 0; row < 3; ++row) {
+                if (row == pivot) continue;
+                const double factor = augmented[row][pivot];
+                for (int column = pivot; column < 4; ++column) {
+                    augmented[row][column] -=
+                        factor * augmented[pivot][column];
+                }
+            }
+        }
+        if (!invertible) {
+            if (detail) *detail = "fixed-yaw top IK Jacobian is singular";
+            return GraspResult::IK_FAILED;
+        }
+        double delta[5] = {};
+        double delta_norm = 0.0;
+        for (int joint = 0; joint < 5; ++joint) {
+            for (int axis = 0; axis < 3; ++axis) {
+                delta[joint] +=
+                    jacobian[axis][joint] * augmented[axis][3];
+            }
+            delta_norm += delta[joint] * delta[joint];
+        }
+        delta_norm = std::sqrt(delta_norm);
+        const double delta_scale = delta_norm > kMaximumStepRad
+            ? kMaximumStepRad / delta_norm
+            : 1.0;
+        bool improved = false;
+        std::vector<float> best_candidate = candidate;
+        double best_score = acceptance_score(achieved);
+        for (double line_scale : {1.0, 0.5, 0.25, 0.125}) {
+            std::vector<float> trial = candidate;
+            for (int joint = 0; joint < 5; ++joint) {
+                trial[joint] = std::clamp(
+                    trial[joint] + static_cast<float>(
+                        line_scale * delta_scale * delta[joint]),
+                    static_cast<float>(lower[joint]),
+                    static_cast<float>(upper[joint]));
+            }
+            if (!constraints_valid(trial) ||
+                wrist_yaw_error(trial) > kMaximumWristYawErrorRad) {
+                continue;
+            }
+            kin_pose_t trial_pose = {};
+            if (!forward(trial, trial_pose)) continue;
+            const double trial_score = acceptance_score(trial_pose);
+            if (trial_score < best_score) {
+                best_score = trial_score;
+                best_candidate = std::move(trial);
+                improved = true;
+            }
+        }
+        if (!improved) {
+            if (detail) {
+                std::ostringstream stalled;
+                stalled
+                    << "fixed-yaw top IK stalled; position="
+                    << current_error_m * 1000.0
+                    << "mm vertical="
+                    << std::fabs(achieved.z - pose.z) * 1000.0
+                    << "mm wrist_yaw_error="
+                    << wrist_yaw_error(candidate) << "rad joints=[";
+                for (size_t joint = 0; joint < candidate.size(); ++joint) {
+                    if (joint > 0) stalled << ",";
+                    stalled << candidate[joint];
+                }
+                stalled << "]";
+                *detail = stalled.str();
+            }
+            return GraspResult::IK_FAILED;
+        }
+        candidate = std::move(best_candidate);
+    }
+    if (!forward(candidate, achieved)) {
+        if (detail) *detail = "FK failed after fixed-yaw top IK";
+        return GraspResult::IK_FAILED;
+    }
+    const double position_error_m = position_error(achieved);
+    const double vertical_error_m = std::fabs(achieved.z - pose.z);
+    const double approach_error_deg = AxisAngleDegrees(
+        ToolAxisZ(achieved.qw, achieved.qx, achieved.qy, achieved.qz),
+        ToolAxisZ(
+            oriented_pose.qw, oriented_pose.qx,
+            oriented_pose.qy, oriented_pose.qz));
+    const double opening_error_deg = AxisAngleDegrees(
+        ToolAxisY(achieved.qw, achieved.qx, achieved.qy, achieved.qz),
+        ToolAxisY(
+            oriented_pose.qw, oriented_pose.qx,
+            oriented_pose.qy, oriented_pose.qz));
+    const double final_wrist_yaw_error_rad = wrist_yaw_error(candidate);
+    if (position_error_m > kMaximumTcpPositionErrorM ||
+        vertical_error_m > kMaximumTcpVerticalErrorM ||
+        final_wrist_yaw_error_rad > kMaximumWristYawErrorRad) {
+        if (detail) {
+            *detail = "fixed-yaw top IK verification failed: position=" +
+                std::to_string(position_error_m * 1000.0) +
+                "mm vertical=" +
+                std::to_string(vertical_error_m * 1000.0) +
+                "mm approach=" + std::to_string(approach_error_deg) +
+                "deg opening=" + std::to_string(opening_error_deg) +
+                "deg wrist_yaw_error=" +
+                std::to_string(final_wrist_yaw_error_rad) + "rad";
+        }
+        return GraspResult::IK_FAILED;
+    }
+    if (candidate_validator && !candidate_validator(candidate)) {
+        if (detail) *detail = "fixed-yaw top IK path is unsafe";
+        return GraspResult::OUT_OF_RANGE;
+    }
+    joints = std::move(candidate);
+    if (config_.performance_log_enabled) {
+        std::cout << "[Timing] component=TOP_FIXED_YAW_IK"
+            << " position_error_mm=" << position_error_m * 1000.0
+            << " approach_error_deg=" << approach_error_deg
+            << " opening_error_deg=" << opening_error_deg
+            << " wrist_yaw_error_rad=" << final_wrist_yaw_error_rad
+            << " result=success" << std::endl;
+    }
+    if (detail) detail->clear();
+    return GraspResult::SUCCESS;
+}
+
+GraspResult GraspExecutor::PlanTopJointPathLegacy(
     const std::vector<Pose3D>& poses,
     float grasp_yaw_rad,
     int timeout_ms,
@@ -2087,8 +2550,7 @@ GraspResult GraspExecutor::PlanTopJointPath(
                     if (index > 0 &&
                         maximum_joint_delta >
                             kMaximumWaypointJointDeltaRad) {
-                        candidate_rejection =
-                            "discontinuous IK branch";
+                        candidate_rejection = "discontinuous IK branch";
                         return false;
                     }
                     std::vector<std::vector<float>> candidate_path;
@@ -2144,6 +2606,216 @@ GraspResult GraspExecutor::PlanTopJointPath(
                 *detail = "top waypoint " + std::to_string(index + 1) +
                     "/" + std::to_string(poses.size()) +
                     ": discontinuous IK branch";
+            }
+            return GraspResult::IK_FAILED;
+        }
+
+        std::string path_detail;
+        std::vector<std::vector<float>> collision_safe_path;
+        const GraspResult path_result = index == 0
+            ? BuildCollisionSafeJointPath(
+                start_joints, solved_joints,
+                collision_safe_path, &path_detail)
+            : ValidateJointPathSafety(
+                start_joints, solved_joints, &path_detail);
+        if (path_result != GraspResult::SUCCESS) {
+            if (detail) {
+                *detail = "top waypoint " + std::to_string(index + 1) +
+                    "/" + std::to_string(poses.size()) + ": " +
+                    path_detail;
+            }
+            return path_result;
+        }
+        joint_path.push_back(solved_joints);
+        start_joints = std::move(solved_joints);
+    }
+    if (detail) detail->clear();
+    return GraspResult::SUCCESS;
+}
+
+GraspResult GraspExecutor::PlanTopJointPath(
+    const std::vector<Pose3D>& poses,
+    float grasp_yaw_rad,
+    int timeout_ms,
+    std::vector<std::vector<float>>& joint_path,
+    std::string* detail,
+    const std::vector<float>* start_override) {
+    if (config_.legacy_top_ik) {
+        return PlanTopJointPathLegacy(
+            poses, grasp_yaw_rad, timeout_ms, joint_path,
+            detail, start_override);
+    }
+    joint_path.clear();
+    if (poses.empty()) {
+        if (detail) *detail = "top path contains no waypoints";
+        return GraspResult::IK_FAILED;
+    }
+    if (!arm_path_safety_ || !support_plane_.valid) {
+        if (detail) *detail = "top grasp support surface is unavailable";
+        return GraspResult::OUT_OF_RANGE;
+    }
+
+    std::vector<float> start_joints;
+    if (start_override) {
+        start_joints = *start_override;
+    } else if (!GetCurrentJoints(start_joints)) {
+        if (detail) *detail = "failed to read top grasp start joints";
+        return GraspResult::MOVE_FAILED;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(std::max(30, timeout_ms));
+    constexpr float kMaximumWaypointJointDeltaRad = 0.45f;
+    std::vector<float> grasp_branch_seed;
+    if (std::isnan(grasp_yaw_rad) && poses.size() > 1) {
+        const auto lowest_pose = std::min_element(
+            poses.begin(), poses.end(),
+            [](const Pose3D& lhs, const Pose3D& rhs) {
+                return lhs.z < rhs.z;
+            });
+        const int anchor_budget_ms = std::max(
+            20, timeout_ms / 3);
+        if (lowest_pose != poses.end() &&
+            SolveIKConstrained(
+                *lowest_pose, grasp_branch_seed, nullptr,
+                anchor_budget_ms) == GraspResult::SUCCESS) {
+            std::cout << "[GraspExecutor] top path seeded from exact "
+                "lowest-pose IK branch at waypoint="
+                << (std::distance(poses.begin(), lowest_pose) + 1)
+                << "/" << poses.size() << std::endl;
+        } else {
+            grasp_branch_seed.clear();
+        }
+    }
+    for (size_t index = 0; index < poses.size(); ++index) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            if (detail) *detail = "top path planning deadline exceeded";
+            return GraspResult::TIMEOUT;
+        }
+
+        std::vector<float> solved_joints;
+        bool reused_waypoint = false;
+        for (size_t previous = index; previous > 0; --previous) {
+            const size_t previous_index = previous - 1;
+            if (PosesMatch(poses[index], poses[previous_index])) {
+                const auto& cached_joints = joint_path[previous_index];
+                float maximum_cached_delta = 0.0f;
+                for (size_t joint = 0;
+                    joint < start_joints.size() &&
+                    joint < cached_joints.size(); ++joint) {
+                    maximum_cached_delta = std::max(
+                        maximum_cached_delta,
+                        std::fabs(
+                            cached_joints[joint] - start_joints[joint]));
+                }
+                if (index == 0 ||
+                    maximum_cached_delta <=
+                        kMaximumWaypointJointDeltaRad) {
+                    solved_joints = cached_joints;
+                    reused_waypoint = true;
+                    break;
+                }
+            }
+        }
+        if (!reused_waypoint) {
+            std::string candidate_rejection;
+            const auto candidate_validator =
+                [&](std::vector<float>& candidate) {
+                    float maximum_joint_delta = 0.0f;
+                    size_t maximum_delta_joint = 0;
+                    for (size_t joint = 0;
+                        joint < start_joints.size() &&
+                        joint < candidate.size(); ++joint) {
+                        const float delta = std::fabs(
+                            candidate[joint] - start_joints[joint]);
+                        if (delta > maximum_joint_delta) {
+                            maximum_joint_delta = delta;
+                            maximum_delta_joint = joint;
+                        }
+                    }
+                    if (index > 0 &&
+                        maximum_joint_delta >
+                            kMaximumWaypointJointDeltaRad) {
+                        candidate_rejection =
+                            "discontinuous IK branch: joint=" +
+                            std::to_string(maximum_delta_joint) +
+                            " delta_rad=" +
+                            std::to_string(maximum_joint_delta) +
+                            " from=" +
+                            std::to_string(
+                                start_joints[maximum_delta_joint]) +
+                            " to=" +
+                            std::to_string(candidate[maximum_delta_joint]);
+                        return false;
+                    }
+                    std::vector<std::vector<float>> candidate_path;
+                    const GraspResult path_result = index == 0
+                        ? BuildCollisionSafeJointPath(
+                            start_joints, candidate,
+                            candidate_path, &candidate_rejection)
+                        : ValidateJointPathSafety(
+                            start_joints, candidate,
+                            &candidate_rejection);
+                    return path_result == GraspResult::SUCCESS;
+                };
+            const int remaining_ms = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now()).count());
+            std::string compensation_detail;
+            const std::vector<float>* waypoint_seed =
+                index == 0 && !grasp_branch_seed.empty()
+                ? &grasp_branch_seed
+                : &start_joints;
+            const GraspResult ik_result =
+                SolveTopIKWithWristYaw(
+                    poses[index], grasp_yaw_rad, solved_joints,
+                    waypoint_seed, std::max(1, remaining_ms),
+                    candidate_validator, &compensation_detail);
+            if (ik_result != GraspResult::SUCCESS) {
+                if (detail) {
+                    const bool generic_path_rejection =
+                        compensation_detail ==
+                            "fixed-yaw top IK path is unsafe";
+                    *detail =
+                        "top waypoint " + std::to_string(index + 1) +
+                        "/" + std::to_string(poses.size()) + ": " +
+                        (generic_path_rejection &&
+                            !candidate_rejection.empty()
+                            ? candidate_rejection
+                            : !compensation_detail.empty()
+                            ? compensation_detail
+                            : candidate_rejection.empty()
+                            ? "IK failed"
+                            : candidate_rejection);
+                }
+                return ik_result;
+            }
+        }
+        float maximum_joint_delta = 0.0f;
+        size_t maximum_delta_joint = 0;
+        for (size_t joint = 0;
+            joint < start_joints.size() && joint < solved_joints.size();
+            ++joint) {
+            const float delta =
+                std::fabs(solved_joints[joint] - start_joints[joint]);
+            if (delta > maximum_joint_delta) {
+                maximum_joint_delta = delta;
+                maximum_delta_joint = joint;
+            }
+        }
+        if (index > 0 &&
+            maximum_joint_delta > kMaximumWaypointJointDeltaRad) {
+            if (detail) {
+                *detail = "top waypoint " + std::to_string(index + 1) +
+                    "/" + std::to_string(poses.size()) +
+                    ": discontinuous IK branch: joint=" +
+                    std::to_string(maximum_delta_joint) +
+                    " delta_rad=" +
+                    std::to_string(maximum_joint_delta) +
+                    " from=" +
+                    std::to_string(start_joints[maximum_delta_joint]) +
+                    " to=" +
+                    std::to_string(solved_joints[maximum_delta_joint]);
             }
             return GraspResult::IK_FAILED;
         }

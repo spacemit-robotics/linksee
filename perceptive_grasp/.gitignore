@@ -1,5 +1,5 @@
 # Build outputs
-build/
+build*/
 
 # CMake
 CMakeCache.txt
@@ -15,10 +15,16 @@ compile_commands.json
 
 # Debug outputs
 debug_localize_output/
+debug_grasp_runs/
+simulation_recordings/
+validation/
 *.png
 *.jpg
 *.jpeg
 !resources/eye-to-hand.jpg
+simulation/mujoco/assets/fruit/
+simulation/mujoco/models/robotiq_2f85/assets/
+simulation/mujoco/models/universal_robots_ur5e/assets/
 
 # Editor
 .vscode/

@@ -63,6 +63,14 @@ struct PipelineConfig {
     int target_missing_frames = 20; // 指定目标连续未检出多少帧后报不存在
     // Top-grasp pixel offset: 0=center, 1=short-axis edge.
     float top_grasp_point_x_ratio = 0.5f;
+    // Top position source: mask_depth or projected_geometry_center.
+    std::string top_position_source = "mask_depth";
+    float top_projected_center_blend = 1.0f;
+    float top_sparse_projected_center_blend = 1.0f;
+    bool top_support_plane_occlusion_recovery = false;
+    bool top_support_plane_height_anchor = false;
+    float top_minimum_grasp_height_m = 0.0f;
+    float top_verification_lift_m = 0.0f;
     VoiceCommandConfig voice;       // 语音命令配置
 
     // 抓取调试数据保存
@@ -202,6 +210,7 @@ private:
     bool have_previous_base_alignment_point_ = false;
     std::array<float, 3> previous_base_alignment_point_ = {};
     MobileBaseAlignmentCommand previous_base_alignment_command_;
+    bool last_base_motion_odometry_confirmed_ = false;
     bool last_top_support_plane_valid_ = false;
     SupportPlane last_top_support_plane_;
     float base_align_travel_m_ = 0.0f;
@@ -299,6 +308,15 @@ private:
         int pixel_x,
         int pixel_y,
         float& depth_mm) const;
+    bool ProjectTopCandidateToMaskCenter(
+        const ObjectGeometry3D& geometry,
+        GraspCandidate& candidate,
+        float& grasp_px,
+        float& grasp_py,
+        uint16_t& depth_mm,
+        float cam_point[3],
+        float base_point[3],
+        std::string& error);
     bool ResolveTopSupportPlane(
         const TablePlane& table,
         SupportPlane& support_plane,
@@ -318,6 +336,8 @@ private:
     void HandleDetecting();
     void HandlePlanning();
     void HandleBaseAligning();
+    bool ValidateMobileBaseVisualProgress(
+        const float alignment_point[3]);
     bool ValidateBaseAlignmentCommandTransition(
         const MobileBaseAlignmentCommand& command,
         std::string& error);

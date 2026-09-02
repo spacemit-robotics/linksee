@@ -2,7 +2,7 @@
 <package format="3">
   <name>perceptive_grasp</name>
   <version>0.1.0</version>
-  <description>Linksee perceptive grasping pipeline with selectable stereo camera backends.</description>
+  <description>RGB-D grasping pipeline for Linksee hardware and MuJoCo simulation.</description>
   <maintainer email="dev@spacemit.com">Spacemit Robotics</maintainer>
   <license>Apache-2.0</license>
 

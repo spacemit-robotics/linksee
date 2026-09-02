@@ -77,7 +77,7 @@ bool SampleMaskedDepthNearPixel(const cv::Mat& depth,
     for (int y = y_min; y <= y_max; ++y) {
         for (int x = x_min; x <= x_max; ++x) {
             if (mask.at<uint8_t>(y, x) == 0 ||
-                depth.at<uint16_t>(y, x) == 0) {
+                !IsValidGraspDepth(depth.at<uint16_t>(y, x))) {
                 continue;
             }
             const int dx = x - requested_x;
@@ -101,7 +101,8 @@ bool SampleMaskedDepthNearPixel(const cv::Mat& depth,
         for (int x = std::max(0, sample_x - kMedianRadius);
             x <= std::min(depth.cols - 1, sample_x + kMedianRadius); ++x) {
             const uint16_t value = depth.at<uint16_t>(y, x);
-            if (mask.at<uint8_t>(y, x) != 0 && value > 0) {
+            if (mask.at<uint8_t>(y, x) != 0 &&
+                IsValidGraspDepth(value)) {
                 depth_values.push_back(value);
             }
         }

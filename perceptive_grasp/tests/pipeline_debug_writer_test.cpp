@@ -58,6 +58,7 @@ int main() {
 
     PipelinePlanDebugData plan;
     plan.color = color;
+    plan.target_mask = cv::Mat(12, 12, CV_8UC1, cv::Scalar(255));
     plan.target_detected = "cup\"test";
     plan.target_score = 0.9f;
     plan.target_bbox = {1.0f, 2.0f, 10.0f, 11.0f};
@@ -93,7 +94,10 @@ int main() {
             "invalid grasp yaw") ||
         !Contains(
             plan_json, "\"grasp_strategy\": \"side\"",
-            "grasp strategy")) {
+            "grasp strategy") ||
+        !Contains(
+            plan_json, "\"target_mask\": \"grasp_unit_test_mask.png\"",
+            "target mask path")) {
         return 1;
     }
 
@@ -132,6 +136,8 @@ int main() {
             output_dir / "grasp_unit_test_pre_grasp.png") ||
         !fs::exists(
             output_dir / "grasp_unit_test_pre_grasp_depth.png") ||
+        !fs::exists(
+            output_dir / "grasp_unit_test_mask.png") ||
         !fs::exists(image_path)) {
         std::cerr << "debug images were not written" << std::endl;
         return 1;

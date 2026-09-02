@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file pipeline_timing.h
- * @brief Task and stage timing for the perceptive grasp state machine.
+ * @brief Task and stage timing for the perceptive_grasp state machine.
  */
 
 #ifndef PIPELINE_TIMING_H

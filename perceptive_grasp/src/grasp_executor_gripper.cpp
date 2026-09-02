@@ -226,8 +226,18 @@ GraspResult GraspExecutor::CheckGripperHolding(
 
     diagnostics_.gripper_check.phase = phase;
     diagnostics_.gripper_check.state = GraspStateName(state);
-    diagnostics_.gripper_check.decision =
-        GripperHoldingResultName(evidence.result);
+    const bool driver_empty_at_calibrated_position =
+        (state == GRASP_STATE_EMPTY || state == GRASP_STATE_IDLE) &&
+        std::isfinite(evidence.position) &&
+        std::isfinite(evidence.load) &&
+        evidence.position <= evidence.minimum_object_position &&
+        evidence.load < evidence.effective_load_threshold;
+    const bool confirmed_empty =
+        evidence.result == GripperHoldingResult::EMPTY ||
+        driver_empty_at_calibrated_position;
+    diagnostics_.gripper_check.decision = confirmed_empty
+        ? "EMPTY"
+        : GripperHoldingResultName(evidence.result);
     diagnostics_.gripper_check.holding_count =
         evidence.state_holding_count;
     diagnostics_.gripper_check.load_holding_count =
@@ -259,7 +269,7 @@ GraspResult GraspExecutor::CheckGripperHolding(
     std::cout << "[GraspExecutor] grasp check: phase=" << phase
             << ", state=" << GraspStateName(state)
             << ", decision="
-            << GripperHoldingResultName(evidence.result)
+            << diagnostics_.gripper_check.decision
             << ", state_holding=" << evidence.state_holding_count << "/"
             << performed_checks
             << ", opening=" << evidence.opening_count << "/"
@@ -277,6 +287,17 @@ GraspResult GraspExecutor::CheckGripperHolding(
             << ", position=" << evidence.position
             << ", load=" << evidence.load << std::endl;
 
+    if (confirmed_empty) {
+        std::cout << "[GraspExecutor] Grasp empty - nothing grabbed"
+                << std::endl;
+        RecordResult(
+            GraspResult::EMPTY,
+            after_lift
+                ? "verify_grasp_after_lift"
+                : "close_gripper_and_check",
+            "gripper reached the calibrated empty position");
+        return GraspResult::EMPTY;
+    }
     if (evidence.result == GripperHoldingResult::HOLDING) {
         const char* action = after_lift
             ? "verify_grasp_after_lift"
@@ -297,27 +318,15 @@ GraspResult GraspExecutor::CheckGripperHolding(
             "gripper closed without object");
         return GraspResult::EMPTY;
     }
-    if (after_lift) {
-        RecordResult(
-            GraspResult::TIMEOUT, "verify_grasp_after_lift",
-            "holding evidence was inconclusive after lift; preserving "
-            "possible-object state for safe recovery");
-        return GraspResult::TIMEOUT;
-    }
-    if (state == GRASP_STATE_MOVING) {
-        std::cerr << "[GraspExecutor] Gripper still moving after close check"
-                << std::endl;
-        RecordResult(
-            GraspResult::TIMEOUT, "close_gripper_and_check",
-            "gripper still moving after close check");
-        return GraspResult::TIMEOUT;
-    }
-    std::cerr << "[GraspExecutor] Gripper error during close check"
+    const char* action = after_lift
+        ? "verify_grasp_after_lift"
+        : "close_gripper_and_check";
+    std::cerr << "[GraspExecutor] Holding evidence remained inconclusive"
             << std::endl;
     RecordResult(
-        GraspResult::MOVE_FAILED, "close_gripper_and_check",
-        "gripper error during close check");
-    return GraspResult::MOVE_FAILED;
+        GraspResult::TIMEOUT, action,
+        "holding evidence was inconclusive; preserving possible-object state for safe recovery");
+    return GraspResult::TIMEOUT;
 }
 
 GraspResult GraspExecutor::ReleaseObject() {

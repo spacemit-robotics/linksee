@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file pipeline_state.h
- * @brief Shared state definitions for the perceptive grasp pipeline.
+ * @brief Shared state definitions for the perceptive_grasp pipeline.
  */
 
 #ifndef PIPELINE_STATE_H
@@ -11,7 +11,7 @@
 
 namespace perceptive_grasp {
 
-/** Execution states of one perceptive grasp task. */
+/** Execution states of one perceptive_grasp task. */
 enum class PipelineState {
     IDLE,
     OBSERVING,

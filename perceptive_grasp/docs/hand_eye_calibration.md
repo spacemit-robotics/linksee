@@ -1,13 +1,13 @@
 # 手眼标定
 
-perceptive grasp 使用 eye-to-hand 标定计算立体相机坐标系到 linksee 机械臂基座坐标系的变换。
+`perceptive_grasp` 使用 eye-to-hand 标定计算 RGB-D 相机坐标系到 Linksee 机械臂基座坐标系的变换。
 
 ## 1. 安装相机和标定板
 
-立体相机固定在机身上，charuco 标定板固定在夹爪末端。如图所示：
+RGB-D 相机固定在机身上，ChArUco 标定板固定在夹爪末端。如图所示：
 
 <p align="center">
-  <img src="../resources/eye-to-hand.jpg" alt="立体相机与 charuco 标定板安装" width="480">
+  <img src="../resources/eye-to-hand.jpg" alt="RGB-D 相机与 ChArUco 标定板安装" width="480">
 </p>
 
 ## 2. 准备标定环境
@@ -16,8 +16,8 @@ perceptive grasp 使用 eye-to-hand 标定计算立体相机坐标系到 linksee
 
 - `config/grasp_pipeline.yaml` 中的 `camera.type` 和相机参数与当前硬件一致。
 - 机械臂串口可访问，机械臂周围没有障碍物。
-- python 环境已安装 `requirements.txt` 中的依赖。
-- 立体相机和机械臂基座已经固定，标定完成前不再调整安装位置。
+- Python 环境已安装 `requirements.txt` 中的依赖。
+- RGB-D 相机和机械臂基座已经固定，标定完成前不再调整安装位置。
 
 激活环境：
 
@@ -27,11 +27,11 @@ source ~/spacemit_robot/build/envsetup.sh
 source ~/.venv-grasp/bin/activate
 ```
 
-标定脚本读取 `camera.type`，支持 realsense d435i 深度相机和 spacemit_las2 双目相机。spacemit_las2 标定只采集校正后的逻辑左目彩色图，不启动深度推理。
+标定脚本读取 `camera.type`，支持 RealSense D435i 和 `spacemit_las2` 双目相机。`spacemit_las2` 标定只采集校正后的逻辑左目彩色图，不启动深度推理。
 
-## 3. 生成并打印标定板
+## 3. 生成并打印 ChArUco 标定板
 
-生成 4 x 5 charuco 标定板：
+生成 4 × 5 ChArUco 标定板：
 
 ```bash
 python3 scripts/generate_charuco_board.py \
@@ -48,7 +48,7 @@ python3 scripts/generate_charuco_board.py \
 config/charuco_4x5_20mm_14mm.png
 ```
 
-按 100% 比例打印标定板，测量一个黑白方格和一个 aruco marker 的实际边长，再将标定板刚性固定在夹爪末端。采集命令必须使用实测尺寸，单位为米。
+按 100% 比例打印标定板，测量一个黑白方格和一个 ArUco marker 的实际边长，再将标定板刚性固定在夹爪末端。采集命令必须使用实测尺寸，单位为米。
 
 ## 4. 采集标定样本
 

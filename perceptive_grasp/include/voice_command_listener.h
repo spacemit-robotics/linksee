@@ -3,7 +3,7 @@
     * SPDX-License-Identifier: Apache-2.0
     *
     * @file voice_command_listener.h
-    * @brief ROS2 voice command subscriber for perceptive grasp pipeline.
+    * @brief ROS2 voice command subscriber for perceptive_grasp pipeline.
     */
 
 #ifndef VOICE_COMMAND_LISTENER_H

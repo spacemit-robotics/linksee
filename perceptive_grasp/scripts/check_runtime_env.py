@@ -16,10 +16,19 @@ import math
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 from typing import Any, Dict
+
+from asr_backend import (
+    normalize_asr_backend,
+    probe_qwen3_asr_endpoint,
+    qwen3_auto_start_enabled,
+    qwen3_endpoint_is_local,
+    validate_qwen3_local_runtime,
+)
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
@@ -44,6 +53,124 @@ def status(ok: bool, name: str, detail: str = "") -> bool:
     mark = "OK" if ok else "FAIL"
     print(f"[{mark}] {name}" + (f": {detail}" if detail else ""))
     return ok
+
+
+def check_remote_mujoco(root: Dict[str, Any]) -> bool:
+    """Check the endpoint shared by the remote camera and executor."""
+    endpoint = root.get("remote_mujoco", {}) \
+        if isinstance(root, dict) else {}
+    if not isinstance(endpoint, dict) or not endpoint:
+        camera = root.get("camera", {}) if isinstance(root, dict) else {}
+        endpoint = camera.get("remote_mujoco", {}) \
+            if isinstance(camera, dict) else {}
+    if not isinstance(endpoint, dict):
+        return status(False, "remote_mujoco configuration",
+                      "expected a mapping")
+
+    host = str(endpoint.get("host", "")).strip()
+    try:
+        port = int(endpoint.get("port", 9090))
+    except (TypeError, ValueError):
+        port = 0
+    if not host or port < 1 or port > 65535:
+        return status(False, "remote_mujoco endpoint",
+                      "host must be set and port must be in [1, 65535]")
+
+    try:
+        with socket.create_connection((host, port), timeout=2.0):
+            pass
+    except OSError as exc:
+        return status(False, "remote_mujoco endpoint",
+                      f"{host}:{port} unreachable: {exc}")
+    return status(True, "remote_mujoco endpoint", f"{host}:{port}")
+
+
+def _find_simulation_server(build_dir: str = "") -> str:
+    """Find the MuJoCo service binary in a requested build or PATH."""
+    candidates = []
+    if build_dir:
+        candidates.append(os.path.join(
+            os.path.abspath(os.path.expanduser(build_dir)),
+            "mujoco_grasp_sim_server",
+        ))
+    path_binary = shutil.which("mujoco_grasp_sim_server")
+    if path_binary:
+        candidates.append(path_binary)
+    return next((path for path in candidates
+                 if os.path.isfile(path) and os.access(path, os.X_OK)), "")
+
+
+def check_mujoco_simulation(root: Dict[str, Any], config_path: str,
+                            build_dir: str = "") -> bool:
+    """Check the local MuJoCo service and scene paths."""
+    server = _find_simulation_server(build_dir)
+    ok = status(
+        bool(server),
+        "MuJoCo simulation server",
+        server or "mujoco_grasp_sim_server missing or not executable",
+    )
+
+    config_dir = os.path.dirname(os.path.abspath(config_path))
+    configured_paths = []
+    camera = root.get("camera", {}) if isinstance(root, dict) else {}
+    manipulator = root.get("manipulator", {}) \
+        if isinstance(root, dict) else {}
+    for field, profile in (
+            ("camera.mujoco.xml_path", camera.get("mujoco", {})),
+            ("manipulator.mujoco.xml_path",
+             manipulator.get("mujoco", {}))):
+        value = profile.get("xml_path", "") \
+            if isinstance(profile, dict) else ""
+        resolved = expand_config_path(str(value))
+        if resolved and not os.path.isabs(resolved):
+            resolved = os.path.normpath(os.path.join(config_dir, resolved))
+        configured_paths.append((field, resolved))
+
+    for field, scene_path in configured_paths:
+        ok &= status(
+            bool(scene_path) and os.path.isfile(scene_path),
+            field,
+            scene_path or "not configured",
+        )
+    return ok
+
+
+def check_voice_asr_backend(root: Dict[str, Any]) -> bool:
+    """Validate the selected ASR backend and its external service."""
+    voice = root.get("voice", {}) if isinstance(root, dict) else {}
+    asr = voice.get("asr", {}) if isinstance(voice, dict) else {}
+    if not isinstance(asr, dict):
+        return status(False, "voice.asr configuration", "expected a mapping")
+    try:
+        backend = normalize_asr_backend(asr.get("backend", "sensevoice"))
+    except ValueError as exc:
+        return status(False, "voice.asr backend", str(exc))
+    if backend == "sensevoice":
+        return status(True, "voice.asr backend", "sensevoice")
+
+    qwen = asr.get("qwen3_asr", {}) or {}
+    if not isinstance(qwen, dict):
+        return status(
+            False, "voice.asr.qwen3_asr configuration",
+            "expected a mapping",
+        )
+    try:
+        endpoint = str(qwen.get(
+            "endpoint", "http://127.0.0.1:8063/v1/chat/completions"
+        )).strip()
+        auto_start = qwen3_auto_start_enabled(qwen)
+        if auto_start and qwen3_endpoint_is_local(endpoint):
+            binary, model_dir, _ = validate_qwen3_local_runtime(qwen)
+            return status(
+                True,
+                "voice.asr backend",
+                "qwen3_asr; local auto-start; "
+                f"server={binary}; model_dir={model_dir}",
+            )
+        health_url = probe_qwen3_asr_endpoint(qwen)
+    except (ValueError, RuntimeError) as exc:
+        return status(False, "voice.asr backend", str(exc))
+    return status(True, "voice.asr backend", f"qwen3_asr; {health_url}")
 
 
 def check_hand_eye_calibration(root: Dict[str, Any],
@@ -236,12 +363,25 @@ def _same_device(configured: str, detected: str) -> bool:
     return configured == detected or os.path.realpath(configured) == os.path.realpath(detected)
 
 
-def _probe_so101_device(device: str, sdk_root: str) -> bool:
+def _probe_so101_device(device: str, sdk_root: str,
+                        build_dir: str = "") -> bool:
     project_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), os.pardir))
-    tool_candidates = [os.path.join(project_root, "build", "read_joints")]
+    tool_candidates = []
+    if build_dir:
+        tool_candidates.append(os.path.join(
+            os.path.abspath(os.path.expanduser(build_dir)), "read_joints"))
+    installed_bin = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, "bin"))
+    tool_candidates.extend([
+        os.path.join(installed_bin, "read_joints"),
+        os.path.join(project_root, "build", "read_joints"),
+    ])
     tool_candidates.extend(sorted(glob.glob(
         os.path.join(project_root, "build*", "read_joints"))))
+    path_tool = shutil.which("read_joints")
+    if path_tool:
+        tool_candidates.append(path_tool)
     tool = next((path for path in tool_candidates
                  if os.path.isfile(path) and os.access(path, os.X_OK)), "")
     if not tool:
@@ -277,7 +417,8 @@ def _probe_so101_device(device: str, sdk_root: str) -> bool:
 def check_serial_role_configuration(manipulator_device: str,
                                     mobile_base_device: str,
                                     mobile_base_enabled: bool,
-                                    sdk_root: str) -> bool:
+                                    sdk_root: str,
+                                    build_dir: str = "") -> bool:
     devices = sorted(glob.glob("/dev/ttyACM*"))
     links_by_target = _serial_by_id_links()
     properties_by_device = {
@@ -295,7 +436,7 @@ def check_serial_role_configuration(manipulator_device: str,
 
     detected_arm = ""
     for device in serial_candidates:
-        if _probe_so101_device(device, sdk_root):
+        if _probe_so101_device(device, sdk_root, build_dir):
             detected_arm = device
             break
 
@@ -566,10 +707,15 @@ def _find_las2_library(sdk_root: str, model_path: str,
     return ""
 
 
-def _find_application_binaries() -> tuple[str, str]:
+def _find_application_binaries(build_dir: str = "") -> tuple[str, str]:
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    build_dirs = [os.path.join(project_root, "build")]
-    build_dirs.extend(sorted(glob.glob(os.path.join(project_root, "build*"))))
+    if build_dir:
+        requested = os.path.abspath(os.path.expanduser(build_dir))
+        build_dirs = [requested]
+    else:
+        build_dirs = [os.path.join(project_root, "build")]
+        build_dirs.extend(sorted(glob.glob(
+            os.path.join(project_root, "build*"))))
     path_launcher = shutil.which("perceptive_grasp")
     if path_launcher:
         build_dirs.append(os.path.dirname(os.path.abspath(path_launcher)))
@@ -588,8 +734,8 @@ def _find_application_binaries() -> tuple[str, str]:
     return partial_match
 
 
-def check_application_binaries() -> bool:
-    launcher, core = _find_application_binaries()
+def check_application_binaries(build_dir: str = "") -> bool:
+    launcher, core = _find_application_binaries(build_dir)
     launcher_ok = bool(launcher) and os.path.isfile(launcher) \
         and os.access(launcher, os.X_OK)
     core_ok = bool(core) and os.path.isfile(core) and os.access(core, os.X_OK)
@@ -606,7 +752,8 @@ def check_application_binaries() -> bool:
     return ok
 
 
-def check_voice_echo_cancellation(root: Dict[str, Any]) -> bool:
+def check_voice_echo_cancellation(root: Dict[str, Any],
+                                  build_dir: str = "") -> bool:
     voice = root.get("voice", {}) if isinstance(root, dict) else {}
     echo_config = voice.get("echo_cancellation", {}) \
         if isinstance(voice, dict) else {}
@@ -627,13 +774,18 @@ def check_voice_echo_cancellation(root: Dict[str, Any]) -> bool:
     )
     candidates = [
         os.environ.get("PERCEPTIVE_GRASP_VOICE_AEC_LIB", ""),
-        os.path.join(project_root, "build", "libperceptive_voice_aec.so"),
-        os.path.join(project_root, "build_las2", "libperceptive_voice_aec.so"),
         os.path.abspath(os.path.join(
             os.path.dirname(__file__), os.pardir, os.pardir, os.pardir,
             "lib", "libperceptive_voice_aec.so",
         )),
     ]
+    if build_dir:
+        candidates.insert(1, os.path.join(
+            os.path.abspath(os.path.expanduser(build_dir)),
+            "libperceptive_voice_aec.so"))
+    else:
+        candidates[1:1] = sorted(glob.glob(os.path.join(
+            project_root, "build*", "libperceptive_voice_aec.so")))
     library = next((path for path in candidates if path and os.path.isfile(path)), "")
     if not library:
         return status(
@@ -865,16 +1017,19 @@ def _read_text_file(path: str) -> str:
 
 def infer_sdk_root(start_path: str) -> str:
     path = os.path.abspath(start_path)
-    marker = os.path.join("application", "ros2", "linksee", "perceptive_grasp")
-    if path.endswith(marker):
-        return path[:-(len(marker) + 1)]
+    markers = (
+        os.path.join("application", "ros2", "linksee", "perceptive_grasp"),
+    )
+    for marker in markers:
+        if path.endswith(marker):
+            return path[:-(len(marker) + 1)]
 
-    parts = path.split(os.sep)
-    marker_parts = marker.split(os.sep)
-    for index in range(0, len(parts) - len(marker_parts) + 1):
-        if parts[index:index + len(marker_parts)] == marker_parts:
-            root_parts = parts[:index]
-            return os.sep.join(root_parts) or os.sep
+        parts = path.split(os.sep)
+        marker_parts = marker.split(os.sep)
+        for index in range(0, len(parts) - len(marker_parts) + 1):
+            if parts[index:index + len(marker_parts)] == marker_parts:
+                root_parts = parts[:index]
+                return os.sep.join(root_parts) or os.sep
     return ""
 
 
@@ -953,7 +1108,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Check perceptive_grasp runtime environment")
     parser.add_argument("--config", default="config/grasp_pipeline.yaml")
     parser.add_argument("--skip-voice", action="store_true",
-                        help="只检查机械臂串口，不检查本地 ASR/TTS 依赖")
+                        help="不检查本地 ASR/TTS 依赖和音频设备")
+    parser.add_argument("--build-dir", default="",
+                        help="检查指定构建目录中的程序和 AEC 运行库")
     parser.add_argument("--no-fix", action="store_true",
                         help="只检查环境，不提示执行自动修复")
     parser.add_argument("--yes", action="store_true",
@@ -978,35 +1135,47 @@ def main() -> int:
     fixer = RuntimeFixer(interactive=sys.stdin.isatty() and not args.no_fix,
                          assume_yes=args.yes)
     ok = True
-    supported_camera = camera_type in ("realsense", "spacemit_las2")
+    supported_camera = camera_type in (
+        "realsense", "spacemit_las2", "mujoco", "remote_mujoco")
     ok &= status(supported_camera, "camera.type", camera_type)
     backend_config = camera.get(camera_type) if supported_camera else None
+    if camera_type == "remote_mujoco":
+        backend_config = root.get("remote_mujoco", backend_config)
     ok &= status(isinstance(backend_config, dict),
                  f"camera.{camera_type} configuration")
     if supported_camera:
         ok &= check_hand_eye_calibration(root, camera_type)
     sdk_root = os.environ.get("SDK_ROOT", "") or infer_sdk_root(os.getcwd())
-    ok &= check_application_binaries()
-    report_serial_devices(device, mobile_base_device)
-    ok &= check_serial_role_configuration(
-        device, mobile_base_device, mobile_base_is_uart, sdk_root)
-    ok &= check_tty(device, fixer, "manipulator.uart_device")
-    if mobile_base_enabled:
-        ok &= check_chassis_driver_registered(sdk_root, mobile_base_driver)
-    if mobile_base_is_uart:
-        ok &= check_tty(mobile_base_device, fixer, "mobile_base.dev_path")
-    elif mobile_base_enabled and mobile_base_driver == "drv_rpmsg_esos":
-        ok &= check_rpmsg_device(
-            mobile_base.get("ctrl_dev", "/dev/rpmsg_ctrl0"),
-            mobile_base.get("data_dev", "/dev/rpmsg0"),
-            fixer)
-    ok &= check_video_permissions(fixer)
+    ok &= check_application_binaries(args.build_dir)
+    if camera_type == "remote_mujoco":
+        ok &= check_remote_mujoco(root)
+    elif camera_type == "mujoco":
+        ok &= check_mujoco_simulation(root, args.config, args.build_dir)
+    else:
+        report_serial_devices(device, mobile_base_device)
+        ok &= check_serial_role_configuration(
+            device, mobile_base_device, mobile_base_is_uart, sdk_root,
+            args.build_dir)
+        ok &= check_tty(device, fixer, "manipulator.uart_device")
+        if mobile_base_enabled:
+            ok &= check_chassis_driver_registered(
+                sdk_root, mobile_base_driver)
+        if mobile_base_is_uart:
+            ok &= check_tty(
+                mobile_base_device, fixer, "mobile_base.dev_path")
+        elif mobile_base_enabled and mobile_base_driver == "drv_rpmsg_esos":
+            ok &= check_rpmsg_device(
+                mobile_base.get("ctrl_dev", "/dev/rpmsg_ctrl0"),
+                mobile_base.get("data_dev", "/dev/rpmsg0"),
+                fixer)
+        ok &= check_video_permissions(fixer)
     if camera_type == "spacemit_las2":
         ok &= check_las2_camera(camera, sdk_root)
         ok &= check_las2_detector_provider(root, args.config)
-    else:
+    elif camera_type == "realsense":
         ok &= check_realsense_camera()
-    ok &= check_kinematics_backend(sdk_root)
+    if camera_type not in ("mujoco", "remote_mujoco"):
+        ok &= check_kinematics_backend(sdk_root)
 
     if not args.skip_voice:
         required_modules = [
@@ -1032,7 +1201,8 @@ def main() -> int:
                 if not imported:
                     missing_modules.append(module)
         ok &= imports_ok
-        ok &= check_voice_echo_cancellation(root)
+        ok &= check_voice_asr_backend(root)
+        ok &= check_voice_echo_cancellation(root, args.build_dir)
         ok &= check_audio_permissions(fixer)
         ok &= list_audio_devices()
 

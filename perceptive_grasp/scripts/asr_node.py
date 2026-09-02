@@ -13,6 +13,12 @@ import signal
 import sys
 import threading
 
+from asr_backend import (
+    create_asr_engine,
+    normalize_asr_backend,
+    select_capture_channel,
+)
+
 
 def import_ros2_or_exit():
     try:
@@ -123,10 +129,15 @@ def main():
     )
     parser.add_argument("-r", "--rate", type=int, default=None, help="采集采样率")
     parser.add_argument("-c", "--channels", type=int, default=None, help="采集声道数")
+    parser.add_argument("--channel-index", type=int, choices=[0, 1],
+                        default=None, help="双声道录音中送入 asr 的物理声道")
     parser.add_argument("-t", "--topic", default=None, help="ROS2 std_msgs/String 发布话题")
     parser.add_argument("--vad-trigger-threshold", type=float, default=None)
     parser.add_argument("--vad-stop-threshold", type=float, default=None)
     parser.add_argument("--vad-min-speech-duration-ms", type=int, default=None)
+    parser.add_argument(
+        "--asr-backend", choices=("sensevoice", "qwen3_asr"),
+        default=None, help="覆盖 voice.asr.backend")
     parser.add_argument("-l", "--list-devices", action="store_true", help="列出音频设备")
     args = parser.parse_args()
 
@@ -135,10 +146,17 @@ def main():
     if args.config:
         voice_cfg = load_voice_config(args.config)
         asr_cfg = voice_cfg.get("asr", {}) or {}
+    if args.asr_backend is not None:
+        asr_cfg = dict(asr_cfg)
+        asr_cfg["backend"] = normalize_asr_backend(args.asr_backend)
 
     device = args.device if args.device is not None else int(asr_cfg.get("device", -1))
     rate = args.rate if args.rate is not None else int(asr_cfg.get("rate", 16000))
     channels = args.channels if args.channels is not None else int(asr_cfg.get("channels", 2))
+    channel_index = (
+        args.channel_index if args.channel_index is not None
+        else int(asr_cfg.get("channel_index", -1))
+    )
     topic = args.topic if args.topic is not None else voice_cfg.get("input_topic", "asr_text")
     vad_trigger_threshold = (
         args.vad_trigger_threshold if args.vad_trigger_threshold is not None
@@ -201,16 +219,18 @@ def main():
         vad = spacemit_vad.VadEngine(vad_config)
         print(f"VAD initialized: {vad.engine_name}")
 
-        asr_config = spacemit_asr.Config()
-        asr_config.provider = "cpu"
-        asr_config._config.num_threads = 4
-        asr_config.language = spacemit_asr.Language.ZH
-        asr_config.punctuation = True
-        asr = spacemit_asr.Engine(asr_config).initialize()
+        sensevoice_cfg = asr_cfg.get("sensevoice", {}) or {}
+        asr_threads = int(sensevoice_cfg.get("num_threads", 4))
+        asr, warmup_required, _ = create_asr_engine(
+            spacemit_asr, asr_cfg, asr_threads, []
+        )
         print(f"ASR initialized: {asr.backend_name}")
 
-        asr.recognize(np.zeros(16000, dtype=np.float32))
-        print("ASR warmup done")
+        if warmup_required:
+            asr.recognize(np.zeros(16000, dtype=np.float32))
+            print("ASR warmup done")
+        else:
+            print("ASR endpoint ready")
         if not running.is_set():
             return
 
@@ -234,8 +254,9 @@ def main():
             try:
                 samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
-                if channels > 1:
-                    samples = samples.reshape(-1, channels).mean(axis=1)
+                samples = select_capture_channel(
+                    samples, channels, channel_index
+                )
 
                 if resampler is not None:
                     samples = resampler.process(samples)
@@ -279,6 +300,9 @@ def main():
 
                     speech_buffer.clear()
                     state["in_speech"] = False
+                    reset_vad = getattr(vad, "reset", None)
+                    if callable(reset_vad):
+                        reset_vad()
 
                     dur = len(audio) / target_rate
                     print(f"\r[VAD] 语音结束 ({dur:.1f}s), 队列={audio_queue.qsize()+1}", flush=True)
@@ -311,7 +335,11 @@ def main():
         if not running.is_set():
             return
 
-        print(f"正在监听 (device={device}, {rate}Hz, {channels}ch, topic={topic})... Ctrl+C 退出")
+        selected = "average" if channel_index < 0 else str(channel_index)
+        print(
+            f"正在监听 (device={device}, {rate}Hz, {channels}ch, "
+            f"channel={selected}, topic={topic})... Ctrl+C 退出"
+        )
 
         while running.is_set():
             try:

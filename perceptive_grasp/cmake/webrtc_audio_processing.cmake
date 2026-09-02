@@ -26,12 +26,14 @@ ExternalProject_Add(webrtc_audio_processing_project
     BUILD_COMMAND "${NINJA_EXECUTABLE}" -C <BINARY_DIR>
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS
-        "${WEBRTC_BINARY_DIR}/webrtc/modules/audio_processing/libwebrtc-audio-processing-2.so"
         "${WEBRTC_BINARY_DIR}/webrtc/modules/audio_processing/libwebrtc-audio-processing-2.so.1"
 )
 
+# Link the versioned Meson output directly. CMake's clean target may remove
+# Meson's unversioned symlink without making Ninja recreate it, which made a
+# clean K3 rebuild fail even though the actual shared library was present.
 set(WEBRTC_LIBRARY
-    "${WEBRTC_BINARY_DIR}/webrtc/modules/audio_processing/libwebrtc-audio-processing-2.so")
+    "${WEBRTC_BINARY_DIR}/webrtc/modules/audio_processing/libwebrtc-audio-processing-2.so.1")
 set(WEBRTC_RUNTIME_LIBRARY
     "${WEBRTC_BINARY_DIR}/webrtc/modules/audio_processing/libwebrtc-audio-processing-2.so.1")
 set(ABSEIL_INCLUDE_DIR

@@ -51,10 +51,10 @@ MobileBaseAlignmentConfig TestConfig() {
     return config;
 }
 
-void TestDefaultComfortRangeIsTightForLinkseeArm() {
+void TestDefaultComfortRangeMatchesLinkseeChassisPrecision() {
     const MobileBaseAlignmentConfig config;
     assert(Near(config.target_x, 0.275f));
-    assert(Near(config.x_tolerance, 0.025f));
+    assert(Near(config.x_tolerance, 0.050f));
     assert(Near(config.x_hysteresis, 0.005f));
     assert(Near(config.yaw_gain, 8.0f));
     assert(config.min_cmd_duration_ms == 350);
@@ -67,6 +67,7 @@ void TestDefaultComfortRangeIsTightForLinkseeArm() {
     assert(Near(config.odom_min_rotation_rad, 0.010f));
     assert(Near(config.odom_min_command_ratio, 0.05f));
     assert(config.max_direction_reversals == 1);
+    assert(config.max_align_attempts == 2);
 }
 
 void TestLongitudinalNoiseDoesNotTriggerMinimumDrivePulse() {
@@ -120,7 +121,7 @@ void TestDriveBackwardWhenTargetIsTooClose() {
     assert(command.type == MobileBaseAlignmentCommand::Type::DRIVE);
     assert(Near(command.linear_x, -config.linear_speed));
     assert(Near(command.angular_z, 0.0f));
-    assert(NearMs(command.duration_ms, 600));
+    assert(NearMs(command.duration_ms, 350));
 }
 
 void TestShortDriveStaysAboveLinkseeMotorDeadZone() {
@@ -140,6 +141,18 @@ void TestShortDriveStaysAboveLinkseeMotorDeadZone() {
         static_cast<float>(command.duration_ms) / 1000.0f;
     assert(commanded_distance >= 0.050f);
     assert(commanded_distance <= 0.055f);
+}
+
+void TestDriveCorrectsOnlyToComfortBoundary() {
+    auto config = TestConfig();
+    config.min_cmd_duration_ms = 200;
+    const float base_point[3] = {0.36f, 0.0f, 0.05f};
+
+    const auto command = PlanMobileBaseAlignment(config, base_point, 0);
+
+    assert(command.type == MobileBaseAlignmentCommand::Type::DRIVE);
+    assert(Near(command.linear_x, 0.15f));
+    assert(command.duration_ms == 200);
 }
 
 void TestRotateCounterClockwiseWhenTargetIsLeft() {
@@ -416,13 +429,14 @@ void TestDetectsRepeatedAxisDirectionReversal() {
 }  // namespace
 
 int main() {
-    TestDefaultComfortRangeIsTightForLinkseeArm();
+    TestDefaultComfortRangeMatchesLinkseeChassisPrecision();
     TestNoMotionWhenTargetIsComfortable();
     TestLongitudinalNoiseDoesNotTriggerMinimumDrivePulse();
     TestNoMotionForReachableSmallLateralOffset();
     TestDriveForwardWhenTargetIsTooFar();
     TestDriveBackwardWhenTargetIsTooClose();
     TestShortDriveStaysAboveLinkseeMotorDeadZone();
+    TestDriveCorrectsOnlyToComfortBoundary();
     TestRotateCounterClockwiseWhenTargetIsLeft();
     TestRotateClockwiseWhenTargetIsRight();
     TestRotationUsesMinimumAngleForCurrentTargetGeometry();

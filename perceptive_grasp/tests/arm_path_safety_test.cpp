@@ -255,9 +255,9 @@ int main() {
     const std::vector<std::vector<float>> production_poses = {
         {1.550f, -1.620f, 1.420f, 1.147f, 0.189f},
         {1.550f, 0.050f, -0.217f, 1.606f, 0.015f},
-        {1.550f, 0.021f, 1.490f, -1.700f, -0.036f},
+        {1.550f, 0.021f, 1.400f, -1.700f, -0.036f},
         {-1.480f, 0.087f, -0.140f, 1.389f, 0.033f},
-        {1.547f, -1.630f, 1.527f, 1.145f, 0.186f},
+        {1.547f, -1.630f, 1.400f, 1.145f, 0.186f},
     };
     for (size_t index = 0; index < production_poses.size(); ++index) {
         const ArmPathSafetyResult production_result =

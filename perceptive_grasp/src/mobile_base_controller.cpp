@@ -124,7 +124,12 @@ MobileBaseAlignmentCommand PlanMobileBaseAlignment(
     }
 
     if (std::fabs(x_error) > x_limit) {
-        const float step_m = std::min(std::fabs(x_error), config.max_step_m);
+        // Move only far enough to enter the comfortable range. Driving the
+        // full error unnecessarily crosses the target when a minimum motor
+        // pulse is longer than the remaining correction.
+        const float correction_m = std::max(
+            0.0f, std::fabs(x_error) - x_limit);
+        const float step_m = std::min(correction_m, config.max_step_m);
         command.type = MobileBaseAlignmentCommand::Type::DRIVE;
         command.angular_z = 0.0f;
         command.duration_ms = ClampDurationMs(

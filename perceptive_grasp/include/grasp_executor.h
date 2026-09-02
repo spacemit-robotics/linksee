@@ -1,10 +1,10 @@
 /*
-    * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
-    * SPDX-License-Identifier: Apache-2.0
-    *
-    * @file grasp_executor.h
-    * @brief 抓取执行模块 - 机械臂 + 夹爪协调控制
-    */
+ * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * @file grasp_executor.h
+ * @brief 抓取执行模块 - 机械臂 + 夹爪协调控制
+ */
 
 #ifndef GRASP_EXECUTOR_H
 #define GRASP_EXECUTOR_H
@@ -147,6 +147,9 @@ struct ExecutorConfig {
     float path_joint_step_rad = 0.040f;
     float side_waypoint_joint_tolerance_rad = 0.040f;
     float place_joint_tolerance_rad = 0.080f;
+    // True selects the SO101 fixed-jaw top-path solver. False selects the
+    // fixed-yaw refinement used by simulation executors.
+    bool legacy_top_ik = true;
 
     // 夹爪
     float gripper_open = 0.5f;
@@ -158,13 +161,13 @@ struct ExecutorConfig {
 
     // 预定义姿态
     std::vector<float> home_joints = {
-        1.546f, -1.765f, 1.563f, 1.093f, 0.186f};
+        1.546f, -1.765f, 1.400f, 1.093f, 0.186f};
     std::vector<float> observe_joints = {
         1.544f, -0.067f, 0.101f, 1.382f, 0.188f};
     std::vector<float> side_ready_joints = {
-        1.550f, 0.021f, 1.490f, -1.700f, -0.036f};
+        1.550f, 0.021f, 1.400f, -1.700f, -0.036f};
     std::vector<float> place_joints = {
-        -1.669f, -0.122f, 0.101f, 1.383f, 0.188f};
+        -1.500f, -0.122f, 0.101f, 1.383f, 0.330f};
 
     // 阶段间等待时间
     TimingConfig timing;
@@ -176,9 +179,9 @@ struct ExecutorConfig {
 
     // Calibrated servo limits, kept inside the persistent register limits.
     std::vector<JointConstraint> joint_limits = {
-        {0, -1.700f, 1.630f},
+        {0, -1.540f, 1.630f},
         {1, -1.770f, 1.680f},
-        {2, -1.840f, 1.570f},
+        {2, -1.840f, 1.430f},
         {3, -1.790f, 1.670f},
         {4, -2.700f, 2.800f},
     };
@@ -195,6 +198,48 @@ struct ExecutorConfig {
 
     // 性能日志
     bool performance_log_enabled = false;
+
+    struct MujocoConfig {
+        std::string xml_path;
+        std::string end_effector_site = "pinch";
+        std::string gripper_actuator = "fingers_actuator";
+        std::string robot_root_body = "ur5e_base";
+        std::string gripper_root_body = "2f85_base";
+        std::vector<std::string> joint_names = {
+            "shoulder_pan_joint",
+            "shoulder_lift_joint",
+            "elbow_joint",
+            "wrist_1_joint",
+            "wrist_2_joint",
+            "wrist_3_joint",
+        };
+        std::vector<std::string> actuator_names = {
+            "shoulder_pan",
+            "shoulder_lift",
+            "elbow",
+            "wrist_1",
+            "wrist_2",
+            "wrist_3",
+        };
+        float gripper_open_ctrl = 0.0f;
+        float gripper_close_ctrl = 255.0f;
+        bool gravity_compensation = true;
+        float arm_stiffness_scale = 1.0f;
+        float joint_tolerance_rad = 0.015f;
+        float ik_position_tolerance_m = 0.006f;
+        float cartesian_tracking_tolerance_m = 0.002f;
+        float ik_step_scale = 0.65f;
+        float ik_damping = 0.035f;
+        int ik_iterations = 120;
+        int settle_steps = 250;
+        int max_motion_steps = 2500;
+    } mujoco;
+
+    struct RemoteMujocoConfig {
+        std::string host = "127.0.0.1";
+        int port = 9090;
+        int timeout_ms = 15000;
+    } remote_mujoco;
 };
 
 /**
@@ -222,6 +267,10 @@ public:
     // Non-copyable
     GraspExecutor(const GraspExecutor&) = delete;
     GraspExecutor& operator=(const GraspExecutor&) = delete;
+
+    virtual void SetTargetLabel(const std::string& target_label) {
+        (void)target_label;
+    }
 
 #ifdef MOCK_EXECUTOR
     virtual bool Init() = 0;
@@ -388,7 +437,9 @@ private:
         std::vector<float>& joints,
         const std::vector<float>* seed_joints = nullptr,
         int timeout_ms = -1,
-        std::function<bool(std::vector<float>&)> candidate_validator = {});
+        std::function<bool(std::vector<float>&)> candidate_validator = {},
+        float position_weight = 1.0f,
+        float ik_epsilon = 1e-3f);
     GraspResult PlanTopJointPath(
         const std::vector<Pose3D>& poses,
         float grasp_yaw_rad,
@@ -396,6 +447,13 @@ private:
         std::vector<std::vector<float>>& joint_path,
         std::string* detail,
         const std::vector<float>* start_joints = nullptr);
+    GraspResult PlanTopJointPathLegacy(
+        const std::vector<Pose3D>& poses,
+        float grasp_yaw_rad,
+        int timeout_ms,
+        std::vector<std::vector<float>>& joint_path,
+        std::string* detail,
+        const std::vector<float>* start_joints);
     GraspResult MoveAlongValidatedTopPath(
         const Pose3D& target_pose,
         float speed,
@@ -407,6 +465,14 @@ private:
         std::vector<float>& joints,
         std::string* detail,
         bool record_diagnostics);
+    GraspResult SolveTopIKWithWristYaw(
+        const Pose3D& pose,
+        float grasp_yaw_rad,
+        std::vector<float>& joints,
+        const std::vector<float>* seed_joints,
+        int timeout_ms,
+        std::function<bool(std::vector<float>&)> candidate_validator,
+        std::string* detail);
     GraspResult SolveIKSide(const Pose3D& pose,
                             int timeout_ms,
                             std::vector<float>& joints,

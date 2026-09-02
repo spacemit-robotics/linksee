@@ -149,6 +149,13 @@ class CameraBackendSourceTest(unittest.TestCase):
         )
         self.assertIn("UnsupportedSpacemitLas2Camera", self.camera_factory)
 
+    def test_x86_standalone_build_does_not_require_camera_sdk(self):
+        self.assertIn(
+            "NOT HAVE_MUJOCO_CAMERA AND NOT HAVE_REMOTE_MUJOCO_CAMERA AND\n"
+            "   NOT X86_STANDALONE",
+            self.cmake,
+        )
+
     def test_build_includes_camera_factory_and_optional_las2(self):
         self.assertIn("src/stereo_camera.cpp", self.cmake)
         self.assertIn("find_package(realsense2 QUIET", self.cmake)
@@ -205,11 +212,15 @@ class CameraBackendSourceTest(unittest.TestCase):
 
     def test_debug_view_builds_with_any_camera_backend(self):
         self.assertIn(
-            "if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA)",
+            "if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA OR "
+            "HAVE_MUJOCO_CAMERA OR",
             self.cmake,
         )
+        self.assertIn("HAVE_REMOTE_MUJOCO_CAMERA)", self.cmake)
         self.assertIn("src/stereo_camera.cpp", self.cmake)
         self.assertIn("src/las2_stereo_camera.cpp", self.cmake)
+        self.assertIn("src/mujoco_stereo_camera.cpp", self.cmake)
+        self.assertIn("src/remote_mujoco_camera.cpp", self.cmake)
         self.assertIn("target_link_libraries(debug_view PRIVATE", self.cmake)
 
     def test_las2_backend_uses_aligned_rgb_depth_api(self):

@@ -41,7 +41,7 @@ struct MobileBaseAlignmentConfig {
     bool feedback_enable = true;
 
     float target_x = 0.275f;
-    float x_tolerance = 0.025f;
+    float x_tolerance = 0.050f;
     float x_hysteresis = 0.005f;
     float y_tolerance = 0.15f;
     float y_hysteresis = 0.025f;
@@ -54,7 +54,7 @@ struct MobileBaseAlignmentConfig {
     int min_rotation_duration_ms = 1000;
     int max_cmd_duration_ms = 2000;
     int settle_ms = 500;
-    int max_align_attempts = 6;
+    int max_align_attempts = 2;
     float min_progress_m = 0.02f;
     float min_progress_ratio = 0.15f;
     float min_progress_floor_m = 0.003f;

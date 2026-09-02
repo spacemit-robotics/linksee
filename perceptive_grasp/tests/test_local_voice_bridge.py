@@ -6,11 +6,13 @@
 
 """Tests for the non-ROS local voice bridge helpers."""
 
-import unittest
 import contextlib
+import inspect
 import io
 import queue
+import tempfile
 import threading
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -39,6 +41,70 @@ class FakeProc:
 
 
 class LocalVoiceBridgeTest(unittest.TestCase):
+    def test_audio_epoch_invalidates_previous_command_period(self):
+        epoch = local_voice_bridge.AudioEpoch()
+        self.assertEqual(epoch.current(), 0)
+        self.assertEqual(epoch.advance(), 1)
+        self.assertEqual(epoch.current(), 1)
+
+    def test_audio_device_name_resolves_current_index(self):
+        devices = [
+            (1, "Rapoo Camera: USB Audio (hw:1,0)"),
+            (2, "2K USB Camera: Audio (hw:2,0)"),
+        ]
+        self.assertEqual(
+            local_voice_bridge.resolve_audio_device(
+                -1, "Rapoo Camera", lambda: devices, "capture"
+            ),
+            1,
+        )
+
+    def test_audio_device_name_must_be_unambiguous(self):
+        devices = [(1, "USB Audio A"), (2, "USB Audio B")]
+        with self.assertRaisesRegex(RuntimeError, "ambiguous"):
+            local_voice_bridge.resolve_audio_device(
+                -1, "USB Audio", lambda: devices, "capture"
+            )
+
+    def test_asr_loop_rearms_vad_after_every_completed_utterance(self):
+        source = inspect.getsource(local_voice_bridge.run_asr_loop)
+        finish_start = source.index("    def finish_speech(reason=None):")
+        finish_end = source.index("    def is_playback_active():")
+        finish_source = source[finish_start:finish_end]
+
+        normal_reset = finish_source.rfind("reset_vad_state()")
+        self.assertGreater(normal_reset, finish_source.index("duration ="))
+        self.assertLess(normal_reset, finish_source.index("audio_queue.put"))
+
+    def test_pipeline_ready_forces_rearm_during_active_speech(self):
+        source = inspect.getsource(local_voice_bridge.run_asr_loop)
+        requested_start = source.index("        requested_rearm = (")
+        requested_end = source.index(
+            "        if path_rearm or requested_rearm:", requested_start
+        )
+        requested_source = source[requested_start:requested_end]
+        self.assertNotIn('not state["in_speech"]', requested_source)
+
+        rearm_end = source.index(
+            '        state["vad_audio_path"] = selected_path',
+            requested_end,
+        )
+        rearm_source = source[requested_end:rearm_end]
+        self.assertIn("reset_speech_segment()", rearm_source)
+        self.assertIn("clear_pending_audio()", rearm_source)
+
+    def test_voice_bridge_lock_rejects_second_instance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / "voice.lock"
+            first = local_voice_bridge.acquire_voice_bridge_lock(lock_path)
+            self.assertIsNotNone(first)
+            self.assertIsNone(local_voice_bridge.acquire_voice_bridge_lock(lock_path))
+
+            first.close()
+            third = local_voice_bridge.acquire_voice_bridge_lock(lock_path)
+            self.assertIsNotNone(third)
+            third.close()
+
     def test_build_grasp_command_uses_local_voice_transport(self):
         cmd = local_voice_bridge.build_grasp_command(
             binary="build/perceptive_grasp",
@@ -52,6 +118,23 @@ class LocalVoiceBridgeTest(unittest.TestCase):
         self.assertIn("--config", cmd)
         self.assertIn("config/grasp_pipeline.yaml", cmd)
         self.assertEqual(cmd[-1], "--step")
+
+    def test_remote_endpoint_is_forwarded_to_pipeline(self):
+        cmd = local_voice_bridge.build_grasp_command(
+            binary="build/perceptive_grasp",
+            config="config/remote.yaml",
+            extra_args=["--remote-host", "10.0.91.182", "--remote-port", "9090"],
+        )
+
+        self.assertEqual(
+            cmd[-4:],
+            [
+                "--remote-host",
+                "10.0.91.182",
+                "--remote-port",
+                "9090",
+            ],
+        )
 
     def test_extract_status_event_accepts_only_prefixed_lines(self):
         event = "state=DONE;message=Task completed!;reason=success"
@@ -78,14 +161,59 @@ class LocalVoiceBridgeTest(unittest.TestCase):
 
     def test_extract_status_event_rejects_corrupted_payload(self):
         line = (
-            f"{local_voice_bridge.STATUS_PREFIX}"
-            "[CHASSIS-UART-DIFF] RX thread started"
+            f"{local_voice_bridge.STATUS_PREFIX}[CHASSIS-UART-DIFF] RX thread started"
         )
 
         self.assertIsNone(local_voice_bridge.extract_status_event(line))
 
     def test_default_asr_channels_match_mono_usb_microphone(self):
         self.assertEqual(local_voice_bridge.default_asr_channels({}), 1)
+
+    def test_remote_config_matches_mono_usb_microphone(self):
+        config = yaml.safe_load(
+            (ROOT / "config" / "grasp_pipeline_remote_mujoco_ur5e.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        asr = config["voice"]["asr"]
+        self.assertEqual(asr["device_name"], "2K USB Camera")
+        self.assertEqual(asr["channels"], 1)
+        self.assertEqual(asr["channel_index"], -1)
+        tts = config["voice"]["tts"]
+        self.assertEqual(tts["playback_device"], 1)
+        self.assertEqual(tts["playback_device_name"], "2K USB Camera")
+
+    def test_asr_debug_audio_is_mono_16k_pcm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = local_voice_bridge.save_asr_audio_segment(
+                directory,
+                3,
+                np.array([-1.0, 0.0, 1.0], dtype=np.float32),
+            )
+            import wave
+
+            with wave.open(str(path), "rb") as source:
+                self.assertEqual(source.getnchannels(), 1)
+                self.assertEqual(source.getframerate(), 16000)
+                self.assertEqual(source.getsampwidth(), 2)
+                self.assertEqual(source.getnframes(), 3)
+
+    def test_asr_hotwords_include_configured_command_phrases(self):
+        hotwords = local_voice_bridge.build_asr_hotwords(
+            {
+                "trigger_words": ["抓", "pick"],
+                "cancel_words": ["停止"],
+                "home_words": ["回家"],
+                "target_aliases": {"香蕉": "banana", "杯子": "cup"},
+            }
+        )
+
+        self.assertIn("抓香蕉", hotwords)
+        self.assertIn("抓杯子", hotwords)
+        self.assertIn("香蕉", hotwords)
+        self.assertIn("停止", hotwords)
+        self.assertNotIn("pick香蕉", hotwords)
+        self.assertEqual(len(hotwords), len(set(hotwords)))
 
     def test_capture_hw_name_is_parsed_from_device_list(self):
         devices = [
@@ -126,6 +254,29 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         self.assertEqual(
             local_voice_bridge.candidate_capture_rates(16000),
             [16000, 48000, 44100, 32000, 8000],
+        )
+
+    def test_capture_mixer_targets_selected_hw_card(self):
+        commands = []
+
+        def fake_runner(command, *args, **kwargs):
+            del args, kwargs
+            commands.append(command)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        result = local_voice_bridge.configure_capture_mixer(
+            1,
+            60,
+            lambda: [(1, "Rapoo Camera: USB Audio (hw:3,0)")],
+            fake_runner,
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(
+            commands,
+            [
+                ["amixer", "-c", "3", "sset", "Mic", "60%", "cap"],
+            ],
         )
 
     def test_spacemit_capture_rate_probe_uses_audio_capture_start_result(self):
@@ -234,7 +385,7 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         self.assertEqual((rate, channels), (16000, 1))
         self.assertEqual(FakeAudio.probed_formats, [(16000, 1)])
 
-    def test_pipeline_config_uses_mono_asr_input(self):
+    def test_pipeline_config_preserves_validated_mono_sensevoice_default(self):
         config_path = ROOT / "config" / "grasp_pipeline.yaml"
         with config_path.open("r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
@@ -242,17 +393,31 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         self.assertEqual(
             set(config["voice"]["asr"].keys()),
             {
+                "backend",
                 "device",
                 "rate",
                 "channels",
+                "channel_index",
+                "mixer_volume",
+                "sensevoice",
+                "qwen3_asr",
                 "vad_trigger_threshold",
                 "vad_stop_threshold",
                 "vad_min_speech_duration_ms",
+                "vad_endpoint_hold_ms",
+                "vad_max_speech_duration_ms",
             },
         )
         self.assertEqual(config["voice"]["asr"]["device"], 1)
         self.assertEqual(config["voice"]["asr"]["rate"], 16000)
         self.assertEqual(config["voice"]["asr"]["channels"], 1)
+        self.assertEqual(config["voice"]["asr"]["channel_index"], -1)
+        self.assertEqual(config["voice"]["asr"]["mixer_volume"], 40)
+        self.assertEqual(config["voice"]["asr"]["backend"], "sensevoice")
+        self.assertEqual(config["voice"]["asr"]["sensevoice"]["provider"], "cpu")
+        self.assertEqual(config["voice"]["asr"]["qwen3_asr"]["model"], "qwen3-asr")
+        self.assertEqual(config["voice"]["asr"]["vad_endpoint_hold_ms"], 600)
+        self.assertEqual(config["voice"]["asr"]["vad_max_speech_duration_ms"], 4000)
 
     def test_pipeline_config_enables_local_tts_on_usb_audio_output(self):
         config_path = ROOT / "config" / "grasp_pipeline.yaml"
@@ -310,23 +475,31 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         self.assertTrue(echo_config["noise_suppression"])
 
     def test_echo_cancellation_mode_is_validated(self):
-        mode, config = local_voice_bridge.load_echo_cancellation_config({
-            "echo_cancellation": {"mode": "hardware_aec"},
-        })
+        mode, config = local_voice_bridge.load_echo_cancellation_config(
+            {
+                "echo_cancellation": {"mode": "hardware_aec"},
+            }
+        )
 
         self.assertEqual(mode, "hardware_aec")
         self.assertEqual(config["mode"], "hardware_aec")
         with self.assertRaises(ValueError):
-            local_voice_bridge.load_echo_cancellation_config({
-                "echo_cancellation": {"mode": "unknown"},
-            })
+            local_voice_bridge.load_echo_cancellation_config(
+                {
+                    "echo_cancellation": {"mode": "unknown"},
+                }
+            )
 
     def test_voice_aec_library_uses_loader_discovery(self):
-        with mock.patch.object(Path, "is_file", return_value=False), \
-                mock.patch.object(
-                    local_voice_bridge.ctypes.util,
-                    "find_library",
-                    return_value="libperceptive_voice_aec.so"):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(Path, "is_file", return_value=False)
+            )
+            stack.enter_context(mock.patch.object(
+                local_voice_bridge.ctypes.util,
+                "find_library",
+                return_value="libperceptive_voice_aec.so",
+            ))
             library = local_voice_bridge.find_voice_aec_library(
                 "build/perceptive_grasp",
                 environ={},
@@ -371,6 +544,71 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
             ),
             tail_until,
         )
+
+    def test_vad_rearms_when_idle_audio_path_changes(self):
+        self.assertTrue(
+            local_voice_bridge.should_rearm_vad_for_audio_path("aec", "raw", False)
+        )
+        self.assertFalse(
+            local_voice_bridge.should_rearm_vad_for_audio_path("aec", "raw", True)
+        )
+        self.assertFalse(
+            local_voice_bridge.should_rearm_vad_for_audio_path("raw", "raw", False)
+        )
+
+    def test_active_utterance_keeps_its_audio_path(self):
+        raw = np.full(160, 0.25, dtype=np.float32)
+        aec = np.full(160, 0.50, dtype=np.float32)
+
+        samples, path = local_voice_bridge.select_speech_samples(
+            False, raw, aec, prefer_aec=False
+        )
+        self.assertEqual(path, "raw")
+        np.testing.assert_array_equal(samples, raw)
+
+        samples, path = local_voice_bridge.select_speech_samples(
+            True, raw, aec, current_path="aec", prefer_aec=False
+        )
+        self.assertEqual(path, "aec")
+        np.testing.assert_array_equal(samples, aec)
+
+        samples, path = local_voice_bridge.select_speech_samples(
+            False, raw, aec, prefer_aec=True
+        )
+        self.assertEqual(path, "aec")
+        np.testing.assert_array_equal(samples, aec)
+
+    def test_repeated_vad_start_does_not_restart_active_utterance(self):
+        start = SimpleNamespace(is_speech_start=True, is_speech_end=False)
+        end = SimpleNamespace(is_speech_start=False, is_speech_end=True)
+
+        self.assertEqual(local_voice_bridge.classify_vad_event(False, start), "start")
+        self.assertEqual(local_voice_bridge.classify_vad_event(True, start), "append")
+        self.assertEqual(local_voice_bridge.classify_vad_event(True, None), "append")
+        self.assertEqual(local_voice_bridge.classify_vad_event(True, end), "finish")
+
+    def test_vad_endpoint_hold_merges_short_pause(self):
+        start = SimpleNamespace(is_speech_start=True, is_speech_end=False)
+        weak_start = SimpleNamespace(
+            is_speech_start=True,
+            is_speech_end=False,
+            probability=0.15,
+        )
+        end = SimpleNamespace(is_speech_start=False, is_speech_end=True)
+        neutral = SimpleNamespace(is_speech_start=False, is_speech_end=False)
+
+        pending = local_voice_bridge.update_vad_endpoint_hold(True, end, 0, 640)
+        self.assertEqual(pending, 640)
+        pending = local_voice_bridge.update_vad_endpoint_hold(
+            True, neutral, pending, 640
+        )
+        self.assertEqual(pending, 1280)
+        pending = local_voice_bridge.update_vad_endpoint_hold(
+            True, weak_start, pending, 640, resume_threshold=0.3
+        )
+        self.assertEqual(pending, 1920)
+        pending = local_voice_bridge.update_vad_endpoint_hold(True, start, pending, 640)
+        self.assertEqual(pending, 0)
 
     def test_asr_capture_start_failure_releases_asr_and_aec(self):
         class FakeVadConfig:
@@ -462,29 +700,36 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         running = threading.Event()
         running.set()
 
-        with mock.patch.dict(
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(
                 sys.modules,
                 {
                     "spacemit_asr": fake_asr,
                     "spacemit_audio": fake_audio,
                     "spacemit_vad": fake_vad,
-                }), mock.patch.object(
-                    local_voice_bridge,
-                    "load_voice_config",
-                    return_value={
-                        "echo_cancellation": {"mode": "webrtc_aec"},
-                        "asr": {"device": 1, "rate": 16000, "channels": 1},
-                    }), mock.patch.object(
-                        local_voice_bridge,
-                        "resolve_spacemit_capture_format",
-                        return_value=(16000, 1)), mock.patch.object(
-                            local_voice_bridge,
-                            "find_voice_aec_library",
-                            return_value="/tmp/libperceptive_voice_aec.so"), \
-                mock.patch.object(
-                    local_voice_bridge,
-                    "WebRtcAecProcessor",
-                    return_value=fake_aec):
+                },
+            ))
+            stack.enter_context(mock.patch.object(
+                local_voice_bridge,
+                "load_voice_config",
+                return_value={
+                    "echo_cancellation": {"mode": "webrtc_aec"},
+                    "asr": {"device": 1, "rate": 16000, "channels": 1},
+                },
+            ))
+            stack.enter_context(mock.patch.object(
+                local_voice_bridge,
+                "resolve_spacemit_capture_format",
+                return_value=(16000, 1),
+            ))
+            stack.enter_context(mock.patch.object(
+                local_voice_bridge,
+                "find_voice_aec_library",
+                return_value="/tmp/libperceptive_voice_aec.so",
+            ))
+            stack.enter_context(mock.patch.object(
+                local_voice_bridge, "WebRtcAecProcessor", return_value=fake_aec
+            ))
             local_voice_bridge.run_asr_loop(
                 args,
                 FakeProc(),
@@ -535,8 +780,7 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         payload = b"x" * 20000
 
         self.assertTrue(tts_node.write_audio_bytes(player, payload, channels=1))
-        self.assertEqual([len(chunk) for chunk in player.chunks],
-                         [8192, 8192, 3616])
+        self.assertEqual([len(chunk) for chunk in player.chunks], [8192, 8192, 3616])
 
     def test_tts_worker_marks_playback_active_while_audio_is_written(self):
         playback_transitions = []
@@ -611,10 +855,11 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         text_queue.put(None)
         running = threading.Event()
         running.set()
+        playback_startup_complete = threading.Event()
 
         with mock.patch.dict(
-                sys.modules,
-                {"spacemit_audio": fake_audio, "spacemit_tts": fake_tts}):
+            sys.modules, {"spacemit_audio": fake_audio, "spacemit_tts": fake_tts}
+        ):
             tts_node.run_tts_worker(
                 text_queue,
                 running,
@@ -628,10 +873,75 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
                 -1,
                 playback_state,
                 0,
+                None,
+                None,
+                playback_startup_complete,
             )
 
         self.assertEqual(playback_transitions, ["set", "clear", "clear"])
         self.assertFalse(playback_state.active)
+        self.assertTrue(playback_startup_complete.is_set())
+
+    def test_tts_worker_disables_speech_when_player_start_fails(self):
+        class FakePlayer:
+            @staticmethod
+            def list_devices():
+                return []
+
+            def __init__(self, device):
+                del device
+
+            def start(self):
+                return False
+
+        fake_audio = SimpleNamespace(
+            init=lambda **kwargs: None,
+            AudioPlayer=FakePlayer,
+        )
+        synthesize = mock.Mock()
+
+        class FakeTtsConfig:
+            speech_rate = 1.0
+            volume = 80
+
+            @classmethod
+            def preset(cls, preset):
+                del preset
+                return cls()
+
+        fake_tts = SimpleNamespace(
+            Config=FakeTtsConfig,
+            Engine=lambda config: SimpleNamespace(synthesize=synthesize),
+        )
+        text_queue = queue.Queue()
+        text_queue.put("系统已就绪。")
+        text_queue.put(None)
+        running = threading.Event()
+        running.set()
+        startup_complete = threading.Event()
+        completed = []
+
+        with mock.patch.dict(
+            sys.modules, {"spacemit_audio": fake_audio, "spacemit_tts": fake_tts}
+        ):
+            tts_node.run_tts_worker(
+                text_queue,
+                running,
+                "matcha_zh",
+                2,
+                48000,
+                1,
+                1.0,
+                80,
+                False,
+                -1,
+                playback_startup_complete=startup_complete,
+                playback_complete_observer=completed.append,
+            )
+
+        self.assertTrue(startup_complete.is_set())
+        self.assertEqual(completed, ["系统已就绪。"])
+        synthesize.assert_not_called()
 
     def test_status_event_fields_are_parsed(self):
         event = "state=IDLE;message=Ready;target=banana"
@@ -656,6 +966,37 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
             local_voice_bridge.status_to_speech(event, {}, False),
             "系统已就绪。",
         )
+
+    def test_waiting_status_requests_vad_rearm(self):
+        class FakeStdout:
+            def __init__(self):
+                self.lines = [
+                    f"{local_voice_bridge.STATUS_PREFIX}"
+                    "state=IDLE;message=Voice: waiting for next command\n",
+                    "",
+                ]
+
+            def readline(self):
+                return self.lines.pop(0)
+
+        proc = SimpleNamespace(
+            stdout=FakeStdout(),
+            poll=lambda: None,
+            terminate=lambda: None,
+        )
+        running = local_voice_bridge.make_running_event()
+        rearm_requested = threading.Event()
+
+        local_voice_bridge._read_grasp_stdout(
+            proc,
+            queue.Queue(),
+            running,
+            {},
+            False,
+            vad_rearm_requested=rearm_requested,
+        )
+
+        self.assertTrue(rearm_requested.is_set())
 
     def test_home_exit_status_stops_voice_bridge_without_extra_tts(self):
         class FakeStdout:
@@ -686,8 +1027,7 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         text_queue = queue.Queue()
         running = local_voice_bridge.make_running_event()
 
-        local_voice_bridge._read_grasp_stdout(
-            proc, text_queue, running, {}, False)
+        local_voice_bridge._read_grasp_stdout(proc, text_queue, running, {}, False)
 
         self.assertFalse(running.is_set())
         self.assertEqual(proc.terminate_count, 1)
@@ -722,7 +1062,8 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         running = local_voice_bridge.make_running_event()
 
         local_voice_bridge._read_grasp_stdout(
-            FakeProc(), text_queue, running, {"carrot": "胡萝卜"}, False)
+            FakeProc(), text_queue, running, {"carrot": "胡萝卜"}, False
+        )
 
         self.assertEqual(text_queue.get_nowait(), "收到，准备抓取胡萝卜。")
         self.assertTrue(text_queue.empty())
@@ -754,7 +1095,8 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         running = local_voice_bridge.make_running_event()
 
         local_voice_bridge._read_grasp_stdout(
-            FakeProc(), text_queue, running, {}, False)
+            FakeProc(), text_queue, running, {}, False
+        )
 
         self.assertEqual(text_queue.get_nowait(), "抓取完成。")
         self.assertTrue(text_queue.empty())
@@ -780,10 +1122,12 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             local_voice_bridge._read_grasp_stdout(
-                FakeProc(), text_queue, running, {"banana": "香蕉"}, False)
+                FakeProc(), text_queue, running, {"banana": "香蕉"}, False
+            )
 
-        self.assertIn("[VoiceBridge] Queue TTS: 收到，准备抓取香蕉。",
-                      output.getvalue())
+        self.assertIn(
+            "[VoiceBridge] Queue TTS: 收到，准备抓取香蕉。", output.getvalue()
+        )
         self.assertEqual(text_queue.get_nowait(), "收到，准备抓取香蕉。")
 
     def test_initial_detection_status_acknowledges_target(self):
@@ -832,7 +1176,8 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         running = local_voice_bridge.make_running_event()
 
         local_voice_bridge._read_grasp_stdout(
-            FakeProc(), text_queue, running, {}, False, status_queue)
+            FakeProc(), text_queue, running, {}, False, status_queue
+        )
 
         self.assertEqual(
             status_queue.get_nowait(),
@@ -865,10 +1210,7 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         )
 
     def test_observe_return_status_is_spoken(self):
-        event = (
-            "state=HOMING;"
-            "message=Object released, returning to observe position..."
-        )
+        event = "state=HOMING;message=Object released, returning to observe position..."
 
         self.assertEqual(
             local_voice_bridge.status_to_speech(event, {}, False),

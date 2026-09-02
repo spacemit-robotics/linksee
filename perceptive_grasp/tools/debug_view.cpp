@@ -134,6 +134,35 @@ static DebugViewConfig LoadDebugViewConfig(const std::string& config_path) {
             settings.max_depth_m = depth["max_m"].as<float>(
                 settings.max_depth_m);
         }
+    } else if (config.camera.type == "mujoco") {
+        const YAML::Node mujoco = camera["mujoco"];
+        if (!mujoco || !mujoco.IsMap()) {
+            throw std::runtime_error("camera.mujoco configuration is required");
+        }
+        auto& settings = config.camera.mujoco;
+        settings.xml_path = mujoco["xml_path"].as<std::string>(
+            settings.xml_path);
+        settings.camera_name = mujoco["camera_name"].as<std::string>(
+            settings.camera_name);
+        settings.width = mujoco["width"].as<int>(settings.width);
+        settings.height = mujoco["height"].as<int>(settings.height);
+        if (const YAML::Node depth = mujoco["depth"]) {
+            settings.min_depth_m = depth["min_m"].as<float>(
+                settings.min_depth_m);
+            settings.max_depth_m = depth["max_m"].as<float>(
+                settings.max_depth_m);
+        }
+    } else if (config.camera.type == "remote_mujoco") {
+        const YAML::Node remote = camera["remote_mujoco"];
+        if (!remote || !remote.IsMap()) {
+            throw std::runtime_error(
+                "camera.remote_mujoco configuration is required");
+        }
+        auto& settings = config.camera.remote_mujoco;
+        settings.host = remote["host"].as<std::string>(settings.host);
+        settings.port = remote["port"].as<int>(settings.port);
+        settings.timeout_ms =
+            remote["timeout_ms"].as<int>(settings.timeout_ms);
     } else {
         throw std::runtime_error("unsupported camera.type: " +
                                 config.camera.type);
@@ -151,6 +180,7 @@ static DebugViewConfig LoadDebugViewConfig(const std::string& config_path) {
                     &config.camera.spacemit_las2.model_path);
     ResolveConfigPath(config_dir,
                     &config.camera.spacemit_las2.calib_path);
+    ResolveConfigPath(config_dir, &config.camera.mujoco.xml_path);
     ResolveConfigPath(config_dir, &config.detection_config_path);
     return config;
 }
@@ -249,7 +279,9 @@ int main(int argc, char* argv[]) {
     }
     if (warmup_frames < 0) {
         warmup_frames =
-            config.camera.type == "spacemit_las2" ? 1 : 30;
+            (config.camera.type == "spacemit_las2" ||
+                config.camera.type == "mujoco" ||
+                config.camera.type == "remote_mujoco") ? 1 : 30;
     }
 
     // 创建输出目录

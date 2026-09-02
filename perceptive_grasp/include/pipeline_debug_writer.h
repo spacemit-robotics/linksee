@@ -23,6 +23,7 @@ namespace perceptive_grasp {
 
 struct PipelinePlanDebugData {
     cv::Mat color;
+    cv::Mat target_mask;
     std::string target_detected;
     float target_score = 0.0f;
     std::array<float, 4> target_bbox = {};

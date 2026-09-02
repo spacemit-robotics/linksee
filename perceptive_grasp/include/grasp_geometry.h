@@ -43,12 +43,14 @@ struct GraspGeometryConfig {
     float object_max_height_m = 0.25f;
     float footprint_padding_m = 0.005f;
     float gripper_max_width_m = 0.075f;
-    float side_min_height_m = 0.060f;
-    float side_min_height_width_ratio = 1.0f;
+    float side_min_height_m = 0.080f;
+    float side_min_height_width_ratio = 1.2f;
     float side_approach_distance_m = 0.020f;
     float side_entry_clearance_m = 0.030f;
     float side_pregrasp_min_x_m = 0.270f;
+    bool side_single_sided_gripper = true;
     float side_gripper_offset_m = 0.015f;
+    float side_visible_surface_offset_m = 0.0f;
     float side_grasp_forward_offset_m = 0.0f;
     float side_initial_lift_m = 0.050f;
     float side_lift_retreat_m = 0.025f;

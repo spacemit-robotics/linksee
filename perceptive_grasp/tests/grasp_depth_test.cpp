@@ -42,5 +42,17 @@ int main() {
     assert(!perceptive_grasp::SampleMaskedDepthNearPixel(
         empty_depth, mask, 10, 10, 4, &invalid_sample));
 
+    cv::Mat stale_depth(20, 20, CV_16UC1, cv::Scalar(20434));
+    assert(!perceptive_grasp::SampleMaskedDepthNearPixel(
+        stale_depth, mask, 10, 10, 4, &invalid_sample));
+
+    stale_depth.at<uint16_t>(10, 11) = 900;
+    perceptive_grasp::GraspDepthSample recovered_sample;
+    assert(perceptive_grasp::SampleMaskedDepthNearPixel(
+        stale_depth, mask, 10, 10, 4, &recovered_sample));
+    assert(recovered_sample.x == 11);
+    assert(recovered_sample.y == 10);
+    assert(recovered_sample.depth_mm == 900);
+
     return 0;
 }
