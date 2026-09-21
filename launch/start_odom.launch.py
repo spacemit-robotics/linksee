@@ -14,8 +14,6 @@ from launch_ros.actions import Node
 def generate_launch_description():
     pkg_share_dir = get_package_share_directory('linksee')
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
-    resolution = LaunchConfiguration('resolution', default='0.05')
-    publish_period_sec = LaunchConfiguration('publish_period_sec', default='1.0')
     configuration_directory = LaunchConfiguration(
         'configuration_directory',
         default=os.path.join(pkg_share_dir, 'config')
@@ -32,23 +30,8 @@ def generate_launch_description():
         output='screen',
         parameters=[{'use_sim_time': use_sim_time}],
         arguments=['-configuration_directory', configuration_directory,
-                   '-configuration_basename', configuration_basename],
-        remappings=[('map', '/map_cartographer')]
+                   '-configuration_basename', configuration_basename]
         )
-
-    cartographer_occupancy_grid_node = Node(
-        package='cartographer_ros',
-        executable='cartographer_occupancy_grid_node',
-        name='cartographer_occupancy_grid_node',
-        output='screen',
-        parameters=[{'use_sim_time': use_sim_time}],
-        arguments=[
-            '-resolution', resolution,
-            '-publish_period_sec', publish_period_sec,
-        ],
-        remappings=[('map', '/map_cartographer')]
-    )
-
 
     odom_topic_node = Node(
         package='linksee',
@@ -58,7 +41,6 @@ def generate_launch_description():
 
     ld = LaunchDescription()
     ld.add_action(cartographer_node)
-    ld.add_action(cartographer_occupancy_grid_node)
     ld.add_action(odom_topic_node)
 
     return ld
