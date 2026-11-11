@@ -1,6 +1,8 @@
 # 手眼标定
 
-`perceptive_grasp` 使用 eye-to-hand 标定计算 RGB-D 相机坐标系到 Linksee 机械臂基座坐标系的变换。
+`perceptive_grasp` 使用公共标定会话采集 eye-to-hand 数据，计算 RGB-D 相机到机械臂基座的变换。
+采集通过 `manipulation` 读取关节反馈，结果与其他应用共用同一标定格式。
+采集接口已通过模拟设备测试；真实相机采样与实体抓取仍需现场验收，详见[验证范围](../README.md#53-验证范围)。
 
 ## 1. 安装相机和标定板
 
@@ -17,6 +19,7 @@ RGB-D 相机固定在机身上，ChArUco 标定板固定在夹爪末端。如图
 - `config/grasp_pipeline.yaml` 中的 `camera.type` 和相机参数与当前硬件一致。
 - 机械臂串口可访问，机械臂周围没有障碍物。
 - Python 环境已安装 `requirements.txt` 中的依赖。
+- `manipulator.device_plan`、`model` 和 `calibration_resources` 指向本台机械臂的设备配置、模型及舵机校准文件。
 - RGB-D 相机和机械臂基座已经固定，标定完成前不再调整安装位置。
 
 激活环境：
@@ -28,6 +31,7 @@ source ~/.venv-grasp/bin/activate
 ```
 
 标定脚本读取 `camera.type`，支持 RealSense D435i 和 `spacemit_las2` 双目相机。`spacemit_las2` 标定只采集校正后的逻辑左目彩色图，不启动深度推理。
+LAS2 须在 `camera.spacemit_las2.serial` 填写本台相机的序列号或固定资产编号；此字段用于登记设备身份，不自动核验 USB 设备。
 
 ## 3. 生成并打印 ChArUco 标定板
 
@@ -57,30 +61,37 @@ config/charuco_4x5_20mm_14mm.png
 ```bash
 python3 scripts/calibrate_hand_eye.py \
   --config config/grasp_pipeline.yaml \
+  --installation-id linksee_site \
   --charuco-squares-x 4 \
   --charuco-squares-y 5 \
   --charuco-square-length 0.020 \
   --charuco-marker-length 0.014 \
   --num-poses 15 \
-  --dataset-dir "config/hand_eye_datasets/handeye_$(date +%Y%m%d_%H%M%S)"
+  --dataset-dir output/hand_eye
 ```
 
-脚本启动后会关闭机械臂扭矩并进入示教模式。手动将机械臂移动到新的采集姿态，松手并等待机械臂稳定后，按回车采集当前样本。
+采集程序不使能、不关闭扭矩、不发送运动目标。按现场规程调整姿态并停止，退出其他控制程序后输入 `CAPTURE`。
+每次采样独占设备，完成后释放连接。手动调整前须按设备规程支撑机械臂，不能强行拖动带力矩的关节。
+标定板须相对模型末端刚性固定；采集期间不得改变夹爪开度。
+
+`installation-id` 标识固定的机械臂、相机与标定板安装。会话绑定模型、设备配置、校准文件、相机内参和板尺寸，资源变化后须新建数据目录。
+驱动明确报告关节未校准时拒绝采集；驱动不提供参考系确认时，须核实模型和编码器零位后显式追加 `--confirm-joint-reference`，该声明不等于驱动验证。
 
 注意事项：
 
 1. 采集姿态应覆盖工作空间的左、中、右、高、低位置以及不同腕部角度。相邻姿态至少改变两个关节，并保持标定板正面朝向相机。
 2. 标定板应完整位于画面内，marker 边长不得小于 40 px。如果机械臂停止后仍有明显晃动，可增大 `--capture-settle-ms`。
-3. 每次采集后，脚本会输出机械臂末端位置、标定板位置、重投影误差和 marker 尺寸。只有通过质量检查的样本才会写入数据集。
+3. 只有通过质量检查的样本才会写入数据集，记录关节反馈、末端与标定板位姿、重投影误差和 marker 尺寸，并保存采集图像。
 
 ## 5. 求解并写回配置
 
-将 `<dataset>` 替换为采集命令输出的数据集目录：
+使用采集时相同的安装标识和数据目录：
 
 ```bash
 python3 scripts/calibrate_hand_eye.py \
   --solve-only \
-  --dataset-dir config/hand_eye_datasets/<dataset> \
+  --installation-id linksee_site \
+  --dataset-dir output/hand_eye \
   --apply-config config/grasp_pipeline.yaml
 ```
 
@@ -94,7 +105,8 @@ calibration:
       rotation: [roll, pitch, yaw]
 ```
 
-脚本根据数据集中的相机后端更新对应配置块，不会覆盖另一种相机的标定结果。`translation` 的单位为米，`rotation` 的单位为弧度。
+脚本仅导出通过质量要求的结果，根据会话中的相机后端更新对应配置块，并备份原文件。
+`translation` 的单位为米，`rotation` 的单位为弧度。旧数据集仍支持离线重算，不补造设备身份或校准来源。
 
 ## 6. 验证标定结果
 

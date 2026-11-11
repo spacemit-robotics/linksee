@@ -168,20 +168,32 @@ python3 scripts/check_runtime_env.py \
 
 单步模式会在每次真实动作前等待确认。程序完成规划并提示“即将移动到预抓取位”时输入 `n`，可在不执行接近和抓取动作的情况下结束检查，机械臂随后返回 home 位。输入流意外关闭时，程序同样中止任务并执行安全归位。
 
-出现 `out of workspace` 时，先检查手眼标定和目标深度，再核对 `grasp.workspace`。出现 `IK failed` 时，检查 `manipulator.urdf_path`、机械臂当前姿态和目标位姿；不要通过扩大工作空间绕过机械结构限制。
+出现 `out of workspace` 时，先检查手眼标定和目标深度，再核对 `grasp.workspace`。出现 `IK failed` 时，检查 `manipulator.model` 引用的关节链、机械臂当前姿态和目标位姿；不要通过扩大工作空间绕过机械结构限制。
+
+只加载模型和求解器，不连接设备：
+
+```bash
+./build/debug_ik --config config/grasp_pipeline.yaml --check-model
+```
+
+`unknown kinematics backend: pinocchio` 表示公共组件未包含求解器，重新构建 `manipulation` 时开启 `MANIPULATION_ENABLE_KINEMATICS_PINOCCHIO`，再重新构建应用。
+`joint reference is uncalibrated` 表示设备没有匹配的舵机校准文件；不能通过跳过标定采集检查解决。
 
 ## 5. 排查机械臂执行
 
 ### 5.1 读取当前关节角
 
-使用配置文件中的稳定串口路径读取机械臂状态：
+通过设备配置只读获取机械臂关节角：
 
 ```bash
 ./build/read_joints \
-  --device /dev/serial/by-id/usb-1a86_USB_Single_Serial_5A7A057974-if00
+  --plan config/devices/linksee_so101.yaml
 ```
 
-工具输出弧度、角度和可写入 yaml 的关节数组。读取失败时，检查串口是否被其他进程占用，并重新运行环境检查确认机械臂能够响应。
+工具输出弧度关节数组，不使能、不发送目标。读取失败时，检查设备配置、串口权限和控制权交接。
+
+执行中出现反馈故障或超时后，程序请求保持并锁存，后续目标被拒绝。先排除故障、确认现场安全，再重新启动应用；不自动清错或恢复运动。
+真机执行器的 `EmergencyStop()` 请求保持并锁存，不释放力矩，也不替代实体急停。
 
 ### 5.2 验证小范围运动
 

@@ -41,9 +41,14 @@
 #include "vision_service.h"
 #include "vision_result_adapter.h"
 
-extern "C" {
-#include "kinematics_interface.h"
-}
+#include "executor_kinematics.h"
+using perceptive_grasp::ExecutorKinematics;
+using perceptive_grasp::PlanningPose;
+using perceptive_grasp::PlanningJoints;
+using perceptive_grasp::PlanningJointCount;
+using perceptive_grasp::PlanningJointLimits;
+using perceptive_grasp::PlanningInverse;
+using perceptive_grasp::kKinematicsOk;
 
 namespace fs = std::filesystem;
 using perceptive_grasp::ComputeGraspPixel;
@@ -91,6 +96,8 @@ struct DebugGraspAppConfig {
 };
 
 struct IKConfig {
+    std::string model;
+    std::string solver = "pinocchio";
     std::string urdf_path;
     std::string base_link = "base_link";
     std::string tip_link = "gripper_frame_link";
@@ -240,6 +247,10 @@ static IKConfig LoadIkConfig(const std::string& pipeline_config) {
 
     auto m = root["manipulator"];
     if (m) {
+        cfg.model = m["model"].as<std::string>("");
+        if (!cfg.model.empty()) cfg.model =
+            fs::absolute(fs::path(pipeline_config).parent_path() / cfg.model).string();
+        cfg.solver = m["kinematics_solver"].as<std::string>(cfg.solver);
         cfg.urdf_path = m["urdf_path"].as<std::string>(cfg.urdf_path);
         cfg.base_link = m["base_link"].as<std::string>(cfg.base_link);
         cfg.tip_link = m["tip_link"].as<std::string>(cfg.tip_link);
@@ -263,16 +274,15 @@ static std::optional<std::vector<double>> SolveArmIk(const IKConfig& cfg,
         return std::nullopt;
     }
 
-    kin_solver_t* kin = kin_create(nullptr,
-                                    cfg.urdf_path.c_str(),
-                                    cfg.base_link.c_str(),
-                                    cfg.tip_link.c_str());
-    if (!kin) {
-        extra_info = "kin_create failed";
+    std::unique_ptr<ExecutorKinematics> kin;
+    try {
+        kin = std::make_unique<ExecutorKinematics>(cfg.model, cfg.solver);
+    } catch (const std::exception& error) {
+        extra_info = error.what();
         return std::nullopt;
     }
 
-    kin_pose_t target{};
+    PlanningPose target{};
     target.x = pose.x;
     target.y = pose.y;
     target.z = pose.z;
@@ -281,11 +291,10 @@ static std::optional<std::vector<double>> SolveArmIk(const IKConfig& cfg,
     target.qy = pose.qy;
     target.qz = pose.qz;
 
-    kin_joints_t out{};
-    int ret = kin_inverse(kin, &target, nullptr, nullptr, &out);
-    if (ret != KIN_OK) {
+    PlanningJoints out{};
+    int ret = PlanningInverse(kin.get(), &target, nullptr, nullptr, &out);
+    if (ret != kKinematicsOk) {
         extra_info = "kin_inverse failed: " + std::to_string(ret);
-        kin_destroy(kin);
         return std::nullopt;
     }
 
@@ -307,7 +316,6 @@ static std::optional<std::vector<double>> SolveArmIk(const IKConfig& cfg,
         extra_info.clear();
     }
 
-    kin_destroy(kin);
     return arm_joints;
 }
 
@@ -315,23 +323,20 @@ static bool GetJointLimit(const IKConfig& cfg, int joint_index,
                             double& lower, double& upper) {
     if (cfg.urdf_path.empty()) return false;
 
-    kin_solver_t* kin = kin_create(nullptr,
-                                    cfg.urdf_path.c_str(),
-                                    cfg.base_link.c_str(),
-                                    cfg.tip_link.c_str());
-    if (!kin) return false;
+    std::unique_ptr<ExecutorKinematics> kin;
+    try {
+        kin = std::make_unique<ExecutorKinematics>(cfg.model, cfg.solver);
+    } catch (...) { return false; }
 
-    int n_joints = kin_get_num_joints(kin);
+    int n_joints = PlanningJointCount(kin.get());
     if (joint_index < 0 || joint_index >= n_joints) {
-        kin_destroy(kin);
         return false;
     }
 
     std::vector<double> lowers(n_joints), uppers(n_joints);
-    kin_get_joint_limits(kin, lowers.data(), uppers.data());
+    PlanningJointLimits(kin.get(), lowers.data(), uppers.data());
     lower = lowers[joint_index];
     upper = uppers[joint_index];
-    kin_destroy(kin);
     return true;
 }
 

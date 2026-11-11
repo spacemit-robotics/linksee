@@ -9,8 +9,8 @@
 | 运行模式 | 配置 | RGB-D 输入 | 机械臂执行 | 部署方式 |
 |---|---|---|---|---|
 | Linksee 真机 | `config/grasp_pipeline.yaml` | RealSense D435i / `spacemit_las2` | SO101 / Linksee 底盘 | 感知、规划和执行均运行在 Linksee |
-| PC 本地 MuJoCo | `config/grasp_pipeline_mujoco_ur5e.yaml` | MuJoCo realsense | MuJoCo UR5e | 仿真服务和 pipeline 运行在同一台 PC |
-| PC/K3 连接 MuJoCo 服务 | `config/grasp_pipeline_remote_mujoco_ur5e.yaml` | MuJoCo realsense | MuJoCo UR5e | pipeline 运行在 PC 或 K3，与仿真服务分开部署 |
+| 本机 MuJoCo | `config/grasp_pipeline_manipulation_mujoco.yaml` | 模拟 RGB-D 相机 | `manipulation` 仿真驱动 | PC 或 K3 本机显示场景并执行抓取 |
+| 远程 MuJoCo | `config/grasp_pipeline_manipulation_remote.yaml` | 远程模拟 RGB-D 相机 | 远程仿真服务 | PC 显示场景，K3 运行抓取 pipeline |
 
 ## 1. 功能范围
 
@@ -35,7 +35,8 @@
 | 目标检测 | `vision_service` / OpenCV DNN | 运行 YOLOv8-Seg，输出目标类别、检测框和分割掩码 |
 | 任务控制 | `grasp_pipeline` | 组织目标关联、策略锁定、观察或底盘动作后的重感知、机械臂执行和失败恢复 |
 | 抓取规划 | `grasp_planner` / `grasp_geometry` | 估计目标点云和桌面平面，生成并验证顶抓或侧抓候选 |
-| 机械臂执行 | `spacemit_manipulator` / `grasp` / MuJoCo | 控制 Linksee SO101 或 MuJoCo UR5e 机械臂和夹爪 |
+| 机械臂执行 | `manipulation` | 统一控制 Linksee SO101 或仿真机械臂和夹爪 |
+| 手眼标定 | `manipulation` 标定会话 | 采集静止姿态与图像，求解和导出相机外参 |
 | 底盘辅助 | `libchassis` | 调整机器人与目标的相对位置 |
 | 语音交互 | `spacemit_audio` / VAD / ASR / TTS | 接收语音命令并播报任务状态 |
 | MuJoCo 仿真 | `mujoco` / `remote_mujoco` | 在没有真实机械臂时验证感知、规划和执行方案，并提供 Sim2Real 验证环境 |
@@ -44,6 +45,8 @@ MuJoCo 模式复用真机 pipeline 的目标检测、三维估计、抓取规划
 
 ## 3. 准备环境
 
+真机部署按以下顺序准备；仅运行仿真时，直接按[仿真运行](#7-仿真运行)安装依赖和构建。
+
 1. 按[方案依赖](docs/sdk_dependencies.md)下载源码，安装系统依赖，构建依赖组件，并获取视觉和语音模型。
 2. 按[硬件部署](docs/hardware_setup.md)连接 RGB-D 相机、机械臂、底盘和音频设备。
 
@@ -51,12 +54,41 @@ MuJoCo 模式复用真机 pipeline 的目标检测、三维估计、抓取规划
 
 主配置文件为 [`config/grasp_pipeline.yaml`](config/grasp_pipeline.yaml)。首次部署时至少完成以下配置：
 
-1. 确认机械臂和底盘的稳定串口路径。
-2. 选择 RGB-D 输入后端，并填写后端所需的设备、模型和标定参数。
+1. 在 `config/devices/linksee_so101.yaml` 的机械臂、夹爪 `options.port` 中填写同一个稳定串口路径；底盘串口仍在主配置中设置。
+2. 选择 RGB-D 输入后端，并填写设备、模型和标定参数。LAS2 还须在 `camera.spacemit_las2.serial` 登记本台相机的序列号或固定资产编号。
 3. 完成 eye-to-hand 标定，更新当前相机后端对应的手眼标定结果。
 4. 根据实际音频设备更新 ASR 和 TTS 设备编号。
 
-字段说明和配置步骤见[抓取配置参考](docs/grasp_config.md)和[手眼标定](docs/hand_eye_calibration.md)。
+将本台 SO101 的舵机校准文件放入应用配置目录，不使用其他设备的偏置和行程：
+
+```bash
+cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
+read -erp "本台 SO101 校准文件目录: " SO101_CALIBRATION
+cp -n "$SO101_CALIBRATION/so101_calibration.json" config/devices/
+cp -n "$SO101_CALIBRATION/so101_gripper_calibration.json" config/devices/
+```
+
+设备配置定义驱动、连接、限位和夹爪端点；`manipulator.model` 定义关节链；
+`manipulator.calibration_resources` 列出标定采集绑定的校准文件。路径相对各自配置文件解析。
+首次使用须先通过 `so101-calibrate` 完成舵机校准。手眼标定不代替舵机校准。
+
+固定相机和末端标定板后，采集 15 个静止姿态并求解外参：
+
+```bash
+source ~/spacemit_robot/build/envsetup.sh
+source ~/.venv-grasp/bin/activate
+python3 scripts/calibrate_hand_eye.py --installation-id linksee_site \
+  --charuco-squares-x 4 --charuco-squares-y 5 \
+  --charuco-square-length 0.020 --charuco-marker-length 0.014 \
+  --num-poses 15 --dataset-dir output/hand_eye
+python3 scripts/calibrate_hand_eye.py --solve-only --installation-id linksee_site \
+  --dataset-dir output/hand_eye --apply-config config/grasp_pipeline.yaml
+```
+
+示例使用 4 × 5 ChArUco 板，方格 20 mm、标记 14 mm；参数须与实测尺寸一致。
+按现场规程调整姿态并停止，退出其他控制程序后输入 `CAPTURE`。
+采集只读取设备，不使能、不释放力矩、不运动；标定板须相对模型末端刚性固定，采集期间不得改变夹爪开度。
+数据目录不可覆盖；同一安装标识用于采集与导出。标定板生成和质量要求见[手眼标定](docs/hand_eye_calibration.md)。
 
 ## 5. 构建与检查
 
@@ -65,8 +97,11 @@ MuJoCo 模式复用真机 pipeline 的目标检测、三维估计、抓取规划
 以下命令用于 K3 上的 Linksee 真机抓取：
 
 ```bash
-cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
-source ~/spacemit_robot/build/envsetup.sh
+cd ~/spacemit_robot
+source build/envsetup.sh
+cd components/control/manipulation
+mm --with-deps -DMANIPULATION_ENABLE_KINEMATICS_PINOCCHIO=ON
+cd ../../../application/ros2/linksee/perceptive_grasp
 cmake -S . -B build
 cmake --build build -j"$(nproc)"
 ```
@@ -99,9 +134,33 @@ python3 scripts/check_runtime_env.py \
 [SUMMARY] ready
 ```
 
+### 5.3 验证范围
+
+截至 2026-11-11，K3 隔离构建已完成以下软件回归：
+
+| 检查 | 结果 | 覆盖范围 |
+| --- | --- | --- |
+| 公共 MuJoCo 组件 | 22/22 通过 | 物理仿真、远程协议与模拟相机 |
+| 仿真抓取应用 | 30/30 通过 | 四类物体、空抓与保护检查，苹果和杯子的完整 RGB-D 抓取 |
+| 真机执行器应用 | 22/22 通过 | 离线、模拟设备和配置检查；不代表实体机械臂验收 |
+
+渲染测试使用 Xvfb、gl4es 和 llvmpipe 软件渲染；K3 实际桌面窗口与 GPU 显示尚未验收。
+PC 共享仿真回归也已通过 30/30，使用 GLFW 和 Xvfb，包含基于模拟 RGB-D 的苹果、杯子完整抓放流程。
+实体 SO101 抓取与真实相机标定采样仍待完成。验证使用隔离安装，未替换 K3 正式安装的程序与库。
+
 ## 6. 运行抓取
 
 **以下命令会驱动机械臂和底盘。启动前清理机器人工作空间，确认急停和断电装置可用，并保持人员远离运动范围。**
+
+确认机械臂空载、支撑可靠后，使能机械臂和夹爪。使能会产生保持力矩；应用不自动使能设备。
+
+```bash
+cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
+source ~/spacemit_robot/build/envsetup.sh
+manipulation inspect --plan config/devices/linksee_so101.yaml
+manipulation enable --plan config/devices/linksee_so101.yaml
+manipulation hand-enable --plan config/devices/linksee_so101.yaml
+```
 
 抓取指定目标：
 
@@ -156,57 +215,64 @@ source ~/.venv-grasp/bin/activate
 
 ## 7. 仿真运行
 
-仿真模式由 PC 运行 MuJoCo 场景和可视化窗口。抓取 pipeline 可以与仿真服务共同运行在 PC，也可以运行在 K3。真机和仿真使用同一个 `perceptive_grasp` 启动器、状态机、YOLOv8-Seg 结果格式和抓取规划器，通过配置文件选择 RGB-D、目标检测与机械臂执行后端。
+示例使用 UR5e、Robotiq 2F-85 和固定式 RGB-D 相机，将绿色区域内的物体搬运到红色区域。
+支持 PC 或 K3 本机运行，也支持 PC 运行场景、K3 远程执行抓取。仿真不会连接真实设备。
+本节使用 `manipulation` 共享仿真后端；已通过的测试与待验收项目见[验证范围](#53-验证范围)。
 
-### 7.1 构建 PC MuJoCo 仿真程序
+### 7.1 安装与构建
 
-PC 仿真不使用 K3 的真实硬件后端，也不处理本地语音，因此关闭 WebRTC AEC 和 `spacemit_las2`：
-
-```bash
-cmake -S . -B build_mujoco \
-  -DUSE_OPENCV_DNN=ON \
-  -DUSE_MOCK_EXECUTOR=ON \
-  -DENABLE_WEBRTC_AEC=OFF \
-  -DENABLE_LAS2_CAMERA=OFF \
-  -DENABLE_MUJOCO_EXECUTOR=ON \
-  -DENABLE_REMOTE_MUJOCO=ON
-cmake --build build_mujoco -j"$(nproc)"
-ctest --test-dir build_mujoco --output-on-failure
-```
-
-不要在缺少 `meson` 和 `ninja-build` 的 PC 上直接使用默认的 `cmake -S . -B build`；该默认配置会启用用于 K3 语音交互的 WebRTC AEC。
-
-### 7.2 启动 PC 仿真服务
+在 SDK 根目录执行。显示窗口和模拟相机均需要 X11 桌面会话；K3 使用带 EGL/GLES 图形驱动的桌面镜像，并先登录桌面。
 
 ```bash
-./build_mujoco/perceptive_grasp \
-  --serve-simulation \
-  --config config/grasp_pipeline_mujoco_ur5e.yaml \
-  --listen 0.0.0.0 \
-  --port 9090 \
-  --viewer
+sudo apt update
+sudo apt install -y build-essential cmake pkg-config git python3 ca-certificates libopencv-dev \
+  libyaml-cpp-dev liburdfdom-dev libglfw3-dev libgl1-mesa-dev libx11-dev
+cd application/ros2/linksee/perceptive_grasp
+python3 scripts/run_manipulation_simulation.py build
 ```
 
-K3 运行远程仿真抓取：
+构建自动获取缺失的 MuJoCo 和场景资源，构建产物放在 `build_manipulation/`，不覆盖真机安装。
+K3 使用 X11/gl4es，PC 使用 GLFW/OpenGL。示例启用仿真颜色分割，未安装 YOLO 模型时也可运行；此设置不用于真机。
+
+### 7.2 本机运行
 
 ```bash
-./build_remote_mujoco/perceptive_grasp \
-  --config config/grasp_pipeline_remote_mujoco_ur5e.yaml \
-  --target apple \
-  --remote-host <pc_ip>
+python3 scripts/run_manipulation_simulation.py serve
 ```
 
-K3 使用本地麦克风和扬声器控制远程仿真：
+保持服务运行，在同一目录的另一终端执行：
 
 ```bash
-source ~/.venv-grasp/bin/activate
-./build_remote_mujoco/perceptive_grasp \
-  --voice-control \
-  --config config/grasp_pipeline_remote_mujoco_ur5e.yaml \
-  --remote-host <pc_ip>
+python3 scripts/run_manipulation_simulation.py grasp apple
 ```
 
-仿真场景使用 MuJoCo Menagerie 的 UR5e 和 Robotiq 2F-85 模型，苹果和香蕉配置外观网格、纹理及用于物理接触的简化碰撞体。场景提供斜向下的虚拟 RGB-D 相机、机械臂与桌面碰撞检查、完整路径检查、双指接触判定和物理夹取。每次启动或显式重置场景时，`apple`、`banana`、`cube` 和 `cup` 都会在加宽的绿色取物区内单行排列，并随机调整排列顺序、位置和水平摆放角度。切换抓取目标不会重置场景，四个物体可以依次搬运到右侧独立的红色放置区。底盘辅助在仿真配置中保持关闭；语音交互运行在 K3，不依赖仿真服务的音频设备。构建、操作和验收步骤见[仿真运行](docs/simulation.md)。
+目标可选 `apple`、`banana`、`cube`、`cup`；前三种使用顶抓，杯子使用侧抓。
+窗口支持鼠标旋转、平移和缩放。切换目标保留场景状态，重新启动服务恢复初始场景。
+`serve --no-viewer` 关闭窗口，但模拟相机仍需要图形上下文。
+
+### 7.3 PC 显示、K3 远程抓取
+
+PC 按上述步骤启动服务。在 K3 的 SDK 根目录执行：
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake pkg-config python3 openssh-client \
+  libopencv-dev libyaml-cpp-dev liburdfdom-dev
+cd application/ros2/linksee/perceptive_grasp
+python3 scripts/run_manipulation_simulation.py build --client-only
+read -rp "PC SSH 地址（用户@主机）: " SIM_PC
+ssh -N -L 9090:127.0.0.1:9090 "$SIM_PC"
+```
+
+保持 SSH 转发，在 K3 同一目录的另一终端执行：
+
+```bash
+python3 scripts/run_manipulation_simulation.py grasp apple --client-only
+```
+
+远程客户端不需要本机显示器或 MuJoCo。服务仅监听回环地址，通过 SSH 转发连接。
+抓持在双指接触后建立约束，是仿真简化，不代表纯摩擦抓持或真机抓稳结果。
+兼容后端使用独立配置和构建目录；共享仿真的语音接入、兼容后端操作及故障处理见[仿真运行](docs/simulation.md)。
 
 ## 8. 文档导航
 
@@ -215,7 +281,7 @@ source ~/.venv-grasp/bin/activate
 - [抓取配置](docs/grasp_config.md)（参考）：说明配置文件字段、默认值、单位和约束。
 - [手眼标定](docs/hand_eye_calibration.md)（操作指南）：生成标定板、采集数据、求解并写回标定结果。
 - [语音控制](docs/voice_control.md)（操作指南）：配置 ASR/TTS 并启动本地语音桥。
-- [仿真运行](docs/simulation.md)（操作指南）：在 PC 启动 MuJoCo，并在 K3 运行抓取 pipeline。
+- [仿真运行](docs/simulation.md)（操作指南）：在 PC 或 K3 本机运行共享仿真，或通过远程服务执行抓取。
 - [故障诊断](docs/debugging.md)（操作指南）：定位感知、规划、执行、底盘和性能问题。
 - [pipeline 状态机](docs/pipeline_state_machine.md)（说明）：介绍状态转换、异步动作、输出事件和失败终态。
 - [抓取方案](docs/grasping_approaches.md)（说明）：介绍感知定位、抓取规划、底盘介入条件和方案边界。

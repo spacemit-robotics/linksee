@@ -3,53 +3,19 @@
 # Copyright 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-手眼标定脚本 (Eye-to-Hand)
+"""Eye-to-hand collection through manipulation, with legacy offline dataset support.
 
-Linksee 结构:
-  - 立体相机固定在机身顶部，不随机械臂运动 → Eye-to-Hand 问题
-  - 机械臂 (SO101 5-DOF) 在机身前方
-  - ChArUco 标定板或 ArUco 标记固定在机械臂末端（夹爪上）
-
-原理:
-  Eye-to-Hand: 相机固定不动，标定板随机械臂运动。
-  已知: 末端在基座系的位姿 T_base_gripper (FK 算出),
-        标定板在相机系的位姿 T_cam_marker (ChArUco/ArUco 检测)
-  求解: T_base_camera (相机在基座系的位姿)
-  约束: T_base_gripper[i] * T_gripper_marker = T_base_camera * T_cam_marker[i]
-
-使用流程:
-  1. 打印一个 ChArUco 标定板（推荐）或 ArUco 标记, 固定到夹爪末端
-  2. 连接配置的立体相机和 SO101
-  3. 手动掰动机械臂到不同姿态, 每次按回车采集一组数据
-  4. 采集 >= 8 组后, 按 q 计算标定结果
-  5. 将结果写入 grasp_pipeline.yaml
-
-用法:
-  # 基本使用 (K3 板端, 无 GUI)
-  python3 calibrate_hand_eye.py
-
-  # 自定义参数
-  python3 calibrate_hand_eye.py --charuco-square-length 0.02 --num-poses 15
-
-  # 指定串口
-  python3 calibrate_hand_eye.py --device /dev/ttyACM1
-
-  # 不连接机械臂, 手动输入关节角
-  python3 calibrate_hand_eye.py --manual-joints
-
-依赖:
-  pip install -r requirements.txt
+The collection entry never moves the arm or changes torque. Move the arm through an
+approved external workflow, stop its controller, then acknowledge each read-only sample.
+The camera and rigidly mounted board must stay fixed relative to their assigned frames.
 """
 
 import argparse
 import shutil
 import json
 import os
-import serial
 import sys
 import time
-import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
@@ -67,12 +33,6 @@ except ImportError:
 # 路径与常量
 # ============================================================
 SCRIPT_DIR = Path(__file__).resolve().parent
-URDF_PATH = SCRIPT_DIR / ".." / "urdf" / "so101.urdf"
-
-SO101_JOINT_IDS = [1, 2, 3, 4, 5]
-SO101_NUM_JOINTS = 5
-URDF_DOF = 6          # URDF 有 6 个 DOF (含 gripper)
-TIP_LINK = "gripper_frame_link"
 DEFAULT_DATASET_ROOT = SCRIPT_DIR / ".." / "config" / "hand_eye_datasets"
 DEFAULT_PIPELINE_CONFIG = SCRIPT_DIR / ".." / "config" / "grasp_pipeline.yaml"
 ARUCO_DICTS = {
@@ -258,6 +218,12 @@ def _apply_to_grasp_config(config_path, camera_type, t_vec, rpy):
         "translation": [float(value) for value in t_vec],
         "rotation": [float(value) for value in rpy],
     }
+    if text.lstrip().startswith("{"):
+        # JSON is accepted as YAML input; appending a block-style key would corrupt it.
+        root["calibration"] = calibration
+        config_path.write_text(json.dumps(root, indent=2, ensure_ascii=False) + "\n",
+                               encoding="utf-8")
+        return backup
 
     lines = text.splitlines()
     block_start = next(
@@ -313,12 +279,14 @@ def _apply_to_grasp_config(config_path, camera_type, t_vec, rpy):
 class RealSenseCalibrationCamera:
     """RealSense color stream used by hand-eye calibration."""
 
-    def __init__(self, width=640, height=480, fps=30):
+    def __init__(self, width=640, height=480, fps=30, serial_number=None):
         if rs is None:
             raise RuntimeError("pyrealsense2 未安装: pip install -r requirements.txt")
 
         self.pipeline = rs.pipeline()
         config = rs.config()
+        if serial_number:
+            config.enable_device(str(serial_number))
         config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
         profile = self.pipeline.start(config)
 
@@ -339,6 +307,8 @@ class RealSenseCalibrationCamera:
             "width": int(intr.width),
             "height": int(intr.height),
             "fps": int(fps),
+            "serial": str(profile.get_device().get_info(rs.camera_info.serial_number)),
+            "frame": "color_optical",
         }
 
     def capture(self):
@@ -484,20 +454,6 @@ def _read_pipeline_camera_config(config_path):
     return camera_config
 
 
-def _read_manipulator_device(config_path):
-    """Read the stable manipulator serial path from the pipeline config."""
-    config_path = Path(config_path)
-    try:
-        with open(config_path, "r", encoding="utf-8") as stream:
-            root = yaml.safe_load(stream) or {}
-    except (OSError, yaml.YAMLError) as exc:
-        raise RuntimeError(f"无法读取抓取配置 {config_path}: {exc}") from exc
-
-    manipulator_config = root.get("manipulator", {})
-    if not isinstance(manipulator_config, dict):
-        raise RuntimeError(f"{config_path} 中的 manipulator 配置无效")
-    return expand_config_path(
-        manipulator_config.get("uart_device", "/dev/ttyACM0"))
 
 
 def _resolve_camera_type(camera_config, camera_override="auto"):
@@ -532,7 +488,8 @@ def _create_pipeline_camera(camera_config, camera_type,
         camera = RealSenseCalibrationCamera(
             int(backend_config.get("width", 640)),
             int(backend_config.get("height", 480)),
-            int(backend_config.get("fps", 30)))
+            int(backend_config.get("fps", 30)),
+            backend_config.get("serial"))
         return camera
 
     video_device = las2_video_device or backend_config.get("video_device")
@@ -996,215 +953,6 @@ def _make_transform(xyz, rpy):
     return T
 
 
-def _rot_z(angle):
-    """Rotation about Z axis"""
-    T = np.eye(4)
-    c, s = np.cos(angle), np.sin(angle)
-    T[0, 0] = c
-    T[0, 1] = -s
-    T[1, 0] = s
-    T[1, 1] = c
-    return T
-
-
-class URDFForwardKinematics:
-    """Minimal URDF FK solver for serial chains with revolute joints (axis=Z)"""
-
-    def __init__(self, urdf_path, tip_link="gripper_frame_link"):
-        tree = ET.parse(str(urdf_path))
-        root = tree.getroot()
-
-        # Parse all joints
-        self.chain = []  # list of (origin_T, joint_type, joint_name)
-        parent_map = {}  # child_link -> (joint_name, parent_link)
-        joints_by_name = {}
-
-        for j in root.findall('.//joint'):
-            name = j.get('name')
-            jtype = j.get('type')
-            parent_el = j.find('parent')
-            child_el = j.find('child')
-            if parent_el is None or child_el is None:
-                continue
-            parent = parent_el.get('link')
-            child = child_el.get('link')
-            if parent is None or child is None:
-                continue
-            origin = j.find('origin')
-            xyz = (
-                [float(v) for v in origin.get('xyz', '0 0 0').split()]
-                if origin is not None else [0, 0, 0]
-            )
-            rpy = (
-                [float(v) for v in origin.get('rpy', '0 0 0').split()]
-                if origin is not None else [0, 0, 0]
-            )
-            parent_map[child] = (name, parent)
-            joints_by_name[name] = {
-                'type': jtype, 'xyz': xyz, 'rpy': rpy,
-                'parent': parent, 'child': child
-            }
-
-        # Build chain from base to tip
-        # Find path: tip_link -> ... -> base_link
-        path = []
-        current = tip_link
-        while current in parent_map:
-            jname, parent = parent_map[current]
-            path.append(jname)
-            current = parent
-        path.reverse()
-
-        # Build kinematic chain
-        self.joint_names = []
-        self.transforms = []  # static origin transforms
-        self.joint_types = []  # 'revolute' or 'fixed'
-
-        for jname in path:
-            info = joints_by_name[jname]
-            T_origin = _make_transform(info['xyz'], info['rpy'])
-            self.transforms.append(T_origin)
-            self.joint_types.append(info['type'])
-            self.joint_names.append(jname)
-
-        # Revolute joint indices (for mapping q vector)
-        self.revolute_indices = [i for i, t in enumerate(self.joint_types) if t == 'revolute']
-        self.num_revolute = len(self.revolute_indices)
-
-    def forward(self, q):
-        """
-        Compute FK. q is array of joint angles for all revolute joints in chain order.
-        Returns 4x4 T_base_tip.
-        """
-        T = np.eye(4)
-        q_idx = 0
-        for i, (T_origin, jtype) in enumerate(zip(self.transforms, self.joint_types)):
-            T = T @ T_origin
-            if jtype == 'revolute':
-                if q_idx < len(q):
-                    T = T @ _rot_z(q[q_idx])
-                q_idx += 1
-        return T
-
-
-def init_fk(urdf_path):
-    """Initialize FK solver, returns URDFForwardKinematics instance"""
-    fk = URDFForwardKinematics(urdf_path, TIP_LINK)
-    print(f"  FK chain: {fk.num_revolute} revolute joints")
-    print(f"  Joints: {[fk.joint_names[i] for i in fk.revolute_indices]}")
-    return fk
-
-
-def compute_fk(fk, joints_5dof):
-    """5 joint angles → 4x4 T_base_gripper (6th joint=gripper set to 0)"""
-    q = np.zeros(fk.num_revolute)
-    q[:len(joints_5dof)] = joints_5dof
-    return fk.forward(q)
-
-
-# ============================================================
-# SO101 关节读取 (纯 serial 协议, 绕过 libmanipulator.so)
-# ============================================================
-
-# STS3215 位置分辨率: 0-4095 对应 0-2π (motor rad)
-STS3215_POS_MAX = 4095.0
-
-
-def _sts_read_pos(ser, motor_id):
-    """读取单个 STS3215 舵机的 Present Position (寄存器 56, 2 bytes)"""
-    # 飞特协议: FF FF ID LEN INST PARAMS... CHECKSUM
-    inst = 0x02  # READ
-    start_addr = 56
-    length = 2
-    pkt_len = 4  # len field = inst(1) + addr(1) + len(1) + checksum(1)
-    packet = bytearray([0xFF, 0xFF, motor_id, pkt_len, inst, start_addr, length])
-    checksum = (~(motor_id + pkt_len + inst + start_addr + length)) & 0xFF
-    packet.append(checksum)
-
-    ser.reset_input_buffer()
-    ser.write(packet)
-    ser.flush()
-
-    # 响应: FF FF ID LEN(4) ERR POS_L POS_H CHECKSUM
-    resp = ser.read(8)
-    if len(resp) < 8 or resp[0] != 0xFF or resp[1] != 0xFF:
-        return None
-    err = resp[4]
-    if err != 0:
-        return None
-    return resp[5] | (resp[6] << 8)
-
-
-def _sts_write_byte(ser, motor_id, addr, value):
-    """写入单个字节到 STS3215 寄存器"""
-    inst = 0x03  # WRITE
-    pkt_len = 4
-    packet = bytearray([0xFF, 0xFF, motor_id, pkt_len, inst, addr, value])
-    checksum = (~(motor_id + pkt_len + inst + addr + value)) & 0xFF
-    packet.append(checksum)
-    ser.write(packet)
-    ser.flush()
-    ser.read(6)  # 读取响应
-    time.sleep(0.002)
-
-
-def _ticks_to_rad(ticks):
-    """STS3215 ticks → joint rad (与 C++ motor_rad_to_joint_rad 一致)
-    motor_rad = ticks / 4095.0 * 2π
-    joint_rad = motor_rad - π  (中位 2048 ticks ≈ 0 rad)
-    """
-    motor_rad = (ticks / STS3215_POS_MAX) * (2.0 * np.pi)
-    joint_rad = motor_rad - np.pi
-    # 归一化到 [-π, π]
-    while joint_rad < -np.pi:
-        joint_rad += 2.0 * np.pi
-    while joint_rad > np.pi:
-        joint_rad -= 2.0 * np.pi
-    return joint_rad
-
-
-def init_so101(device="/dev/ttyACM0", baudrate=1000000):
-    """
-    通过纯串口连接 SO101, 关闭扭矩进入示教模式
-    返回 serial.Serial 对象或 None
-    """
-    try:
-        ser = serial.Serial(device, baudrate, timeout=0.1)
-        time.sleep(0.1)
-    except Exception as e:
-        print(f"  [WARN] 无法打开串口 {device}: {e}")
-        return None
-
-    # 关闭所有舵机扭矩 (REG_TORQUE_ENABLE=40, value=0)
-    for mid in SO101_JOINT_IDS:
-        _sts_write_byte(ser, mid, 40, 0)
-
-    # 验证: 读取一次位置确认通信正常
-    test_pos = _sts_read_pos(ser, SO101_JOINT_IDS[0])
-    if test_pos is None:
-        print("  [WARN] 无法读取舵机位置, 请检查连接")
-        ser.close()
-        return None
-
-    print("  示教模式已开启 (扭矩关闭, 可自由掰动)")
-    return ser
-
-
-def read_joints(ser):
-    """从 SO101 读取 5 个关节角 (rad)"""
-    joints = []
-    for mid in SO101_JOINT_IDS:
-        ticks = _sts_read_pos(ser, mid)
-        if ticks is None:
-            return None
-        joints.append(_ticks_to_rad(ticks))
-    return np.array(joints)
-
-
-def close_so101(ser):
-    """关闭串口 (不恢复扭矩, 标定后手动操作)"""
-    if ser and ser.is_open:
-        ser.close()
 
 
 # ============================================================
@@ -1570,13 +1318,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="手眼标定 (Eye-to-Hand): 相机固定, ChArUco/ArUco 贴在夹爪上",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  python3 calibrate_hand_eye.py --config config/grasp_pipeline.yaml
-  python3 calibrate_hand_eye.py --charuco-square-length 0.02 --num-poses 15
-  python3 calibrate_hand_eye.py --device /dev/ttyACM1     # 指定串口
-  python3 calibrate_hand_eye.py --manual-joints            # 手动输入关节角
-""")
+        epilog="采集: --config PIPELINE --installation-id INSTALLATION；离线: --solve-only --dataset-dir DATASET")
     ap.add_argument("--config", type=str,
                     default=str(DEFAULT_PIPELINE_CONFIG),
                     help="抓取配置，用于自动选择相机后端")
@@ -1595,6 +1337,8 @@ def main():
                     help="ArUco 字典, 默认 4x4_50")
     ap.add_argument("--marker-length", type=float, default=0.037,
                     help="单 ArUco 模式的标记边长 (米), 默认 0.037")
+    ap.add_argument("--marker-id", type=int,
+                    help="单 ArUco 模式固定标记的 ID，现场采集时必须指定")
     ap.add_argument("--charuco-squares-x", type=int, default=5,
                     help="ChArUco 横向棋盘格数量, 默认 5")
     ap.add_argument("--charuco-squares-y", type=int, default=7,
@@ -1604,17 +1348,20 @@ def main():
     ap.add_argument("--charuco-marker-length", type=float, default=0.018,
                     help="ChArUco 内部 ArUco marker 边长 (米), 默认 0.018")
     ap.add_argument("--num-poses", type=int, default=12,
-                    help="采集姿态数, 默认 12 (最少 3, 建议 >=10)")
+                    help="采集姿态数，12..100，默认 12")
     ap.add_argument("--capture-settle-ms", type=int, default=500,
-                    help="按回车后等待机械臂和画面稳定的时间，默认 500ms")
-    ap.add_argument(
-        "--device", type=str, default=None,
-        help="机械臂串口，默认读取 --config 中的 manipulator.uart_device")
-    ap.add_argument("--baudrate", type=int, default=1000000)
-    ap.add_argument("--manual-joints", action="store_true",
-                    help="手动输入关节角 (不连接机械臂)")
+                    help="确认采集后等待机械臂和画面稳定的时间，默认 500ms")
+    ap.add_argument("--device-plan", help="覆盖机械臂设备配置路径")
+    ap.add_argument("--model", help="覆盖机械臂运动学模型描述路径")
+    ap.add_argument("--device-executable", default="manipulation-device",
+                    help="公共只读设备进程，默认从 PATH 查找")
+    ap.add_argument("--installation-id", help="固定机械臂、相机和标定板安装的标识")
+    ap.add_argument("--calibration-resource", action="append", default=[],
+                    help="补充需绑定的校准文件，可重复；路径相对抓取配置")
+    ap.add_argument("--confirm-joint-reference", action="store_true",
+                    help="仅当驱动未报告关节零点状态时，声明已确认本次安装的关节参考系")
     ap.add_argument("--output", type=str, default=None,
-                    help="输出路径, 默认 config/hand_eye_result.json")
+                    help="结果路径，默认数据集目录中的 result.json")
     ap.add_argument("--save-images", type=str, default=None,
                     help="额外保存采集图像的目录")
     ap.add_argument("--dataset-dir", type=str, default=None,
@@ -1637,16 +1384,20 @@ def main():
     ap.add_argument("--max-distance", type=float, default=0.40,
                     help="marker 距相机最大距离(m), 默认 0.40")
     ap.add_argument("--no-quality-gate", action="store_true",
-                    help="只提示质量问题但不拒收样本")
+                    help=argparse.SUPPRESS)
     args = ap.parse_args()
-
-    if args.output is None:
-        args.output = str(SCRIPT_DIR / ".." / "config" / "hand_eye_result.json")
 
     if args.solve_only:
         if not args.dataset_dir:
             sys.exit("错误: --solve-only 需要指定 --dataset-dir")
         dataset_dir = Path(args.dataset_dir)
+        manifest = _json_load(dataset_dir / "manifest.json")
+        if manifest.get("schema") == 1 and manifest.get("mode") == "eye_to_hand":
+            from hand_eye_collection import solve_collection
+            solve_collection(args, dataset_dir)
+            return
+        if args.output is None:
+            args.output = str(dataset_dir / "result.json")
         manifest, samples, R_g2b, t_g2b, R_t2c, t_t2c = _load_dataset(dataset_dir)
         count = len(samples)
         if count < 3:
@@ -1689,303 +1440,14 @@ def main():
             print(f"  备份文件: {backup}")
         return
 
-    try:
-        camera_config = _read_pipeline_camera_config(args.config)
-        camera_type = _resolve_camera_type(camera_config, args.camera_type)
-        if args.device is None:
-            args.device = _read_manipulator_device(args.config)
-    except Exception as exc:
-        sys.exit(f"错误: {exc}")
-
-    camera_name = ("spacemit_las2 logical-left camera"
-                   if camera_type == "spacemit_las2"
-                   else "RealSense D435i")
-    print("=" * 60)
-    print("  手眼标定 (Eye-to-Hand)")
-    print(f"  相机: {camera_name} (固定)  "
-          f"标定板: {args.board_type} (贴在夹爪)")
-    print("=" * 60)
-    if args.board_type == "charuco":
-        print(f"  ChArUco: {args.charuco_squares_x}x{args.charuco_squares_y}, "
-              f"square={args.charuco_square_length * 100:.1f}cm, "
-              f"marker={args.charuco_marker_length * 100:.1f}cm")
-    else:
-        print(f"  ArUco: dict={args.aruco_dict}, marker={args.marker_length * 100:.1f}cm")
-    print(f"  目标采集: {args.num_poses} 组")
-    print()
-
-    # ---- 1. FK solver ----
-    print("[1/4] 加载 URDF ...")
-    if not URDF_PATH.exists():
-        sys.exit(f"  错误: URDF 不存在: {URDF_PATH}")
-    fk_solver = init_fk(URDF_PATH)
-    print(f"  OK: {URDF_PATH.name}")
-
-    # ---- 2. 机械臂 ----
-    arm = None
-    if not args.manual_joints:
-        print("\n[2/4] 连接 SO101 ...")
-        arm = init_so101(args.device, args.baudrate)
-        if arm:
-            test = read_joints(arm)
-            if test is not None:
-                print(f"  OK: 当前关节角 = [{', '.join(f'{j:.3f}' for j in test)}]")
-            else:
-                print("  WARN: 读取失败, 退回手动模式")
-                close_so101(arm)
-                arm = None
-        else:
-            print("  WARN: 无法连接, 退回手动模式")
-    else:
-        print("\n[2/4] 手动输入模式")
-
-    # ---- 3. 相机 ----
-    print(f"\n[3/4] 初始化 {camera_name} ...")
-    try:
-        camera = _create_pipeline_camera(
-            camera_config, camera_type,
-            args.las2_video_device, args.las2_calib_path)
-    except Exception as exc:
-        if arm:
-            close_so101(arm)
-        sys.exit(f"  错误: {exc}")
-    pipeline = camera
-    cam_mtx = camera.camera_matrix
-    cam_dist = camera.dist_coeffs
-    print(f"  OK: {camera.metadata['width']}x{camera.metadata['height']} "
-          f"fx={cam_mtx[0,0]:.1f}, fy={cam_mtx[1,1]:.1f}")
-    if camera.metadata.get("backend") == "spacemit_las2":
-        print("  LAS2: 使用校正后逻辑左目 MJPEG，不启动深度推理")
-
-    if args.save_images:
-        os.makedirs(args.save_images, exist_ok=True)
-
-    dataset_dir = Path(args.dataset_dir) if args.dataset_dir else _make_dataset_dir()
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    (dataset_dir / "images").mkdir(exist_ok=True)
-    (dataset_dir / "samples").mkdir(exist_ok=True)
-    if list((dataset_dir / "samples").glob("pose_*.json")):
-        sys.exit(
-            "错误: 数据集目录已有样本，为避免混入其他数据请换一个目录: "
-            f"{dataset_dir}"
-        )
-    manifest = {
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "mode": "eye_to_hand_marker_on_gripper",
-        "board_type": args.board_type,
-        "aruco_dict": args.aruco_dict,
-        "marker_type": args.board_type,
-        "marker_length_m": args.marker_length,
-        "charuco": {
-            "squares_x": args.charuco_squares_x,
-            "squares_y": args.charuco_squares_y,
-            "square_length_m": args.charuco_square_length,
-            "marker_length_m": args.charuco_marker_length,
-        },
-        "camera": camera.metadata,
-        "camera_matrix": cam_mtx.tolist(),
-        "dist_coeffs": cam_dist.tolist(),
-        "urdf_path": str(URDF_PATH),
-        "tip_link": TIP_LINK,
-        "quality_thresholds": {
-            "min_poses": args.min_poses,
-            "min_relative_rotation_deg": args.min_relative_rotation_deg,
-            "max_reproj_error_px": args.max_reproj_error,
-            "min_marker_size_px": args.min_marker_size_px,
-            "min_distance_m": args.min_distance,
-            "max_distance_m": args.max_distance,
-        },
-        "samples": [],
-    }
-    _json_dump(dataset_dir / "manifest.json", manifest)
-    print(f"\n  数据集目录: {dataset_dir}")
-
-    # ---- 4. 采集 ----
-    print("\n[4/4] 开始采集")
-    print("-" * 60)
-    print("操作步骤:")
-    print("  1. 确认 ChArUco 标定板/ArUco 标记刚性固定在夹爪末端")
-    print("  2. 掰动机械臂到新姿态 (标定板要对着相机)")
-    print("  3. 按回车采集 | 输入 s 预览 | 输入 q 结束")
-    print()
-    print("★ 标定质量要求:")
-    print("  - 标定板建议距相机 20~30cm (图像中 marker ≥40px)")
-    print("  - 标定板尽量在图像中心区域")
-    print("  - 每次至少变化 2 个关节, 旋转 >20°")
-    print("  - 覆盖: 左/中/右 × 高/低 × 不同腕部角度")
-    print("  - 标定板正面朝向相机 (倾斜 <45°)")
-    print("-" * 60)
-
-    R_g2b, t_g2b, R_t2c, t_t2c = [], [], [], []
-    count = 0
-
-    while count < args.num_poses:
-        if arm:
-            prompt = f"[{count+1}/{args.num_poses}] 掰好后按回车"
-        else:
-            prompt = f"[{count+1}/{args.num_poses}] 输入 5 个关节角(rad, 空格分隔)"
-
-        user = input(f"\n{prompt}: ").strip()
-
-        if user.lower() == 'q':
-            break
-
-        if user.lower() == 's':
-            img = capture_frame(pipeline)
-            T_cm, vis, info = detect_board(
-                img, cam_mtx, cam_dist, args, return_info=True)
-            path = "/tmp/calibrate_preview.png"
-            cv2.imwrite(path, vis)
-            if T_cm is not None:
-                print(
-                    "  ✓ 检测到标定板  位置: "
-                    f"[{T_cm[0,3]:.4f}, {T_cm[1,3]:.4f}, "
-                    f"{T_cm[2,3]:.4f}]"
-                )
-                if info.get("reprojection_error_px") is not None:
-                    print(f"    reproj={info['reprojection_error_px']:.2f}px, "
-                          f"size={info['marker_size_px']:.1f}px")
-            else:
-                print("  ✗ 未检测到标定板")
-                print(f"    诊断: {_format_detect_info(info)}")
-                if args.board_type == "charuco":
-                    _print_charuco_detection_hint(info)
-            print(f"  图像: {path}")
-            continue
-
-        # 获取关节角
-        if arm:
-            joints = read_joints(arm)
-            if joints is None:
-                print("  ✗ 读取失败, 重试")
-                continue
-        else:
-            if not user:
-                print("  ✗ 手动模式需输入关节角")
-                continue
-            try:
-                joints = np.array([float(v) for v in user.split()])
-                if len(joints) != SO101_NUM_JOINTS:
-                    print(f"  ✗ 需要 {SO101_NUM_JOINTS} 个值")
-                    continue
-            except ValueError:
-                print("  ✗ 格式错误")
-                continue
-
-        if args.capture_settle_ms > 0:
-            time.sleep(args.capture_settle_ms / 1000.0)
-
-        # FK
-        T_bg = compute_fk(fk_solver, joints)
-
-        # 标定板检测 (多帧平均提高精度)
-        T_cm, vis, raw_img, detect_info = detect_board_averaged(
-            pipeline, cam_mtx, cam_dist, args, num_frames=15, return_info=True)
-        if T_cm is None:
-            print("  ✗ 未检测到标定板, 调整姿态使标定板朝向相机")
-            print(f"    诊断: {_format_detect_info(detect_info)}")
-            if args.board_type == "charuco":
-                _print_charuco_detection_hint(detect_info)
-            continue
-
-        ok, quality_info = check_capture_quality(
-            T_bg, T_cm, detect_info,
-            [_T_from_rt(R_g2b[i], t_g2b[i]) for i in range(len(R_g2b))],
-            args)
-        if not ok:
-            print("  ✗ 样本质量不足，未收录:")
-            for reason in quality_info["reject_reasons"]:
-                print(f"    - {reason}")
-            print(
-                "    请调整距离、角度或姿态后重试；"
-                "--no-quality-gate 仅用于调试。"
-            )
-            continue
-
-        R_g2b.append(T_bg[:3, :3])
-        t_g2b.append(T_bg[:3, 3])
-        R_t2c.append(T_cm[:3, :3])
-        t_t2c.append(T_cm[:3, 3])
-        count += 1
-
-        if args.save_images:
-            cv2.imwrite(os.path.join(args.save_images, f"pose_{count:03d}.png"), vis)
-
-        sample = _save_sample(dataset_dir, count, raw_img, vis, joints,
-                              T_bg, T_cm, quality_info)
-        manifest["samples"].append({
-            "index": count,
-            "sample_file": f"samples/pose_{count:03d}.json",
-            "image": sample["image"],
-            "visualization": sample["visualization"],
-        })
-        manifest["num_samples"] = count
-        _json_dump(dataset_dir / "manifest.json", manifest)
-
-        marker_dist = quality_info.get("marker_distance_m")
-        reproj = quality_info.get("reprojection_error_px")
-        marker_size = quality_info.get("marker_size_px")
-        print(f"  ✓ 采集成功 ({count}/{args.num_poses})")
-        print(f"    关节: [{', '.join(f'{j:.3f}' for j in joints)}]")
-        print(f"    末端(基座系): [{T_bg[0,3]:.4f}, {T_bg[1,3]:.4f}, {T_bg[2,3]:.4f}]")
-        print(f"    标定板(相机系): [{T_cm[0,3]:.4f}, {T_cm[1,3]:.4f}, {T_cm[2,3]:.4f}]")
-        print(f"    质量: dist={marker_dist*100:.1f}cm, "
-              f"reproj={reproj:.2f}px, size={marker_size:.1f}px, "
-              f"frames={quality_info['detected_frames']}/{quality_info['num_frames']}")
-        for warning in quality_info.get("warnings", []):
-            print(f"    WARN: {warning}")
-
-    # 清理
-    pipeline.stop()
-    if arm:
-        close_so101(arm)
-
-    if count < 3:
-        sys.exit(f"\n错误: 至少需要 3 组, 当前 {count} 组")
-    if count < args.min_poses:
-        print(f"\n  [WARN] 当前只有 {count} 组, 建议至少 {args.min_poses} 组。")
-
-    # ---- 求解 ----
-    print(f"\n{'=' * 60}")
-    print(f"  标定求解 ({count} 组数据, 5 种方法)")
-    print(f"{'=' * 60}")
-
-    results = solve_hand_eye(R_g2b, t_g2b, R_t2c, t_t2c)
-    if not results:
-        sys.exit("错误: 所有方法都失败")
-
-    best, eval_details = evaluate(results, R_g2b, t_g2b, R_t2c, t_t2c)
-    out = save_result(dataset_dir, results, best, eval_details, count,
-                      args.marker_length, cam_mtx)
-    _json_dump(args.output, out)
-
-    t_vec = np.asarray(out["T_base_camera"]["translation"])
-    rpy = np.asarray(out["T_base_camera"]["rotation"])
-
-    print(f"\n  ★ 最佳方法: {best}")
-    print(f"    translation: [{t_vec[0]:.4f}, {t_vec[1]:.4f}, {t_vec[2]:.4f}]")
-    print(f"    rotation:    [{rpy[0]:.4f}, {rpy[1]:.4f}, {rpy[2]:.4f}]")
-    print(f"\n  结果已保存: {args.output}")
-    print(f"  数据集结果: {dataset_dir / 'result.json'}")
-    print(f"  标定报告: {dataset_dir / 'report.txt'}")
-    if args.apply_config:
-        backup = _apply_to_grasp_config(
-            args.apply_config, camera_type, t_vec, rpy)
-        print(f"  已写回配置: {args.apply_config}")
-        print(f"  备份文件: {backup}")
-
-    # ---- 配置片段 ----
-    print(f"\n{'=' * 60}")
-    print("  复制以下内容到 grasp_pipeline.yaml:")
-    print(f"{'=' * 60}")
-    print(f"""
-calibration:
-  {camera_type}:
-    T_base_camera:
-      translation: [{t_vec[0]:.4f}, {t_vec[1]:.4f}, {t_vec[2]:.4f}]
-      rotation: [{rpy[0]:.4f}, {rpy[1]:.4f}, {rpy[2]:.4f}]
-""")
+    from hand_eye_collection import collect
+    collect(args)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (ValueError, RuntimeError, OSError) as error:
+        sys.exit(f"标定失败：{error}")
+    except KeyboardInterrupt:
+        sys.exit("标定已取消；未完成的数据集不用于发布外参。")

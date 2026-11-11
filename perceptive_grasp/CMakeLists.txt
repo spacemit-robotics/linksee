@@ -29,6 +29,11 @@ option(ENABLE_REMOTE_MUJOCO
        "Enable remote MuJoCo client backends for split PC/K3 simulation" OFF)
 option(ENABLE_MUJOCO_EXECUTOR
        "Enable optional MuJoCo UR5e executor backend for PC simulation" OFF)
+option(ENABLE_MANIPULATION_MUJOCO
+       "Execute the simulation example through the manipulation shared-world driver" OFF)
+if(ENABLE_MANIPULATION_MUJOCO AND NOT ENABLE_MUJOCO_EXECUTOR)
+    message(FATAL_ERROR "ENABLE_MANIPULATION_MUJOCO requires ENABLE_MUJOCO_EXECUTOR")
+endif()
 
 # X86_STANDALONE 是主机侧规划与仿真验证构建的快捷选项。
 if(X86_STANDALONE)
@@ -41,6 +46,8 @@ endif()
 find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc highgui imgcodecs dnn calib3d)
 find_package(yaml-cpp REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME manipulation_simulation_launcher_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_manipulation_simulation_launcher.py)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(URDFDOM REQUIRED IMPORTED_TARGET urdfdom)
 
@@ -62,7 +69,8 @@ endif()
 set(HAVE_MUJOCO_EXECUTOR OFF)
 set(HAVE_MUJOCO_CAMERA OFF)
 if(ENABLE_MUJOCO_EXECUTOR)
-    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64" AND
+       NOT (ENABLE_MANIPULATION_MUJOCO AND CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64"))
         message(FATAL_ERROR
             "[Executor] MuJoCo executor is PC/x86_64 only; disable "
             "ENABLE_MUJOCO_EXECUTOR for K3 builds")
@@ -79,12 +87,15 @@ if(ENABLE_MUJOCO_EXECUTOR)
     include("${CMAKE_CURRENT_SOURCE_DIR}/../../../../components/simulation/mujoco/cmake/FindMuJoCo.cmake")
     set(HAVE_MUJOCO_EXECUTOR ON)
     message(STATUS "[Executor] mujoco ur5e simulation backend enabled")
-    find_package(glfw3 QUIET)
-    if(glfw3_FOUND)
-        set(HAVE_MUJOCO_CAMERA ON)
-        message(STATUS "[Camera] mujoco rendered camera backend enabled")
-    else()
-        message(STATUS "[Camera] MuJoCo rendered camera backend disabled: glfw3 not found")
+    # Preserve the standalone GLFW camera on PC. K3 uses only the shared renderer.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+        find_package(glfw3 QUIET)
+        if(glfw3_FOUND)
+            set(HAVE_MUJOCO_CAMERA ON)
+            message(STATUS "[Camera] mujoco rendered camera backend enabled")
+        else()
+            message(STATUS "[Camera] MuJoCo rendered camera backend disabled: glfw3 not found")
+        endif()
     endif()
 endif()
 
@@ -305,7 +316,7 @@ endif()
 
 if(NOT HAVE_REALSENSE_CAMERA AND NOT HAVE_LAS2_CAMERA AND
    NOT HAVE_MUJOCO_CAMERA AND NOT HAVE_REMOTE_MUJOCO_CAMERA AND
-   NOT X86_STANDALONE)
+   NOT X86_STANDALONE AND NOT ENABLE_MANIPULATION_MUJOCO)
     message(FATAL_ERROR
         "No stereo camera backend found. Install realsense dependencies or "
         "place spacemit_las2 in ~/las2_runtime.")
@@ -393,6 +404,15 @@ if(HAVE_MUJOCO_EXECUTOR)
         list(APPEND EXTRA_LIBRARIES glfw)
         add_definitions(-DHAVE_MUJOCO_CAMERA=1)
     endif()
+    if(ENABLE_MANIPULATION_MUJOCO)
+        find_package(manipulation CONFIG REQUIRED)
+        if(NOT TARGET mujoco_sim::render)
+            message(FATAL_ERROR "The installed MuJoCo component requires MUJOCO_BUILD_RENDERER=ON")
+        endif()
+        add_definitions(-DHAVE_MANIPULATION_MUJOCO=1)
+        list(APPEND EXTRA_LIBRARIES spacemit::manipulation_motion
+            spacemit::manipulation_drivers mujoco_sim::world)
+    endif()
 endif()
 
 # ============ 执行器选择 ============
@@ -405,42 +425,25 @@ if(USE_MOCK_EXECUTOR)
     endif()
     add_definitions(-DMOCK_EXECUTOR=1)
 else()
-    message(STATUS "[Executor] REAL (manipulator + grasp)")
-
-    if(NOT DEFINED _STAGING_DIR)
-        set(_STAGING_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../output/staging")
-    endif()
-
-    find_path(MANIP_INCLUDE_DIR manipulator.h
-        PATHS "${_STAGING_DIR}/include"
-        NO_DEFAULT_PATH
-    )
-    find_library(MANIP_LIBRARY manipulator
-        PATHS "${_STAGING_DIR}/lib"
-        NO_DEFAULT_PATH
-    )
-    find_library(GRASP_LIBRARY grasp
-        PATHS "${_STAGING_DIR}/lib"
-        NO_DEFAULT_PATH
-    )
-
-    if(NOT MANIP_INCLUDE_DIR OR NOT MANIP_LIBRARY OR NOT GRASP_LIBRARY)
-        message(FATAL_ERROR
-            "Manipulator/Grasp SDK not found in staging.\n"
-            "Build components/control first, or use -DUSE_MOCK_EXECUTOR=ON")
+    message(STATUS "[Executor] REAL (manipulation)")
+    find_package(manipulation CONFIG REQUIRED)
+    if(NOT TARGET spacemit::manipulation_kinematics)
+        message(FATAL_ERROR "Build manipulation with MANIPULATION_ENABLE_KINEMATICS_PINOCCHIO=ON")
     endif()
 
     list(APPEND SOURCES
         src/grasp_executor.cpp
         src/grasp_executor_gripper.cpp
         src/grasp_executor_runtime.cpp
+        src/executor_device.cpp
+        src/executor_kinematics.cpp
         src/arm_path_safety.cpp
         src/motion_completion.cpp
     )
-    list(APPEND EXTRA_INCLUDE_DIRS ${MANIP_INCLUDE_DIR})
     list(APPEND EXTRA_LIBRARIES
-        ${MANIP_LIBRARY}
-        ${GRASP_LIBRARY}
+        spacemit::manipulation_motion
+        spacemit::manipulation_drivers
+        spacemit::manipulation_kinematics
         PkgConfig::URDFDOM
     )
 endif()
@@ -792,14 +795,49 @@ if(HAVE_MUJOCO_EXECUTOR)
         PERCEPTIVE_GRASP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME mujoco_grasp_executor_test
         COMMAND mujoco_grasp_executor_test)
+    if(ENABLE_MANIPULATION_MUJOCO)
+        target_link_libraries(mujoco_grasp_executor_test PRIVATE
+            spacemit::manipulation_motion spacemit::manipulation_drivers mujoco_sim::world yaml-cpp)
+        add_executable(manipulation_mujoco_grasp_test
+            tests/manipulation_mujoco_grasp_test.cpp
+            src/mujoco_grasp_executor.cpp src/mujoco_simulation.cpp)
+        target_include_directories(manipulation_mujoco_grasp_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include ${MUJOCO_INCLUDE_DIR} ${OpenCV_INCLUDE_DIRS})
+        target_link_libraries(manipulation_mujoco_grasp_test PRIVATE
+            spacemit::manipulation_motion spacemit::manipulation_drivers mujoco_sim::world
+            ${MUJOCO_LIB} ${OpenCV_LIBS} pthread yaml-cpp)
+        target_compile_definitions(manipulation_mujoco_grasp_test PRIVATE
+            MOCK_EXECUTOR=1 PERCEPTIVE_GRASP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME manipulation_mujoco_grasp_test COMMAND manipulation_mujoco_grasp_test)
+        set_tests_properties(manipulation_mujoco_grasp_test PROPERTIES TIMEOUT 480 RUN_SERIAL TRUE)
+        add_test(NAME manipulation_mujoco_contract_test
+            COMMAND manipulation_mujoco_grasp_test --contract-only)
+        add_test(NAME manipulation_mujoco_release_guard_test
+            COMMAND manipulation_mujoco_grasp_test --release-guard-only)
+        set_tests_properties(manipulation_mujoco_release_guard_test PROPERTIES
+            TIMEOUT 90 RUN_SERIAL TRUE)
+        add_test(NAME manipulation_mujoco_path_guard_test
+            COMMAND manipulation_mujoco_grasp_test --path-guard-only)
+        add_test(NAME manipulation_mujoco_departure_guard_test
+            COMMAND manipulation_mujoco_grasp_test --departure-guard-only)
+        set_tests_properties(manipulation_mujoco_departure_guard_test PROPERTIES
+            TIMEOUT 120 RUN_SERIAL TRUE)
+        add_test(NAME manipulation_mujoco_placement_guard_test
+            COMMAND manipulation_mujoco_grasp_test --placement-guard-only)
+        set_tests_properties(manipulation_mujoco_placement_guard_test PROPERTIES
+            TIMEOUT 120 RUN_SERIAL TRUE)
+        add_test(NAME manipulation_mujoco_cup_opening_guard_test
+            COMMAND manipulation_mujoco_grasp_test --cup-opening-guard-only)
+        set_tests_properties(manipulation_mujoco_cup_opening_guard_test PROPERTIES
+            TIMEOUT 120 RUN_SERIAL TRUE)
+    endif()
 endif()
 
-if(HAVE_MUJOCO_CAMERA)
+if(HAVE_MUJOCO_CAMERA OR ENABLE_MANIPULATION_MUJOCO)
     add_executable(mujoco_grasp_sim_server
         tools/mujoco_grasp_sim_server.cpp
         src/mujoco_grasp_executor.cpp
         src/mujoco_simulation.cpp
-        src/mujoco_stereo_camera.cpp
         src/remote_mujoco_protocol.cpp
     )
     target_include_directories(mujoco_grasp_sim_server PRIVATE
@@ -811,13 +849,39 @@ if(HAVE_MUJOCO_CAMERA)
         ${MUJOCO_LIB}
         ${OpenCV_LIBS}
         yaml-cpp
-        glfw
         pthread
     )
     target_compile_definitions(mujoco_grasp_sim_server PRIVATE
         HAVE_MUJOCO_EXECUTOR=1
-        HAVE_MUJOCO_CAMERA=1
         MOCK_EXECUTOR=1)
+    if(HAVE_MUJOCO_CAMERA)
+        target_sources(mujoco_grasp_sim_server PRIVATE src/mujoco_stereo_camera.cpp)
+        target_link_libraries(mujoco_grasp_sim_server PRIVATE glfw)
+        target_compile_definitions(mujoco_grasp_sim_server PRIVATE HAVE_MUJOCO_CAMERA=1)
+    endif()
+    if(ENABLE_MANIPULATION_MUJOCO)
+        target_sources(mujoco_grasp_sim_server PRIVATE src/manipulation_mujoco_camera.cpp)
+        target_link_libraries(mujoco_grasp_sim_server PRIVATE
+            spacemit::manipulation_motion spacemit::manipulation_drivers
+            mujoco_sim::world mujoco_sim::render)
+        find_program(XVFB_RUN_EXECUTABLE xvfb-run)
+        if(XVFB_RUN_EXECUTABLE AND ENABLE_REMOTE_MUJOCO)
+            add_test(NAME manipulation_mujoco_pipeline_test COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_manipulation_mujoco_pipeline.py
+                --server $<TARGET_FILE:mujoco_grasp_sim_server>
+                --client $<TARGET_FILE:perceptive_grasp_core>
+                --source ${CMAKE_CURRENT_SOURCE_DIR} --xvfb ${XVFB_RUN_EXECUTABLE})
+            set_tests_properties(manipulation_mujoco_pipeline_test PROPERTIES
+                TIMEOUT 240 RUN_SERIAL TRUE)
+            add_test(NAME manipulation_mujoco_cup_pipeline_test COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_manipulation_mujoco_pipeline.py
+                --server $<TARGET_FILE:mujoco_grasp_sim_server>
+                --client $<TARGET_FILE:perceptive_grasp_core>
+                --source ${CMAKE_CURRENT_SOURCE_DIR} --xvfb ${XVFB_RUN_EXECUTABLE} --target cup)
+            set_tests_properties(manipulation_mujoco_cup_pipeline_test PROPERTIES
+                TIMEOUT 240 RUN_SERIAL TRUE)
+        endif()
+    endif()
     install(TARGETS mujoco_grasp_sim_server DESTINATION bin)
     install(DIRECTORY simulation/mujoco/
         DESTINATION share/perceptive_grasp/simulation/mujoco)
@@ -880,7 +944,12 @@ install(PROGRAMS
     scripts/check_runtime_env.py
     scripts/local_voice_bridge.py
     scripts/tts_node.py
+    scripts/calibrate_hand_eye.py
     DESTINATION share/perceptive_grasp/scripts)
+install(FILES scripts/hand_eye_collection.py
+    DESTINATION share/perceptive_grasp/scripts)
+add_test(NAME hand_eye_collection_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hand_eye_collection.py)
 
 # ============ 立体相机调试工具 ============
 
@@ -1062,16 +1131,16 @@ if(HAVE_REALSENSE_CAMERA)
     if(USE_OPENCV_DNN OR USE_MOCK_EXECUTOR)
         message(WARNING
             "debug_grasp skipped: requires VisionService and the real "
-            "manipulator SDK")
+            "manipulation executor")
         set_target_properties(debug_grasp PROPERTIES EXCLUDE_FROM_ALL TRUE)
     else()
         target_include_directories(debug_grasp PRIVATE
             ${VISION_INCLUDE_DIR}
-            ${MANIP_INCLUDE_DIR}
         )
+        target_sources(debug_grasp PRIVATE src/executor_kinematics.cpp)
         target_link_libraries(debug_grasp PRIVATE
             ${VISION_LIBRARY}
-            ${MANIP_LIBRARY}
+            spacemit::manipulation_kinematics
         )
         install(TARGETS debug_grasp DESTINATION bin)
     endif()
@@ -1081,14 +1150,29 @@ else()
 endif()
 
 if(NOT USE_MOCK_EXECUTOR)
-    add_executable(debug_ik tools/debug_ik.cpp)
+    add_executable(executor_device_test tests/executor_device_test.cpp src/executor_device.cpp)
+    target_include_directories(executor_device_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(executor_device_test PRIVATE spacemit::manipulation_motion
+        spacemit::manipulation_drivers)
+    target_compile_options(executor_device_test PRIVATE -UNDEBUG)
+    add_test(NAME executor_device_test COMMAND executor_device_test)
+
+    add_executable(executor_kinematics_test tests/executor_kinematics_test.cpp
+        src/executor_kinematics.cpp)
+    target_include_directories(executor_kinematics_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(executor_kinematics_test PRIVATE
+        PERCEPTIVE_GRASP_TEST_MODEL="${CMAKE_CURRENT_SOURCE_DIR}/config/devices/so101_model.json")
+    target_link_libraries(executor_kinematics_test PRIVATE yaml-cpp spacemit::manipulation_kinematics)
+    target_compile_options(executor_kinematics_test PRIVATE -UNDEBUG)
+    add_test(NAME executor_kinematics_test COMMAND executor_kinematics_test)
+
+    add_executable(debug_ik tools/debug_ik.cpp src/executor_kinematics.cpp)
     target_include_directories(debug_ik PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${MANIP_INCLUDE_DIR}
     )
     target_link_libraries(debug_ik PRIVATE
         yaml-cpp
-        ${MANIP_LIBRARY}
+        spacemit::manipulation_kinematics
     )
     install(TARGETS debug_ik DESTINATION bin)
 
@@ -1097,6 +1181,8 @@ if(NOT USE_MOCK_EXECUTOR)
         src/grasp_executor.cpp
         src/grasp_executor_gripper.cpp
         src/grasp_executor_runtime.cpp
+        src/executor_device.cpp
+        src/executor_kinematics.cpp
         src/arm_path_safety.cpp
         src/gripper_holding.cpp
         src/motion_completion.cpp
@@ -1104,13 +1190,13 @@ if(NOT USE_MOCK_EXECUTOR)
     target_include_directories(debug_execute_safe PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${OpenCV_INCLUDE_DIRS}
-        ${MANIP_INCLUDE_DIR}
     )
     target_link_libraries(debug_execute_safe PRIVATE
         yaml-cpp
         ${OpenCV_LIBS}
-        ${MANIP_LIBRARY}
-        ${GRASP_LIBRARY}
+        spacemit::manipulation_motion
+        spacemit::manipulation_drivers
+        spacemit::manipulation_kinematics
         PkgConfig::URDFDOM
         pthread
     )
@@ -1120,14 +1206,14 @@ endif()
 # ============ 关节读取工具 ============
 
 if(NOT USE_MOCK_EXECUTOR)
-    # read_joints 需要真实的 manipulator SDK。
+    # This reader uses the same resource lease and calibrated device plan as the application.
     add_executable(read_joints tools/read_joints.cpp)
     target_include_directories(read_joints PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${MANIP_INCLUDE_DIR}
     )
     target_link_libraries(read_joints PRIVATE
-        ${MANIP_LIBRARY}
+        spacemit::manipulation_motion
+        spacemit::manipulation_drivers
         pthread
     )
     install(TARGETS read_joints DESTINATION bin)

@@ -426,46 +426,16 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         self.assertIn("RealSense D435i", output.getvalue())
         self.assertIn("not found", output.getvalue())
 
-    def test_so101_probe_finds_read_joints_in_named_build_directory(self):
-        tool = str(ROOT / "build_las2" / "read_joints")
-        result = SimpleNamespace(
-            returncode=0,
-            stdout="[ReadJoints] Current joints (rad): [1, 2, 3, 4, 5]",
-            stderr="",
-        )
-        with mock.patch.object(check_runtime_env.glob, "glob",
-                               return_value=[tool]), \
-                mock.patch.object(check_runtime_env.os.path, "isfile",
-                                  side_effect=lambda path: path == tool), \
-                mock.patch.object(check_runtime_env.os, "access",
-                                  return_value=True), \
-                mock.patch.object(check_runtime_env.subprocess, "run",
-                                  return_value=result) as run:
-            ok = check_runtime_env._probe_so101_device(
-                "/dev/ttyACM0", str(ROOT))
-
+    def test_serial_discovery_does_not_open_or_probe_candidate_ports(self):
+        with mock.patch.object(check_runtime_env.glob, "glob", return_value=["/dev/ttyACM0"]), \
+                mock.patch.object(check_runtime_env, "_udev_properties", return_value={
+                    "ID_MODEL": "USB_Single_Serial"}), \
+                mock.patch.object(check_runtime_env.subprocess, "run") as run:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok = check_runtime_env.check_serial_role_configuration(
+                    "/dev/ttyACM0", "", False, "unused")
         self.assertTrue(ok)
-        self.assertEqual(run.call_args.args[0][0], tool)
-        self.assertEqual(run.call_args.kwargs["cwd"], str(ROOT))
-
-    def test_so101_probe_prefers_requested_build_directory(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tool = str(Path(tmp) / "read_joints")
-            Path(tool).write_text("#!/bin/sh\n", encoding="utf-8")
-            Path(tool).chmod(0o755)
-            result = SimpleNamespace(
-                returncode=0,
-                stdout=("[ReadJoints] Current joints (rad): "
-                        "[1, 2, 3, 4, 5]"),
-                stderr="",
-            )
-            with mock.patch.object(check_runtime_env.subprocess, "run",
-                                   return_value=result) as run:
-                ok = check_runtime_env._probe_so101_device(
-                    "/dev/ttyACM1", str(ROOT), tmp)
-
-        self.assertTrue(ok)
-        self.assertEqual(run.call_args.args[0][0], tool)
+        run.assert_not_called()
 
     def test_application_check_finds_launcher_and_core_in_named_build_directory(self):
         build_dir = str(ROOT / "build_release")
@@ -783,74 +753,52 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         check_realsense.assert_not_called()
 
     def test_kinematics_check_reports_missing_pinocchio_backend(self):
-        cache_text = (
-            "//The directory containing a CMake configuration file for pinocchio.\n"
-            "pinocchio_DIR:PATH=pinocchio_DIR-NOTFOUND\n"
-        )
-
-        def fake_exists(path):
-            return str(path).endswith("libmanipulator.so") \
-                or str(path).endswith("CMakeCache.txt")
-
-        def fake_open(path, *args, **kwargs):
-            if str(path).endswith("CMakeCache.txt"):
-                return io.StringIO(cache_text)
-            return open(path, *args, **kwargs)
-
-        def fake_run(command, *args, **kwargs):
-            if command[0] == "nm":
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
-            if command[0] == "ldd":
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
-            raise AssertionError(command)
-
-        with mock.patch.object(check_runtime_env.os.path, "exists",
-                               side_effect=fake_exists), \
-                mock.patch.object(check_runtime_env.subprocess, "run",
-                                  side_effect=fake_run), \
-                mock.patch("builtins.open", side_effect=fake_open):
+        with mock.patch.object(check_runtime_env.os.path, "isfile", return_value=True), \
+                mock.patch.object(check_runtime_env.os, "access", return_value=True), \
+                mock.patch.object(check_runtime_env.subprocess, "run", return_value=SimpleNamespace(
+                    returncode=1, stdout="", stderr="unknown kinematics backend: pinocchio")) as run:
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                ok = check_runtime_env.check_kinematics_backend("/tmp/sdk")
+                ok = check_runtime_env.check_kinematics_backend("/tmp/sdk", "cfg.yaml", "/tmp/app")
 
         self.assertFalse(ok)
-        self.assertIn("pinocchio backend in libmanipulator", output.getvalue())
-        self.assertIn("pinocchio_DIR-NOTFOUND", output.getvalue())
+        self.assertIn("unknown kinematics backend", output.getvalue())
+        self.assertEqual(run.call_args.args[0], [
+            "/tmp/app/debug_ik", "--config", os.path.abspath("cfg.yaml"), "--check-model"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 10)
 
     def test_kinematics_check_reports_unresolved_runtime_libraries(self):
-        def fake_exists(path):
-            return str(path).endswith("libmanipulator.so") \
-                or str(path).endswith("CMakeCache.txt")
-
-        def fake_run(command, *args, **kwargs):
-            if command[0] == "nm":
-                return SimpleNamespace(
-                    returncode=0,
-                    stdout="_ZN9pinocchio4testEv\n",
-                    stderr="",
-                )
-            if command[0] == "ldd":
-                return SimpleNamespace(
-                    returncode=0,
-                    stdout="libpinocchio_default.so => not found\n",
-                    stderr="",
-                )
-            raise AssertionError(command)
-
-        with mock.patch.object(check_runtime_env.os.path, "exists",
-                               side_effect=fake_exists), \
-                mock.patch.object(check_runtime_env.subprocess, "run",
-                                  side_effect=fake_run), \
-                mock.patch("builtins.open", return_value=io.StringIO(
-                    "pinocchio_DIR:PATH=/opt/ros/humble/lib/cmake/pinocchio\n")):
+        with mock.patch.object(check_runtime_env.os.path, "isfile", return_value=True), \
+                mock.patch.object(check_runtime_env.os, "access", return_value=True), \
+                mock.patch.object(check_runtime_env.subprocess, "run", return_value=SimpleNamespace(
+                    returncode=127, stdout="", stderr="libpinocchio_default.so => not found")):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 ok = check_runtime_env.check_kinematics_backend("/tmp/sdk")
 
         self.assertFalse(ok)
-        self.assertIn("libmanipulator runtime libraries", output.getvalue())
+        self.assertIn("manipulation kinematics", output.getvalue())
         self.assertIn("libpinocchio_default.so => not found",
                       output.getvalue())
+
+    def test_device_plan_port_is_relative_to_plan_not_working_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "devices").mkdir()
+            (root / "devices" / "arm.yaml").write_text(
+                "device:\n  arm:\n    options:\n      port: serial/arm\n")
+            config = {"manipulator": {"device_plan": "devices/arm.yaml"}}
+            port = check_runtime_env.configured_arm_port(config, str(root / "pipeline.yaml"))
+        self.assertEqual(port, str(root / "devices/serial/arm"))
+
+    def test_device_plan_port_overrides_legacy_uart_field_without_device_access(self):
+        config = {"manipulator": {"device_plan": "/tmp/device.yaml", "uart_device": "/dev/old"}}
+        with mock.patch.object(check_runtime_env, "load_yaml", return_value={
+                "device": {"options": {"port": "/dev/current"}}}), \
+                mock.patch.object(check_runtime_env.subprocess, "run") as run:
+            self.assertEqual(check_runtime_env.configured_arm_port(config, "/tmp/pipeline.yaml"),
+                             "/dev/current")
+        run.assert_not_called()
 
     def test_sdk_root_can_be_inferred_from_project_path(self):
         project = "/home/user/spacemit_robot/application/ros2/linksee/perceptive_grasp"
@@ -929,7 +877,7 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         text = output.getvalue()
         self.assertIn("[INFO] serial devices:", text)
         self.assertIn("/dev/ttyACM2", text)
-        self.assertIn("role=manipulator.uart_device", text)
+        self.assertIn("role=manipulator.device_plan port", text)
         self.assertIn("/dev/serial/by-id/usb-single-serial-if00", text)
         self.assertIn("ID_MODEL=USB Single Serial", text)
         self.assertIn("/dev/ttyACM1", text)
@@ -1137,10 +1085,7 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
                 mock.patch.object(check_runtime_env.os.path, "realpath",
                                   side_effect=fake_realpath), \
                 mock.patch.object(check_runtime_env, "_udev_properties",
-                                  side_effect=fake_props), \
-                mock.patch.object(check_runtime_env, "_probe_so101_device",
-                                  side_effect=lambda d, r, b="":
-                                  d == "/dev/ttyACM1"):
+                                  side_effect=fake_props):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 ok = check_runtime_env.check_serial_role_configuration(
@@ -1152,16 +1097,9 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
 
         text = output.getvalue()
         self.assertFalse(ok)
-        self.assertIn("manipulator.uart_device role", text)
+        self.assertIn("manipulator.device_plan port", text)
         self.assertIn("camera serial", text)
-        self.assertIn(
-            'manipulator.uart_device: "/dev/serial/by-id/usb-arm-if00"',
-            text,
-        )
-        self.assertIn(
-            'mobile_base.dev_path: "/dev/serial/by-id/usb-base-if00"',
-            text,
-        )
+        self.assertNotIn("[SUGGEST]", text)
 
     def test_serial_role_check_fails_when_base_uses_detected_arm_port(self):
         def fake_realpath(path):
@@ -1185,10 +1123,7 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
                                   return_value={
                                       "ID_MODEL": "USB_Single_Serial",
                                       "ID_VENDOR": "1a86",
-                                  }), \
-                mock.patch.object(check_runtime_env, "_probe_so101_device",
-                                  side_effect=lambda d, r, b="":
-                                  d == "/dev/ttyACM1"):
+                                  }):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 ok = check_runtime_env.check_serial_role_configuration(
@@ -1201,13 +1136,13 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         text = output.getvalue()
         self.assertFalse(ok)
         self.assertIn("mobile_base.dev_path role", text)
-        self.assertIn("SO101 manipulator port", text)
+        self.assertIn("configured arm port", text)
         self.assertIn(
             'mobile_base.dev_path: "/dev/serial/by-id/usb-base-if00"',
             text,
         )
 
-    def test_serial_role_check_fails_when_no_so101_port_responds(self):
+    def test_serial_role_check_fails_when_configured_port_is_missing(self):
         def fake_realpath(path):
             mapping = {
                 "/dev/serial/by-id/usb-arm-if00": "/dev/ttyACM1",
@@ -1229,13 +1164,11 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
                                   return_value={
                                       "ID_MODEL": "USB_Single_Serial",
                                       "ID_VENDOR": "1a86",
-                                  }), \
-                mock.patch.object(check_runtime_env, "_probe_so101_device",
-                                  return_value=False):
+                                  }):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 ok = check_runtime_env.check_serial_role_configuration(
-                    "/dev/ttyACM1",
+                    "/dev/ttyACM9",
                     "/dev/ttyACM2",
                     True,
                     str(ROOT),
@@ -1243,8 +1176,8 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
 
         text = output.getvalue()
         self.assertFalse(ok)
-        self.assertIn("manipulator.uart_device role", text)
-        self.assertIn("SO101 did not respond", text)
+        self.assertIn("manipulator.device_plan port", text)
+        self.assertIn("configured port not among USB serial devices", text)
 
 
 if __name__ == "__main__":

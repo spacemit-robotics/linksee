@@ -671,10 +671,17 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
     if (auto m = root["manipulator"]) {
         cfg.executor.manip_driver = m["driver"].as<std::string>(
             cfg.executor.manip_driver);
-        cfg.executor.uart_device = m["uart_device"].as<std::string>(
-            cfg.executor.uart_device);
-        cfg.executor.baudrate = m["baudrate"].as<int>(
-            cfg.executor.baudrate);
+        const auto resolve_manipulation_path = [&](const char* key) {
+            const std::string value = m[key].as<std::string>("");
+            return value.empty() ? value :
+                fs::absolute(fs::path(config_path).parent_path() / value).lexically_normal().string();
+        };
+        cfg.executor.device_plan = resolve_manipulation_path("device_plan");
+        cfg.executor.model = resolve_manipulation_path("model");
+        cfg.executor.kinematics_solver = m["kinematics_solver"].as<std::string>(
+            cfg.executor.kinematics_solver);
+        cfg.executor.gripper_command_duration_s = m["gripper_command_duration_s"].as<float>(
+            cfg.executor.gripper_command_duration_s);
         cfg.executor.urdf_path = m["urdf_path"].as<std::string>(
             cfg.executor.urdf_path);
         cfg.executor.legacy_top_ik = m["legacy_top_ik"].as<bool>(
@@ -723,6 +730,8 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             auto& mujoco = cfg.executor.mujoco;
             mujoco.xml_path = mj["xml_path"].as<std::string>(
                 mujoco.xml_path);
+            mujoco.device_plan = mj["device_plan"].as<std::string>(
+                mujoco.device_plan);
             mujoco.end_effector_site =
                 mj["end_effector_site"].as<std::string>(
                     mujoco.end_effector_site);
@@ -1313,10 +1322,17 @@ int main(int argc, char* argv[]) {
     ResolveConfigPath(config_dir, &cfg.camera.spacemit_las2.calib_path);
     ResolveConfigPath(config_dir, &cfg.camera.mujoco.xml_path);
     ResolveConfigPath(config_dir, &cfg.executor.mujoco.xml_path);
+    ResolveConfigPath(config_dir, &cfg.executor.mujoco.device_plan);
 
     if (validate_config_only) {
         std::cout << "[Config] valid" << std::endl;
         return 0;
+    }
+    if (!cfg.executor.mujoco.device_plan.empty()) {
+        std::cerr << "This configuration starts the shared simulation service: use "
+                << "mujoco_grasp_sim_server --config; use the remote profile for perception."
+                << std::endl;
+        return 1;
     }
 
     // 创建并初始化 Pipeline

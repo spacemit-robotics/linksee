@@ -27,14 +27,23 @@
 #include <string>
 #include <vector>
 
-#include <GLFW/glfw3.h>
 #include <opencv2/core.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include "mujoco_grasp_executor.h"
+#ifdef HAVE_MUJOCO_CAMERA
+#include <GLFW/glfw3.h>
 #include "mujoco_simulation.h"
 #include "mujoco_stereo_camera.h"
+#endif
 #include "remote_mujoco_protocol.h"
+#include "stereo_camera.h"
+#ifdef HAVE_MANIPULATION_MUJOCO
+#include "manipulation_mujoco_camera.h"
+#include "manipulation/mujoco_runtime.h"
+#include "mujoco_render.h"
+#include "mujoco_world.h"
+#endif
 
 namespace fs = std::filesystem;
 
@@ -149,6 +158,11 @@ static ServerConfig LoadConfig(const std::string& path) {
                     &config.executor.place_joints);
     }
     auto& executor_settings = config.executor.mujoco;
+    executor_settings.device_plan = mujoco_executor["device_plan"].as<std::string>("");
+    if (!executor_settings.device_plan.empty()) {
+        config.executor.move_speed = manipulator["move_speed"].as<float>(config.executor.move_speed);
+        config.executor.line_speed = manipulator["line_speed"].as<float>(config.executor.line_speed);
+    }
     executor_settings.xml_path =
         mujoco_executor["xml_path"].as<std::string>(
             executor_settings.xml_path);
@@ -210,6 +224,7 @@ static ServerConfig LoadConfig(const std::string& path) {
     ParseStringList(mujoco_executor["actuator_names"],
                     &executor_settings.actuator_names);
     ResolveConfigPath(config_dir, &executor_settings.xml_path);
+    ResolveConfigPath(config_dir, &executor_settings.device_plan);
     return config;
 }
 
@@ -485,6 +500,7 @@ private:
     std::unique_ptr<MujocoGraspExecutor> executor_;
 };
 
+#ifdef HAVE_MUJOCO_CAMERA
 class MujocoViewer {
 public:
     ~MujocoViewer() {
@@ -688,6 +704,7 @@ private:
     mjvScene scene_;
     mjrContext context_;
 };
+#endif
 
 static int CreateListenSocket(const std::string& host, int port) {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -726,7 +743,11 @@ static void PrintUsage(const char* argv0) {
 }  // namespace
 }  // namespace perceptive_grasp
 
-int main(int argc, char* argv[]) {
+static int RunServer(int argc, char* argv[]) {
+#if defined(HAVE_MANIPULATION_MUJOCO) && MUJOCO_RENDER_USES_GL4ES
+    setenv("LIBGL_GL", "21", 0);
+    setenv("LIBGL_ES", "2", 0);
+#endif
     using perceptive_grasp::ServerConfig;
     ServerConfig config;
     bool listen_overridden = false;
@@ -771,24 +792,51 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::unique_ptr<perceptive_grasp::StereoCamera> camera =
-        perceptive_grasp::CreateMujocoStereoCamera(config.camera);
-    if (!camera || !camera->Init()) {
-        std::cerr << "[MujocoSimServer] failed to initialize camera"
-                << std::endl;
-        return 1;
-    }
+    std::unique_ptr<perceptive_grasp::StereoCamera> camera;
     auto executor =
         std::make_unique<perceptive_grasp::MujocoGraspExecutor>(
             config.executor);
-    if (!executor->Init()) {
-        std::cerr << "[MujocoSimServer] failed to initialize executor"
-                << std::endl;
+    bool executor_initialized = false;
+#ifdef HAVE_MANIPULATION_MUJOCO
+    if (!config.executor.mujoco.device_plan.empty()) {
+        executor_initialized = executor->Init();
+        if (!executor_initialized) return 1;
+        camera = perceptive_grasp::CreateManipulationMujocoCamera(
+            executor->SimulationRuntime(), config.camera);
+    }
+#endif
+#ifdef HAVE_MUJOCO_CAMERA
+    if (!camera) camera = perceptive_grasp::CreateMujocoStereoCamera(config.camera);
+#endif
+    if (!camera || !camera->Init() || (!executor_initialized && !executor->Init())) {
+        std::cerr << "[MujocoSimServer] failed to initialize simulation" << std::endl;
         return 1;
     }
 
+#ifdef HAVE_MANIPULATION_MUJOCO
+    std::unique_ptr<mujoco_sim::Viewer> shared_viewer;
+    std::function<void()> draw_shared_viewer;
+    const auto shared_runtime = executor->SimulationRuntime();
+    if (config.viewer && shared_runtime) {
+        shared_viewer = std::make_unique<mujoco_sim::Viewer>();
+        auto next_frame = std::chrono::steady_clock::now();
+        draw_shared_viewer = [&, next_frame]() mutable {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < next_frame) return;
+            // UI refresh is independent of control polling and the owner's physics timestep.
+            next_frame = now + std::chrono::milliseconds(33);
+            if (shared_viewer->ShouldClose()) {
+                perceptive_grasp::g_stop.store(true);
+            } else {
+                shared_viewer->Draw(shared_runtime->Snapshot());
+            }
+        };
+        executor->SetVisualStepCallback([&]() { draw_shared_viewer(); });
+    }
+#endif
+#ifdef HAVE_MUJOCO_CAMERA
     std::unique_ptr<perceptive_grasp::MujocoViewer> viewer;
-    if (config.viewer) {
+    if (config.viewer && config.executor.mujoco.device_plan.empty()) {
         viewer = std::make_unique<perceptive_grasp::MujocoViewer>();
         std::string error;
         if (!viewer->Init(
@@ -813,6 +861,7 @@ int main(int argc, char* argv[]) {
             }
         });
     }
+#endif
     perceptive_grasp::SimServer server(std::move(camera), std::move(executor));
 
     int listen_fd = -1;
@@ -833,6 +882,7 @@ int main(int argc, char* argv[]) {
             now - last_tick).count();
         last_tick = now;
         server.Tick(std::clamp(elapsed_s, 0.0f, 0.05f));
+#ifdef HAVE_MUJOCO_CAMERA
         if (viewer) {
             if (viewer->ShouldClose()) {
                 perceptive_grasp::g_stop.store(true);
@@ -840,6 +890,13 @@ int main(int argc, char* argv[]) {
             }
             viewer->Render();
         }
+#endif
+#ifdef HAVE_MANIPULATION_MUJOCO
+        if (shared_viewer) {
+            if (shared_viewer->ShouldClose()) break;
+            draw_shared_viewer();
+        }
+#endif
         pollfd pfd{};
         pfd.fd = listen_fd;
         pfd.events = POLLIN;
@@ -871,7 +928,14 @@ int main(int argc, char* argv[]) {
         std::vector<std::uint8_t> payload;
         if (perceptive_grasp::remote_mujoco::ReadRequest(
                 client_fd, &command, &request, &error)) {
-            server.Handle(command, request, &ok, &result, &detail, &payload);
+            try {
+                server.Handle(command, request, &ok, &result, &detail, &payload);
+            } catch (const std::exception& failure) {
+                ok = false;
+                result = static_cast<std::int32_t>(perceptive_grasp::GraspResult::MOVE_FAILED);
+                detail = failure.what();
+                payload.clear();
+            }
         } else {
             detail = error;
             result = static_cast<std::int32_t>(
@@ -884,4 +948,13 @@ int main(int argc, char* argv[]) {
     close(listen_fd);
     std::cout << "[MujocoSimServer] Stopped" << std::endl;
     return 0;
+}
+
+int main(int argc, char* argv[]) {
+    try {
+        return RunServer(argc, argv);
+    } catch (const std::exception& failure) {
+        std::cerr << "[MujocoSimServer] " << failure.what() << std::endl;
+        return 1;
+    }
 }

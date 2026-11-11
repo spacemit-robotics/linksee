@@ -8,6 +8,7 @@
 
 from pathlib import Path
 import unittest
+import xml.etree.ElementTree as ET
 
 import yaml
 
@@ -90,6 +91,29 @@ class BackendProfilesTest(unittest.TestCase):
         self.assertIn("qwen3_asr", config)
         self.assertIn("model_dir", config["sensevoice"])
         self.assertIn("endpoint", config["qwen3_asr"])
+
+    def test_shared_world_profile_keeps_physical_tuning_in_scene(self):
+        config = _load("grasp_pipeline_manipulation_mujoco.yaml")
+        settings = config["manipulator"]["mujoco"]
+        self.assertFalse(settings["gravity_compensation"])
+        self.assertEqual(settings["arm_stiffness_scale"], 1.0)
+        plan = (CONFIG / settings["device_plan"]).resolve()
+        definition = yaml.safe_load(plan.read_text(encoding="utf-8"))["device"]
+        self.assertEqual(definition["arm"]["driver"], "mujoco")
+        self.assertEqual(definition["effector"]["driver"], "mujoco")
+        self.assertEqual(definition["arm"]["options"], definition["effector"]["options"])
+        self.assertFalse(config["mobile_base"]["enabled"])
+        self.assertEqual(config["camera"]["mujoco"]["xml_path"], settings["xml_path"])
+        scene = ET.parse(ROOT / "simulation/mujoco/manipulation_scene.xml").getroot()
+        self.assertEqual(scene.find("option/flag").get("multiccd"), "enable")
+        legacy = ET.parse(ROOT / "simulation/mujoco/ur5e_scene.xml").getroot()
+        self.assertIsNone(legacy.find("option/flag"))
+
+    def test_shared_world_remote_profile_defaults_to_loopback(self):
+        config = _load("grasp_pipeline_manipulation_remote.yaml")
+        self.assertEqual(config["remote_mujoco"]["host"], "127.0.0.1")
+        self.assertEqual(config["camera"]["type"], "remote_mujoco")
+        self.assertEqual(config["manipulator"]["driver"], "remote_mujoco")
 
 
 if __name__ == "__main__":

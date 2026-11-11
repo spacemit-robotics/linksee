@@ -17,6 +17,7 @@ camera:
       hole_filling: false
 
   spacemit_las2:
+    serial: ""  # 手眼标定必填：本台相机序列号或固定资产编号
     video_device: "/dev/v4l/by-id/usb-DECXIN_DECXIN_Camera_01.00.00-video-index0"
     model_path: "~/las2_runtime/models/LAS2_M_256x320.fp16.iofp32.corr_func_nhwc.gelu.onnx"
     calib_path: "~/las2_runtime/config/matlab_stereo_opencv.json"
@@ -101,7 +102,12 @@ orientation:
 
 # 机械臂与放置姿态
 manipulator:
-  uart_device: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14113459-if00"
+  device_plan: "devices/linksee_so101.yaml"
+  model: "devices/so101_model.json"
+  calibration_resources:
+    - "devices/so101_calibration.json"
+    - "devices/so101_gripper_calibration.json"
+  kinematics_solver: "pinocchio"
   urdf_path: "../urdf/so101.urdf"
   tip_link: "gripper_frame_link"
   legacy_top_ik: true

@@ -16,6 +16,12 @@
 
 #include "grasp_executor.h"
 
+#ifdef HAVE_MANIPULATION_MUJOCO
+namespace spacemit::manipulation {
+class MujocoRuntime;
+}
+#endif
+
 namespace perceptive_grasp {
 
 class MujocoGraspExecutor : public GraspExecutor {
@@ -24,7 +30,11 @@ public:
     ~MujocoGraspExecutor() override;
 
     void SetVisualStepCallback(std::function<void()> callback);
-    /** Reset the world and randomize the pickup layout explicitly. */
+#ifdef HAVE_MANIPULATION_MUJOCO
+    /** The shared live world; null for the standalone compatibility backend. */
+    std::shared_ptr<spacemit::manipulation::MujocoRuntime> SimulationRuntime() const;
+#endif
+    /** Reset the scene; the shared-world backend restores its configured keyframe. */
     void ResetScene();
     void SetTargetLabel(const std::string& target_label) override;
     bool Init() override;
@@ -80,6 +90,8 @@ private:
                             bool constrain_orientation = true,
                             bool allow_target_contact = false);
     GraspResult SetGripperCtrl(float ctrl, const char* action);
+    GraspResult PrepareCupRelease();
+    GraspResult RetreatFromCup();
 };
 
 }  // namespace perceptive_grasp

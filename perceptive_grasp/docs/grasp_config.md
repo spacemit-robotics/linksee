@@ -1,10 +1,12 @@
 # 抓取配置参考
 
-本文说明三份发布配置的字段、默认值和约束：
+本文说明以下配置的字段、示例值和约束：
 
 - [`grasp_pipeline.yaml`](../config/grasp_pipeline.yaml)：Linksee 真机。
-- [`grasp_pipeline_mujoco_ur5e.yaml`](../config/grasp_pipeline_mujoco_ur5e.yaml)：PC 本地 MuJoCo。
-- [`grasp_pipeline_remote_mujoco_ur5e.yaml`](../config/grasp_pipeline_remote_mujoco_ur5e.yaml)：PC 或 K3 连接远程 MuJoCo 服务。
+- [`grasp_pipeline_manipulation_mujoco.yaml`](../config/grasp_pipeline_manipulation_mujoco.yaml)：PC 或 K3 的 `manipulation` 共享仿真服务。
+- [`grasp_pipeline_manipulation_remote.yaml`](../config/grasp_pipeline_manipulation_remote.yaml)：共享仿真的本机或远程客户端。
+- [`grasp_pipeline_mujoco_ur5e.yaml`](../config/grasp_pipeline_mujoco_ur5e.yaml)：独立兼容后端的 PC 服务。
+- [`grasp_pipeline_remote_mujoco_ur5e.yaml`](../config/grasp_pipeline_remote_mujoco_ur5e.yaml)：独立兼容后端的 PC 或 K3 客户端。
 
 修改真机配置前，按[硬件部署](hardware_setup.md)确认设备路径和权限。
 
@@ -49,6 +51,7 @@ camera:
 ```yaml
 camera:
   spacemit_las2:
+    serial: ""  # 手眼标定必填：本台相机序列号或固定资产编号
     video_device: "/dev/v4l/by-id/usb-DECXIN_DECXIN_Camera_01.00.00-video-index0"
     model_path: "~/las2_runtime/models/LAS2_M_256x320.fp16.iofp32.corr_func_nhwc.gelu.onnx"
     calib_path: "~/las2_runtime/config/matlab_stereo_opencv.json"
@@ -59,6 +62,7 @@ camera:
       max_m: 2.0
 ```
 
+- `serial`：手眼标定使用的本台相机序列号或固定资产编号，须人工填写，不自动核验 USB 设备。
 - `video_device`：双目相机视频设备，使用 `/dev/v4l/by-id/` 稳定路径。
 - `model_path`：spacemit_las2 onnx 模型路径，支持以 `~/` 表示当前用户主目录。
 - `calib_path`：双目标定 json 路径，支持以 `~/` 表示当前用户主目录。
@@ -74,7 +78,7 @@ camera:
 camera:
   type: "mujoco"
   mujoco:
-    xml_path: "../simulation/mujoco/ur5e_scene.xml"
+    xml_path: "../simulation/mujoco/manipulation_scene.xml"
     camera_name: "realsense"
     width: 640
     height: 480
@@ -87,6 +91,8 @@ camera:
 - `mujoco.camera_name`：场景 XML 中用于 RGB-D 渲染的相机名称。
 - `mujoco.width`、`mujoco.height`：渲染图像尺寸，单位像素。
 - `mujoco.depth.min_m`、`mujoco.depth.max_m`：输出深度图的有效距离范围，单位米。
+
+共享后端由服务端从同一物理世界读取相机；其服务配置不能直接用于独立 pipeline。兼容后端的场景为 `../simulation/mujoco/ur5e_scene.xml`。
 
 `camera.type: "remote_mujoco"` 从远程仿真服务获取相同格式的彩色图、深度图和相机内参。远程服务地址由 [`remote_mujoco`](#7-配置-mujoco-服务与远程连接) 配置块统一设置。
 
@@ -237,7 +243,7 @@ orientation:
 
 **公共夹爪参数：**
 
-- `gripper_effort`：闭合抓取时请求的归一化控制量，范围为 `[0, 1]`；
+- `gripper_effort`：兼容配置字段，范围为 `[0, 1]`；SO101 执行路径不提供力度控制，闭合速度受设备配置约束；
   SO101 UART 夹爪将它作为闭合速度比例，并保留 `0.2` 的最低速度以避免失步。
 - `gripper_hold_load_threshold`：持物判断使用的绝对负载下限。程序还会根据空夹爪负载分布计算动态阈值，并采用两者中的较大值。
 - `gripper_empty_position_margin`：抓取后夹爪开度相对空夹爪位置分布中位数的最小差值。程序会同时考虑基线波动，避免测量噪声造成误判。
@@ -271,12 +277,18 @@ orientation:
 
 ```yaml
 manipulator:
-  uart_device: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A7A057974-if00"
+  device_plan: "devices/linksee_so101.yaml"
+  model: "devices/so101_model.json"
+  calibration_resources:
+    - "devices/so101_calibration.json"
+    - "devices/so101_gripper_calibration.json"
+  kinematics_solver: "pinocchio"
   urdf_path: "../urdf/so101.urdf"
   tip_link: "gripper_frame_link"
   legacy_top_ik: true
   move_speed: 1.0
   line_speed: 0.5
+  gripper_command_duration_s: 0.5
   home_joints: [1.546, -1.765, 1.400, 1.093, 0.186]
   observe_joints: [1.544, -0.067, 0.101, 1.382, 0.188]
   side_ready_joints: [1.550, 0.021, 1.400, -1.700, -0.036]
@@ -293,12 +305,16 @@ place:
 ```
 
 - `driver`：机械臂执行后端。Linksee 真机使用 `so101`，本地仿真使用 `mujoco_ur5e`，远程仿真使用 `remote_mujoco`。
-- `uart_device`：机械臂舵机总线的稳定串口路径。
+- `device_plan`：公共设备配置，定义机械臂与末端驱动、连接、反馈和限位；`steps` 必须为空。真机串口在该文件的 `options.port` 中设置。
+- `model`：公共模型描述，包含 URDF、基座、末端及关节顺序。关节顺序须与设备配置完全一致。
+- `calibration_resources`：本台设备的校准文件列表；标定采集用其内容摘要防止混用不同关节参考。
+- `kinematics_solver`：注册的求解器名称，默认 `pinocchio`。
 - `urdf_path`：机械臂 urdf 文件路径，相对主配置文件所在目录解析。
 - `tip_link`：逆运动学、路径安全检查和到位验证使用的 TCP 坐标系。Linksee 真机配置使用 `gripper_frame_link`；仿真执行器使用各自模型中的末端站点。
 - `legacy_top_ik`：选择 SO101 固定夹爪朝向的顶抓 IK 路径。Linksee 真机配置为 `true`；仿真配置为 `false`，由对应仿真执行器规划路径。
 - `move_speed`：关节运动速度倍率，范围为 `[0, 1]`。
 - `line_speed`：末端直线运动速度倍率，范围为 `[0, 1]`。
+- `gripper_command_duration_s`：单次夹爪目标的期望运动时间，默认 `0.5` 秒，范围为 `(0, 120]`；实际速度同时受设备限速约束。
 - `home_joints`：任务结束后的归位姿态，关节角单位弧度。
 - `observe_joints`：检测目标前的通用观察姿态，关节角单位弧度。顶抓从该姿态进入预抓取位，不能与侧抓准备姿态混用。
 - `side_ready_joints`：侧抓前的水平夹爪准备姿态，关节角单位弧度。侧抓路径从该姿态进入目标前方的预抓取位。
@@ -306,15 +322,20 @@ place:
 - `place_joints`：抓取成功后的放置姿态，关节角单位弧度。Linksee 在底座转向放置侧时受腕部线束耦合影响，第 5 轴使用真机稳定角 `0.330 rad`，不复用观察位的 `0.188 rad`。
 - `release_open`：放置目标时的夹爪张开度，范围为 `[0, 1]`。
 
+文件路径相对所属配置解析。连接只读取状态；运行前机械臂与夹爪须已按现场规程使能。
+抓取执行器要求单通道位置反馈夹爪、负载与夹持判断、可确认停止的保持能力。
+更换驱动不等于更换抓取策略，模型、工作空间和预定义姿态仍须匹配实际安装。
+
 ### 4.1 配置 MuJoCo 执行器
 
-`manipulator.driver: "mujoco_ur5e"` 使用以下配置块：
+`manipulator.driver: "mujoco_ur5e"` 保留上层执行器名称；`manipulator.mujoco.device_plan` 非空时选择共享仿真后端。配套服务配置使用以下字段：
 
 ```yaml
 manipulator:
   driver: "mujoco_ur5e"
   mujoco:
-    xml_path: "../simulation/mujoco/ur5e_scene.xml"
+    xml_path: "../simulation/mujoco/manipulation_scene.xml"
+    device_plan: "../simulation/mujoco/manipulation/device.yaml"
     end_effector_site: "robot_gripper_pinch"
     gripper_actuator: "robot_gripper_fingers_actuator"
     robot_root_body: "robot_base"
@@ -335,8 +356,8 @@ manipulator:
       - "robot_wrist_3"
     gripper_open_ctrl: 0.0
     gripper_close_ctrl: 255.0
-    gravity_compensation: true
-    arm_stiffness_scale: 12.0
+    gravity_compensation: false
+    arm_stiffness_scale: 1.0
     joint_tolerance_rad: 0.04
     ik_position_tolerance_m: 0.006
     cartesian_tracking_tolerance_m: 0.003
@@ -348,6 +369,7 @@ manipulator:
 ```
 
 - `manipulator.mujoco.xml_path`：执行器加载的 MuJoCo 场景 XML 路径。
+- `manipulator.mujoco.device_plan`：相对主配置解析的共享设备配置；要求构建 `ENABLE_MANIPULATION_MUJOCO=ON`。设备关节顺序、执行器名称和夹爪端点须与本配置一致，映射须设置 `synchronized_joint_point: true`。
 - `manipulator.mujoco.end_effector_site`：用于末端位姿和逆运动学的 site 名称。
 - `manipulator.mujoco.gripper_actuator`：夹爪控制器名称。
 - `manipulator.mujoco.robot_root_body`、`manipulator.mujoco.gripper_root_body`：机器人与夹爪碰撞树的根 body 名称。
@@ -363,6 +385,9 @@ manipulator:
 - `manipulator.mujoco.ik_iterations`：单个目标位姿允许的最大逆运动学迭代次数。
 - `manipulator.mujoco.settle_steps`：动作或夹爪命令后用于稳定物理状态的仿真步数。
 - `manipulator.mujoco.max_motion_steps`：单次机械臂动作允许的最大仿真步数。
+
+共享后端将重力补偿和伺服参数保存在 MJCF 场景中，要求 `gravity_compensation: false`、`arm_stiffness_scale: 1.0`。
+独立兼容后端不设置 `device_plan`，使用 `ur5e_scene.xml`；其配套配置为 `gravity_compensation: true`、`arm_stiffness_scale: 12.0`，不能直接套用到共享后端。
 
 机械臂进入观察位时会连续采集空夹爪位置和负载，建立本次任务的基线分布。夹爪闭合后会检查持物状态，抬起后再检查一次。pipeline 综合夹爪开度、负载和驱动状态判断是否持物；持续负载与明显高于空夹噪声的部分开度可以共同确认持物，但单独出现空夹硬限位负载时不会判为成功。抬升后的证据仍不确定时，pipeline 保留可能持物状态并执行安全放置恢复，不会按抓空再次接近目标。
 
@@ -519,7 +544,7 @@ voice:
 
 ## 7. 配置 MuJoCo 服务与远程连接
 
-PC 本地仿真服务读取 `mujoco_server`：
+本机仿真服务读取 `mujoco_server`：
 
 ```yaml
 mujoco_server:
@@ -527,22 +552,23 @@ mujoco_server:
   port: 9090
 ```
 
-- `mujoco_server.listen`：仿真服务监听地址。仅本机使用时配置为 `127.0.0.1`；跨设备连接时配置为 `0.0.0.0` 或 PC 的可用监听地址。
+- `mujoco_server.listen`：仿真服务监听地址。共享仿真启动脚本固定使用 `127.0.0.1`，跨设备通过 SSH 转发连接；直接启动服务时，`--listen` 可覆盖配置值。
 - `mujoco_server.port`：仿真服务监听端口，范围为 `1–65535`。启动参数 `--listen` 和 `--port` 会覆盖配置值。
 
 远程 pipeline 使用一个端点获取 RGB-D 帧并发送机械臂命令：
 
 ```yaml
 remote_mujoco:
-  host: "10.0.91.182"
+  host: "127.0.0.1"
   port: 9090
   frame_timeout_ms: 5000
-  action_timeout_ms: 20000
+  action_timeout_ms: 90000
 ```
 
-- `remote_mujoco.host`：MuJoCo 服务所在 PC 的主机名或 IP 地址，不能为空。
+- `remote_mujoco.host`：MuJoCo 服务的主机名或 IP 地址，不能为空；本机连接和 SSH 转发均使用 `127.0.0.1`。
 - `remote_mujoco.port`：MuJoCo 服务端口，范围为 `1–65535`。
 - `remote_mujoco.frame_timeout_ms`：等待远程 RGB-D 帧的超时时间，单位毫秒。
 - `remote_mujoco.action_timeout_ms`：等待远程机械臂动作完成的超时时间，单位毫秒。
 
-启动参数 `--remote-host` 和 `--remote-port` 会同时覆盖相机与机械臂使用的共享端点。部署步骤见[MuJoCo 仿真运行](simulation.md)。
+以上数值取自 `grasp_pipeline_manipulation_remote.yaml`。直接运行应用时，`--remote-host` 和 `--remote-port` 会同时覆盖相机与机械臂使用的共享端点；共享仿真脚本的 `grasp` 子命令对应使用 `--host` 和 `--port`。
+应用抓取服务的 `9090` 端口不能替换为组件通用设备服务的 `9100` 端口。部署步骤见[MuJoCo 仿真运行](simulation.md)。

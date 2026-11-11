@@ -316,7 +316,8 @@ class CameraBackendSourceTest(unittest.TestCase):
     def test_hand_eye_calibration_selects_configured_camera(self):
         self.assertIn("--camera-type", self.hand_eye)
         self.assertIn("_read_pipeline_camera_config", self.hand_eye)
-        self.assertIn("_read_manipulator_device", self.hand_eye)
+        self.assertIn("from hand_eye_collection import collect", self.hand_eye)
+        self.assertNotIn("serial.Serial", self.hand_eye)
         self.assertIn("_resolve_camera_type", self.hand_eye)
         self.assertIn("Las2CalibrationCamera", self.hand_eye)
 

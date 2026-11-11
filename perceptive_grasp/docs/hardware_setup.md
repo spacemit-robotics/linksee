@@ -59,16 +59,18 @@ python3 scripts/check_runtime_env.py \
   --no-fix
 ```
 
-脚本会探测机械臂关节响应，并列出机械臂和底盘的稳定设备路径：
+脚本列出 USB 设备属性和稳定路径，不扫描或打开候选机械臂串口：
 
 ```text
-[OK] manipulator.uart_device role: SO101 responds on /dev/ttyACM0
-[SUGGEST] manipulator.uart_device: "/dev/serial/by-id/..."
+[OK] manipulator.device_plan port: configured serial /dev/ttyACM0; not opened
+[SUGGEST] device.arm.options.port and device.effector.options.port: "/dev/serial/by-id/..."
 [OK] mobile_base.dev_path role: chassis candidate /dev/ttyACM1
 [SUGGEST] mobile_base.dev_path: "/dev/serial/by-id/..."
 ```
 
-将建议路径写入 `config/grasp_pipeline.yaml`。优先使用 `/dev/serial/by-id/...`，不要使用可能随插拔顺序变化的 `/dev/ttyACM*`。字段说明见[抓取配置参考](grasp_config.md)。
+将机械臂路径写入 `config/devices/linksee_so101.yaml` 中机械臂与夹爪的 `options.port`，两者须一致。
+底盘路径写入 `config/grasp_pipeline.yaml` 的 `mobile_base.dev_path`。
+优先使用 `/dev/serial/by-id/...`，避免插拔顺序改变设备编号。
 
 ## 5. 验证 RGB-D 相机
 

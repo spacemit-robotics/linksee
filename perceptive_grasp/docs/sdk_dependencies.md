@@ -1,8 +1,8 @@
 # 依赖、SDK 组件与模型
 
-本文说明如何在 SpaceMIT K3 上准备 `perceptive_grasp` 的软件依赖、SDK 组件和模型文件。
+本文说明如何在 SpaceMIT K3 上准备 `perceptive_grasp` 真机部署的软件依赖、SDK 组件和模型文件。仅运行仿真时，按 [README 的仿真运行](../README.md#7-仿真运行)准备，无需安装真机相机和机械臂依赖。
 
-检测模型和四个 SDK 组件为必需项。`spacemit_las2` 运行时和语音模型仅在启用相应功能时安装。
+检测模型、底盘、视觉和 `manipulation` 组件为必需项。`spacemit_las2` 运行时和语音模型仅在启用相应功能时安装。
 
 ## 1. 准备 SDK
 
@@ -131,36 +131,20 @@ ls ~/spacemit_robot/output/staging/include/vision_service.h
 ls ~/spacemit_robot/output/staging/lib/libvision.so
 ```
 
-### 4.3 构建夹爪控制组件
+### 4.3 构建机械臂与夹爪控制组件
 
-夹爪组件提供夹爪开合、力度控制和夹持状态读取接口。
+`manipulation` 提供设备控制、关节反馈、正逆运动学和公共标定工具。
 
 ```bash
-cd ~/spacemit_robot/components/control/grasp
-mm
+cd ~/spacemit_robot/components/control/manipulation
+mm --with-deps -DMANIPULATION_ENABLE_KINEMATICS_PINOCCHIO=ON
 ```
 
 确认产物：
 
 ```bash
-ls ~/spacemit_robot/output/staging/include/grasp.h
-ls ~/spacemit_robot/output/staging/lib/libgrasp.so
-```
-
-### 4.4 构建机械臂控制组件
-
-机械臂组件提供 Linksee 机械臂驱动、关节运动、直线运动以及基于 Pinocchio 的正逆运动学接口。
-
-```bash
-cd ~/spacemit_robot/components/control/manipulator
-mm
-```
-
-确认产物：
-
-```bash
-ls ~/spacemit_robot/output/staging/include/manipulator.h
-ls ~/spacemit_robot/output/staging/lib/libmanipulator.so
+manipulation drivers --roles
+manipulation-device --help
 ```
 
 ## 5. 准备检测模型
@@ -353,35 +337,25 @@ cmake --build build -j"$(nproc)"
 
 - `ENABLE_WEBRTC_AEC`：启用本地语音桥的软件回声消除，默认开启。
 - `ENABLE_LAS2_CAMERA`：编译 `spacemit_las2` 双目相机后端，默认开启；未找到运行库时构建继续，运行时选择该后端会报错。
-- `ENABLE_REMOTE_MUJOCO`：编译 `remote_mujoco` 客户端后端，用于 K3 连接 PC 上的 MuJoCo 仿真服务。
-- `ENABLE_MUJOCO_EXECUTOR`：编译 PC 本机 MuJoCo 相机、UR5e 执行器和仿真服务端。该选项仅用于 x86_64 PC。
+- `ENABLE_REMOTE_MUJOCO`：编译 `remote_mujoco` 客户端后端，连接本机或远程仿真服务。
+- `ENABLE_MUJOCO_EXECUTOR`：编译本机 MuJoCo 执行器；独立兼容后端仅支持 x86_64 PC。
+- `ENABLE_MANIPULATION_MUJOCO`：通过 `manipulation` 共用物理世界、机械臂、夹爪和渲染接口，支持 x86_64 PC 与 riscv64 K3；须同时启用 `ENABLE_MUJOCO_EXECUTOR`。
 - `USE_OPENCV_DNN`：使用 OpenCV DNN 检测器，主要用于 PC 仿真和未部署 `vision_service` 的独立构建。
 - `USE_MOCK_EXECUTOR`：使用 mock 执行器，不控制真实机械臂。
 
-PC 仿真服务构建命令：
+共享仿真使用独立构建目录。PC 或 K3 本机服务执行：
 
 ```bash
-python3 scripts/prepare_mujoco_assets.py
-cmake -S . -B build_mujoco \
-  -DUSE_OPENCV_DNN=ON \
-  -DUSE_MOCK_EXECUTOR=ON \
-  -DENABLE_WEBRTC_AEC=OFF \
-  -DENABLE_LAS2_CAMERA=OFF \
-  -DENABLE_MUJOCO_EXECUTOR=ON \
-  -DENABLE_REMOTE_MUJOCO=ON
-cmake --build build_mujoco -j"$(nproc)"
+python3 scripts/run_manipulation_simulation.py build
 ```
 
-K3 远程仿真客户端构建命令：
+只运行远程客户端时执行：
 
 ```bash
-cmake -S . -B build_remote_mujoco \
-  -DENABLE_REMOTE_MUJOCO=ON \
-  -DENABLE_LAS2_CAMERA=OFF \
-  -DENABLE_WEBRTC_AEC=ON
-cmake --build build_remote_mujoco -j"$(nproc)"
+python3 scripts/run_manipulation_simulation.py build --client-only
 ```
 
-该构建同时支持远程仿真 pipeline 和 K3 本地语音交互。音频硬件已提供回声消除，或明确不启用语音时，可将 `ENABLE_WEBRTC_AEC` 设为 `OFF`。MuJoCo 物理仿真和图形界面运行在 x86_64 PC，当前不在 K3 本地构建。
+本机构建将公共组件安装到 `build_manipulation/prefix/`，服务与客户端生成在 `build_manipulation/app/`；仅客户端构建到 `build_manipulation/client/`，不需要本机 MuJoCo 或显示器。
+两种构建均关闭真机执行器、LAS2 和 WebRTC AEC。启用语音时须按[共享仿真的语音控制](simulation.md#共享仿真的语音控制)选择回声处理模式。
 
-完整运行步骤见[仿真运行](simulation.md)。
+安装依赖与运行命令见 [README](../README.md#7-仿真运行)，独立兼容后端的构建和语音步骤见[原有仿真后端](simulation.md#原有仿真后端)。

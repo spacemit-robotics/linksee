@@ -7,6 +7,7 @@
  */
 
 #include "mujoco_grasp_executor.h"
+#include "mujoco_joint_path.h"
 
 #include <algorithm>
 #include <array>
@@ -16,12 +17,23 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "mujoco_simulation.h"
+#ifdef HAVE_MANIPULATION_MUJOCO
+#include <yaml-cpp/yaml.h>
+
+#include "manipulation/device_plan.h"
+#include "manipulation/mujoco_runtime.h"
+#include "mujoco_cup_placement.h"
+#include "mujoco_native_snapshot.h"
+#include "mujoco_world.h"
+#endif
 
 namespace perceptive_grasp {
 namespace {
@@ -274,13 +286,226 @@ struct MujocoGraspExecutor::Impl {
     Pose3D last_pre_grasp_pose{};
     bool last_pre_grasp_valid = false;
 
-    bool Load(const ExecutorConfig& config, std::string* error) {
-        simulation = MujocoSimulation::Get(config.mujoco.xml_path, error);
-        if (!simulation) {
+#ifdef HAVE_MANIPULATION_MUJOCO
+    std::shared_ptr<spacemit::manipulation::MujocoRuntime> runtime;
+    std::unique_ptr<spacemit::manipulation::DeviceSession> device;
+    std::unique_ptr<mujoco_sim::NativeSnapshot> native_snapshot;
+    bool owns_planning_copy = false;
+    bool cup_placement = false;
+    bool cup_retreat = false;
+    bool cup_departure_pending = false;
+    bool cup_placement_blocked = false;
+    int released_cup_body = -1;
+    double released_cup_height = 0;
+    std::array<double, 3> cup_retreat_axis{};
+    std::map<std::pair<int, int>, double> cup_pad_contacts;
+    std::chrono::steady_clock::time_point cup_retreat_deadline;
+    std::uint64_t snapshot_sample = 0;
+
+    ~Impl() {
+        device.reset();
+        runtime.reset();
+        if (owns_planning_copy) {
+            mj_deleteData(data);
+            mj_deleteModel(model);
+        }
+    }
+
+    void SyncSnapshot() {
+        if (!runtime) return;
+        const auto world_snapshot = runtime->Snapshot();
+        snapshot_sample = world_snapshot.SampleId();
+        if (native_snapshot) {
+            native_snapshot->Update(world_snapshot);
+        } else {
+            native_snapshot = std::make_unique<mujoco_sim::NativeSnapshot>(world_snapshot);
+        }
+        const auto& snapshot = *native_snapshot;
+        if (!model) {
+            model = mj_copyModel(nullptr, snapshot.Model());
+            if (!model) throw std::runtime_error("cannot allocate MuJoCo planning model");
+            owns_planning_copy = true;
+            data = mj_makeData(model);
+            if (!data) throw std::runtime_error("cannot allocate MuJoCo planning data");
+        }
+        const auto* source = snapshot.Model();
+        if (source->nq != model->nq || source->nv != model->nv || source->neq != model->neq) {
+            throw std::runtime_error("simulation model changed during grasp task");
+        }
+        // Equality targets are scene state too. IK changes only this private copy.
+        std::copy(source->eq_obj1id, source->eq_obj1id + model->neq, model->eq_obj1id);
+        std::copy(source->eq_obj2id, source->eq_obj2id + model->neq, model->eq_obj2id);
+        std::copy(source->eq_data, source->eq_data + model->neq * mjNEQDATA, model->eq_data);
+        mj_copyData(data, model, snapshot.Data());
+    }
+
+    void WaitPhysics(double seconds, bool render = true) {
+        const double end_time = data->time + seconds;
+        double next_report = data->time;
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::duration<double>(seconds + 2.0);
+        while (data->time < end_time) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error("simulation did not advance before deadline");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            SyncSnapshot();
+            if (seconds >= 0.5 && cup_departure_pending && !cup_retreat &&
+                released_cup_body >= 0 && data->time >= next_report) {
+                std::cout << "[MujocoExecutor] cup settling " << DescribeCupMotion() << std::endl;
+                next_report = data->time + 0.2;
+            }
+            if (render && visual_step_callback) visual_step_callback();
+        }
+    }
+
+    void WaitForDeviceSettle(const char* context) {
+        // Arm motion or a new constraint can briefly transfer momentum to passive fingers.
+        // Require fresh, quiet feedback before handing the device back to the motion layer.
+        SyncSnapshot();
+        WaitPhysics(0.1, false);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        std::uint64_t last_sample = 0;
+        int quiet_samples = 0;
+        spacemit::manipulation::ArmState arm;
+        spacemit::manipulation::EffectorState effector;
+        while (std::chrono::steady_clock::now() < deadline) {
+            arm = device->ReadArm();
+            effector = device->ReadEffector();
+            if (arm.fault || effector.fault) throw std::runtime_error("device settling fault");
+            if (effector.sample_id != last_sample) {
+                last_sample = effector.sample_id;
+                const bool quiet = !arm.moving && !arm.command_active &&
+                    !effector.moving && !effector.command_active;
+                quiet_samples = quiet ? quiet_samples + 1 : 0;
+                if (quiet_samples >= 5) {
+                    SyncSnapshot();
+                    return;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            // Rendering may take longer than several feedback periods on software GL.
+            // Keep readiness sampling independent of the UI; motion callbacks render again.
+        }
+        SyncSnapshot();
+        double arm_speed = 0;
+        for (int address : qvel_addr) arm_speed = std::max(arm_speed, std::abs(data->qvel[address]));
+        double tool_speed = 0;
+        for (int joint = 0; joint < model->njnt; ++joint) {
+            int body = model->jnt_bodyid[joint];
+            while (body > 0 && body != gripper_root_body_id) body = model->body_parentid[body];
+            if (body == gripper_root_body_id && model->jnt_type[joint] == mjJNT_HINGE) {
+                tool_speed = std::max(tool_speed, std::abs(data->qvel[model->jnt_dofadr[joint]]));
+            }
+        }
+        throw std::runtime_error("simulation device did not settle before motion: context=" +
+            std::string(context) + " arm_moving=" +
+            std::to_string(arm.moving) + " arm_active=" + std::to_string(arm.command_active) +
+            " effector_moving=" + std::to_string(effector.moving) +
+            " effector_active=" + std::to_string(effector.command_active) +
+            " quiet_samples=" + std::to_string(quiet_samples) +
+            " sample=" + std::to_string(last_sample) +
+            " arm_max_speed_rad_s=" + std::to_string(arm_speed) +
+            " tool_max_speed_rad_s=" + std::to_string(tool_speed) +
+            " weld_active=" + std::to_string(grasp_weld_equality_id >= 0 &&
+                data->eq_active[grasp_weld_equality_id] != 0));
+    }
+
+    spacemit::manipulation::CommandResult RunSettledCommand(
+        const std::function<spacemit::manipulation::CommandResult()>& command) {
+        for (int attempt = 0; ; ++attempt) {
+            WaitForDeviceSettle("before_command");
+            try {
+                return command();
+            } catch (const spacemit::manipulation::BusyRejected&) {
+                // This typed refusal guarantees no device write. Passive contact can change
+                // after the readiness sample; recheck it, never retry a submitted motion.
+                if (attempt >= 2 || device->ReadArm().fault || device->ReadEffector().fault) throw;
+            }
+        }
+    }
+
+    bool LoadDevice(const ExecutorConfig& config, std::string* error) {
+        namespace control = spacemit::manipulation;
+        try {
+            if (config.mujoco.gravity_compensation ||
+                config.mujoco.arm_stiffness_scale != 1.0f) {
+                throw std::runtime_error(
+                    "device-plan simulation requires physical parameters in the MJCF scene");
+            }
+            const auto registry = control::MakeBuiltinDeviceRegistry();
+            const auto plan = control::LoadDevicePlan(config.mujoco.device_plan, registry);
+            if (plan.composition.arm_driver != "mujoco" ||
+                plan.composition.effector_driver != "mujoco" ||
+                plan.composition.arm_options != plan.composition.effector_options) {
+                throw std::runtime_error("grasp simulation requires one shared MuJoCo device plan");
+            }
+            if (plan.definition.arm.joints.size() != config.mujoco.joint_names.size() ||
+                config.mujoco.actuator_names.size() != config.mujoco.joint_names.size()) {
+                throw std::runtime_error("grasp planning and device joint counts must match");
+            }
+            for (std::size_t index = 0; index < config.mujoco.joint_names.size(); ++index) {
+                if (plan.definition.arm.joints[index].name != config.mujoco.joint_names[index]) {
+                    throw std::runtime_error("grasp planning and device joint order must match");
+                }
+            }
+            if (plan.definition.effector.channels.size() != 1) {
+                throw std::runtime_error("grasp simulation requires one gripper channel");
+            }
+            // The driver validates the mapping schema; the application also binds its private
+            // IK and gripper-control convention to the same actuators and endpoint direction.
+            const auto mapping = YAML::LoadFile(plan.composition.arm_options.at("mapping_file"));
+            if (!mapping["synchronized_joint_point"] ||
+                !mapping["synchronized_joint_point"].as<bool>()) {
+                throw std::runtime_error("grasp planning requires synchronized_joint_point: true");
+            }
+            for (std::size_t index = 0; index < config.mujoco.actuator_names.size(); ++index) {
+                if (mapping["arm"][index]["actuator"].as<std::string>() !=
+                    config.mujoco.actuator_names[index]) {
+                    throw std::runtime_error("grasp planning and device actuators must match");
+                }
+            }
+            const auto gripper = mapping["effector"][0];
+            if (!std::isfinite(config.mujoco.gripper_open_ctrl) ||
+                !std::isfinite(config.mujoco.gripper_close_ctrl) ||
+                gripper["actuator"].as<std::string>() != config.mujoco.gripper_actuator ||
+                std::abs(gripper["control_open"].as<double>() -
+                    config.mujoco.gripper_open_ctrl) > 1e-6 ||
+                std::abs(gripper["control_closed"].as<double>() -
+                    config.mujoco.gripper_close_ctrl) > 1e-6) {
+                throw std::runtime_error("grasp planning and device gripper endpoints must match");
+            }
+            runtime = std::make_shared<control::MujocoRuntime>(
+                plan.definition, plan.composition.arm_options);
+            runtime->Start();
+            device = std::make_unique<control::DeviceSession>(
+                plan.definition, runtime->CreateDevices());
+            device->Connect();
+            SyncSnapshot();
+            return true;
+        } catch (const std::exception& failure) {
+            if (error) *error = failure.what();
             return false;
         }
-        model = simulation->model();
-        data = simulation->data();
+    }
+#else
+    void SyncSnapshot() {}
+#endif
+
+    bool Load(const ExecutorConfig& config, std::string* error) {
+        if (!config.mujoco.device_plan.empty()) {
+#ifdef HAVE_MANIPULATION_MUJOCO
+            if (!LoadDevice(config, error)) return false;
+#else
+            if (error) *error = "device-plan simulation requires ENABLE_MANIPULATION_MUJOCO";
+            return false;
+#endif
+        } else {
+            simulation = MujocoSimulation::Get(config.mujoco.xml_path, error);
+            if (!simulation) return false;
+            model = simulation->model();
+            data = simulation->data();
+        }
 
         ee_site_id = mj_name2id(model, mjOBJ_SITE,
                                 config.mujoco.end_effector_site.c_str());
@@ -401,6 +626,25 @@ struct MujocoGraspExecutor::Impl {
     }
 
     void ResetTaskScene(const ExecutorConfig& config) {
+#ifdef HAVE_MANIPULATION_MUJOCO
+        if (runtime) {
+            device->Disconnect();
+            runtime->Reset();
+            device->Connect();
+            SyncSnapshot();
+            held_body_id = -1;
+            held_joint_id = -1;
+            held_qpos_addr = -1;
+            held_qvel_addr = -1;
+            cup_placement = cup_retreat = cup_departure_pending = cup_placement_blocked = false;
+            released_cup_body = -1;
+            cup_pad_contacts.clear();
+            validated_pre_grasp_path.clear();
+            validated_grasp_path.clear();
+            validated_lift_path.clear();
+            return;
+        }
+#endif
         held_body_id = -1;
         held_joint_id = -1;
         held_qpos_addr = -1;
@@ -468,6 +712,22 @@ struct MujocoGraspExecutor::Impl {
     void ForwardWithAttachments() {
         mj_forward(model, data);
         SyncFreeGripperToFlange();
+#ifdef HAVE_MANIPULATION_MUJOCO
+        if (runtime && cup_placement && held_body_id >= 0) {
+            // Only the private planning data is changed here. Carry the measured rigid
+            // attachment through IK/path samples so object clearance is checked too.
+            const int joint = model->body_jntadr[held_body_id];
+            const int address = model->jnt_qposadr[joint];
+            mjtNum hold_quat[4], offset[3], object_quat[4];
+            mju_mat2Quat(hold_quat, data->site_xmat + 9 * hold_site_id);
+            RotateVectorByQuat(hold_quat, held_rel_pos.data(), offset);
+            QuatMultiply(hold_quat, held_rel_quat.data(), object_quat);
+            for (int axis = 0; axis < 3; ++axis) {
+                data->qpos[address + axis] = data->site_xpos[3 * hold_site_id + axis] + offset[axis];
+            }
+            std::copy(object_quat, object_quat + 4, data->qpos + address + 3);
+        }
+#endif
         mj_forward(model, data);
     }
 
@@ -506,7 +766,7 @@ struct MujocoGraspExecutor::Impl {
     }
 
     bool HasUnsafeCollision(bool allow_target_contact,
-                            std::string* detail) const {
+                            std::string* detail) {
         const auto geom_label = [this](int geom_id) {
             const char* geom_name = mj_id2name(model, mjOBJ_GEOM, geom_id);
             if (geom_name && geom_name[0] != '\0') {
@@ -519,12 +779,45 @@ struct MujocoGraspExecutor::Impl {
             }
             return std::string("geom:") + std::to_string(geom_id);
         };
+#ifdef HAVE_MANIPULATION_MUJOCO
+        std::set<std::pair<int, int>> present_pad_contacts;
+        if (cup_retreat && (std::chrono::steady_clock::now() >= cup_retreat_deadline ||
+            released_cup_body < 0 ||
+            !BodyInsideDropZoneXY(released_cup_body, nullptr) ||
+            data->xpos[3 * released_cup_body + 2] > released_cup_height + 0.005)) {
+            if (detail) *detail = "released cup moved outside its placement bounds during retreat";
+            return true;
+        }
+#endif
         for (int i = 0; i < data->ncon; ++i) {
             const mjContact& contact = data->contact[i];
             const int body1 = model->geom_bodyid[contact.geom1];
             const int body2 = model->geom_bodyid[contact.geom2];
             const bool robot1 = IsRobotBody(body1);
             const bool robot2 = IsRobotBody(body2);
+#ifdef HAVE_MANIPULATION_MUJOCO
+            if (cup_retreat) {
+                const auto pair = std::minmax(contact.geom1, contact.geom2);
+                const auto found = cup_pad_contacts.find(pair);
+                if (found != cup_pad_contacts.end()) {
+                    if (contact.dist < found->second - 1e-6) {
+                        if (detail) *detail = "cup-pad contact deepened during retreat";
+                        return true;
+                    }
+                    present_pad_contacts.insert(pair);
+                    continue;
+                }
+            }
+            if (runtime && cup_placement &&
+                ((GraspableRoot(body1) == held_body_id && !robot2 &&
+                    GraspableRoot(body2) != held_body_id) ||
+                (GraspableRoot(body2) == held_body_id && !robot1 &&
+                    GraspableRoot(body1) != held_body_id))) {
+                if (detail) *detail = "held cup clearance violated: " +
+                    geom_label(contact.geom1) + " / " + geom_label(contact.geom2);
+                return true;
+            }
+#endif
             if (!robot1 && !robot2) continue;
 
             if (robot1 && robot2) {
@@ -552,6 +845,14 @@ struct MujocoGraspExecutor::Impl {
             }
             return true;
         }
+#ifdef HAVE_MANIPULATION_MUJOCO
+        if (cup_retreat) {
+            for (auto item = cup_pad_contacts.begin(); item != cup_pad_contacts.end();) {
+                if (!present_pad_contacts.count(item->first)) item = cup_pad_contacts.erase(item);
+                else ++item;
+            }
+        }
+#endif
         return false;
     }
 
@@ -706,6 +1007,40 @@ struct MujocoGraspExecutor::Impl {
 
         best_body_id = contact_body_id;
         best_distance = contact_distance;
+#ifdef HAVE_MANIPULATION_MUJOCO
+        if (runtime) {
+            const auto stopped = device->HoldEffector();
+            if (stopped.status != spacemit::manipulation::Result::kSucceeded) {
+                throw std::runtime_error("cannot stop gripper after contact: " + stopped.detail);
+            }
+            const auto arm_stopped = device->HoldArm();
+            if (arm_stopped.status != spacemit::manipulation::Result::kSucceeded) {
+                throw std::runtime_error("cannot settle arm after contact: " + arm_stopped.detail);
+            }
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (std::chrono::steady_clock::now() < deadline) {
+                try {
+                    runtime->AttachWeld("grasp_weld",
+                        mj_id2name(model, mjOBJ_BODY, gripper_root_body_id),
+                        mj_id2name(model, mjOBJ_BODY, best_body_id),
+                        "robot_gripper_left_pad", "robot_gripper_right_pad");
+                    held_body_id = best_body_id;
+                    SyncSnapshot();
+                    WaitForDeviceSettle("after_attach");
+                    if (detail) *detail = "contact constraint established after opposing pad contact";
+                    return true;
+                } catch (const spacemit::manipulation::CommandRejected& rejected) {
+                    // Holding is measured per role. Coupled contact can briefly move the other
+                    // role; the owner rechecks both roles and both pads atomically on each retry.
+                    if (detail) *detail = rejected.what();
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                SyncSnapshot();
+                if (visual_step_callback) visual_step_callback();
+            }
+            return false;
+        }
+#endif
         const int joint_id = model->body_jntadr[best_body_id];
         held_body_id = best_body_id;
         held_joint_id = joint_id;
@@ -758,6 +1093,44 @@ struct MujocoGraspExecutor::Impl {
 
     bool CloseGripperOnContact(
         const ExecutorConfig& config, std::string* detail) {
+#ifdef HAVE_MANIPULATION_MUJOCO
+        if (runtime) {
+            if (cup_placement_blocked) {
+                throw spacemit::manipulation::CommandRejected(
+                    "cup placement incomplete; reset the simulation scene");
+            }
+            if (cup_departure_pending) {
+                throw spacemit::manipulation::CommandRejected(
+                    "cup departure incomplete; reset the simulation scene");
+            }
+            WaitForDeviceSettle("before_close");
+            const double duration = std::max(0.1, config.mujoco.settle_steps * model->opt.timestep);
+            const auto result = device->FollowEffector({{0.0}, duration});
+            if (result.status != spacemit::manipulation::Result::kSucceeded) {
+                throw std::runtime_error("cannot close simulation gripper: " + result.detail);
+            }
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::duration<double>(duration + 2.0);
+            while (std::chrono::steady_clock::now() < deadline) {
+                SyncSnapshot();
+                if (AttachContactObject(detail)) return true;
+                const auto state = device->ReadEffector();
+                if (!state.command_active && !state.moving && state.positions.front() < 0.03) {
+                    break;
+                }
+                if (visual_step_callback) visual_step_callback();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            if (AttachContactObject(detail)) return true;
+            // Finish the streaming close before the empty-grasp recovery submits an opening.
+            const auto held = device->HoldEffector();
+            if (held.status != spacemit::manipulation::Result::kSucceeded) {
+                throw std::runtime_error("cannot stop empty simulation grasp: " + held.detail);
+            }
+            SyncSnapshot();
+            return false;
+        }
+#endif
         if (gripper_actuator_id < 0) {
             if (detail) *detail = "missing gripper actuator";
             return false;
@@ -789,6 +1162,18 @@ struct MujocoGraspExecutor::Impl {
     }
 
     void ReleaseHeldObject(int settle_steps) {
+#ifdef HAVE_MANIPULATION_MUJOCO
+        if (runtime) {
+            runtime->ReleaseWeld("grasp_weld");
+            held_body_id = -1;
+            held_joint_id = -1;
+            held_qpos_addr = -1;
+            held_qvel_addr = -1;
+            SyncSnapshot();
+            WaitPhysics(std::max(0, settle_steps) * model->opt.timestep);
+            return;
+        }
+#endif
         if (held_joint_id >= 0 && held_qvel_addr >= 0 &&
             model->jnt_type[held_joint_id] == mjJNT_FREE) {
             std::fill(
@@ -829,6 +1214,217 @@ struct MujocoGraspExecutor::Impl {
         }
         return radius;
     }
+
+#ifdef HAVE_MANIPULATION_MUJOCO
+    double GeometryVerticalExtent(int geom) const {
+        const auto* rotation = data->geom_xmat + 9 * geom;
+        const auto* size = model->geom_size + 3 * geom;
+        switch (model->geom_type[geom]) {
+            case mjGEOM_SPHERE: return size[0];
+            case mjGEOM_CAPSULE: return size[0] + std::abs(rotation[8]) * size[1];
+            case mjGEOM_CYLINDER:
+                return size[0] * std::hypot(rotation[6], rotation[7]) +
+                    std::abs(rotation[8]) * size[1];
+            case mjGEOM_BOX:
+                return std::abs(rotation[6]) * size[0] + std::abs(rotation[7]) * size[1] +
+                    std::abs(rotation[8]) * size[2];
+            default: return model->geom_rbound[geom];
+        }
+    }
+
+    double BodyLowestCollisionPoint(int body) const {
+        double minimum = std::numeric_limits<double>::infinity();
+        for (int geom = 0; geom < model->ngeom; ++geom) {
+            if (!IsDescendantBody(model->geom_bodyid[geom], body) ||
+                (model->geom_contype[geom] == 0 && model->geom_conaffinity[geom] == 0)) continue;
+            minimum = std::min(minimum,
+                data->geom_xpos[3 * geom + 2] - GeometryVerticalExtent(geom));
+        }
+        return minimum;
+    }
+
+    double TableTop() const {
+        const int table = mj_name2id(model, mjOBJ_GEOM, "simple_table");
+        if (table < 0) throw std::runtime_error("simulation placement table is missing");
+        return data->geom_xpos[3 * table + 2] + GeometryVerticalExtent(table);
+    }
+
+    bool HoldingCup() const {
+        const char* name = held_body_id >= 0 ? mj_id2name(model, mjOBJ_BODY, held_body_id) : nullptr;
+        return runtime && name && Lowercase(name) == "cup";
+    }
+
+    bool CupReadyForRelease(std::string* detail) const {
+        if (!HoldingCup()) return true;
+        const double gap = BodyLowestCollisionPoint(held_body_id) - TableTop();
+        const double tilt = std::acos(std::clamp(data->xmat[9 * held_body_id + 8], -1.0, 1.0));
+        const bool inside = BodyInsideDropZoneXY(held_body_id, nullptr);
+        const bool ready = MujocoCupReleaseReady(gap, tilt, inside);
+        if (detail) *detail = "cup release readiness: " + DescribeSupportGeometry(held_body_id) +
+            " inside_zone_xy=" + std::to_string(inside);
+        return ready;
+    }
+
+    void BeginCupPlacement() {
+        mjtNum hold_quat[4], inverse_hold[4], offset[3];
+        mju_mat2Quat(hold_quat, data->site_xmat + 9 * hold_site_id);
+        QuatConjugate(hold_quat, inverse_hold);
+        for (int axis = 0; axis < 3; ++axis) {
+            offset[axis] = data->xpos[3 * held_body_id + axis] -
+                data->site_xpos[3 * hold_site_id + axis];
+        }
+        RotateVectorByQuat(inverse_hold, offset, held_rel_pos.data());
+        QuatMultiply(inverse_hold, data->xquat + 4 * held_body_id, held_rel_quat.data());
+        cup_placement = true;
+    }
+
+    Pose3D UprightCupHoldPose() const {
+        const auto pose = MujocoUprightHoldPose(data->xpos + 3 * held_body_id,
+            data->xquat + 4 * held_body_id, held_rel_pos.data(), held_rel_quat.data());
+        return {static_cast<float>(pose[0]), static_cast<float>(pose[1]), static_cast<float>(pose[2]),
+            static_cast<float>(pose[3]), static_cast<float>(pose[4]), static_cast<float>(pose[5]),
+            static_cast<float>(pose[6])};
+    }
+
+    void BeginCupRetreat() {
+        released_cup_height = data->xpos[3 * released_cup_body + 2];
+        const auto* rotation = data->site_xmat + 9 * hold_site_id;
+        for (int axis = 0; axis < 3; ++axis) cup_retreat_axis[axis] = -rotation[3 * axis + 2];
+        cup_pad_contacts.clear();
+        const int left = mj_name2id(model, mjOBJ_BODY, "robot_gripper_left_pad");
+        const int right = mj_name2id(model, mjOBJ_BODY, "robot_gripper_right_pad");
+        for (int index = 0; index < data->ncon; ++index) {
+            const auto& contact = data->contact[index];
+            const int first = model->geom_bodyid[contact.geom1];
+            const int second = model->geom_bodyid[contact.geom2];
+            const bool cup_first = GraspableRoot(first) == released_cup_body;
+            const bool cup_second = GraspableRoot(second) == released_cup_body;
+            if (!cup_first && !cup_second) continue;
+            const int other = cup_first ? second : first;
+            if (!IsDescendantBody(other, left) && !IsDescendantBody(other, right)) continue;
+            double separating = 0;
+            for (int axis = 0; axis < 3; ++axis) {
+                separating += cup_retreat_axis[axis] * contact.frame[axis];
+            }
+            if (!cup_first) separating = -separating;
+            if (contact.dist < -0.001 || separating < -1e-6) {
+                throw std::runtime_error("cup-pad contact cannot be separated along the retreat axis");
+            }
+            const auto pair = std::minmax(contact.geom1, contact.geom2);
+            const auto found = cup_pad_contacts.find(pair);
+            if (found == cup_pad_contacts.end()) cup_pad_contacts.emplace(pair, contact.dist);
+            else found->second = std::min(found->second, contact.dist);
+        }
+        cup_retreat = true;
+        cup_retreat_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        std::cout << "[MujocoExecutor] cup retreat begin " << DescribeCupMotion()
+            << " accepted_pairs=" << cup_pad_contacts.size() << " qpos=[";
+        for (int index = 0; index < model->nq; ++index) {
+            if (index) std::cout << ",";
+            std::cout << data->qpos[index];
+        }
+        std::cout << "]" << std::endl;
+    }
+
+    void WaitForCupSettle() {
+        // Opening the fingers does not make the released object stationary. Wait for
+        // its natural table contact to settle before recording the permitted pad pairs.
+        SyncSnapshot();
+        const double initial_height = data->xpos[3 * released_cup_body + 2];
+        const int address = model->jnt_dofadr[model->body_jntadr[released_cup_body]];
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        double quiet_since = -1;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto arm = device->ReadArm();
+            const auto tool = device->ReadEffector();
+            if (arm.fault || tool.fault || !arm.enabled || !tool.enabled.value_or(false) ||
+                arm.command_active || tool.command_active) {
+                throw std::runtime_error("device is not idle and healthy while the cup settles");
+            }
+            SyncSnapshot();
+            if (!BodyInsideDropZoneXY(released_cup_body, nullptr) ||
+                data->xpos[3 * released_cup_body + 2] > initial_height + 0.005) {
+                throw std::runtime_error("released cup moved outside its placement bounds while settling");
+            }
+            double linear_squared = 0, angular_squared = 0;
+            for (int axis = 0; axis < 3; ++axis) {
+                linear_squared += std::pow(data->qvel[address + axis], 2);
+                angular_squared += std::pow(data->qvel[address + axis + 3], 2);
+            }
+            if (linear_squared <= 1e-6 && angular_squared <= 0.005 * 0.005) {
+                if (quiet_since < 0) quiet_since = data->time;
+                if (data->time - quiet_since >= 0.2) return;
+            } else {
+                quiet_since = -1;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        throw std::runtime_error("released cup did not settle before retreat: " + DescribeCupMotion());
+    }
+
+    std::string DescribeCupMotion() const {
+        const int address = model->jnt_dofadr[model->body_jntadr[released_cup_body]];
+        double linear = 0, angular = 0;
+        for (int axis = 0; axis < 3; ++axis) {
+            linear += std::pow(data->qvel[address + axis], 2);
+            angular += std::pow(data->qvel[address + axis + 3], 2);
+        }
+        std::string contacts;
+        for (int index = 0; index < data->ncon; ++index) {
+            const auto& contact = data->contact[index];
+            if (GraspableRoot(model->geom_bodyid[contact.geom1]) != released_cup_body &&
+                GraspableRoot(model->geom_bodyid[contact.geom2]) != released_cup_body) continue;
+            contacts += " " + std::to_string(contact.geom1) + "/" +
+                std::to_string(contact.geom2) + ":" + std::to_string(contact.dist);
+        }
+        return "sample=" + std::to_string(snapshot_sample) + " time=" + std::to_string(data->time) +
+            " linear_m_s=" + std::to_string(std::sqrt(linear)) +
+            " angular_rad_s=" + std::to_string(std::sqrt(angular)) +
+            " tilt_rad=" + std::to_string(std::acos(std::clamp(
+                data->xmat[9 * released_cup_body + 8], -1.0, 1.0))) + " contacts=" + contacts;
+    }
+
+    double CupPadSeparation() const {
+        double minimum = 1.0;
+        const int left = mj_name2id(model, mjOBJ_BODY, "robot_gripper_left_pad");
+        const int right = mj_name2id(model, mjOBJ_BODY, "robot_gripper_right_pad");
+        for (int pad = 0; pad < model->ngeom; ++pad) {
+            if (!IsDescendantBody(model->geom_bodyid[pad], left) &&
+                !IsDescendantBody(model->geom_bodyid[pad], right)) continue;
+            if (!model->geom_contype[pad] && !model->geom_conaffinity[pad]) continue;
+            for (int cup = 0; cup < model->ngeom; ++cup) {
+                if (GraspableRoot(model->geom_bodyid[cup]) != released_cup_body ||
+                    (!model->geom_contype[cup] && !model->geom_conaffinity[cup])) continue;
+                minimum = std::min(minimum, mj_geomDistance(model, data, pad, cup, 1.0, nullptr));
+            }
+        }
+        return minimum;
+    }
+
+    std::string DescribeSupportGeometry(int body) const {
+        const auto* position = data->xpos + 3 * body;
+        const auto* rotation = data->xmat + 9 * body;
+        const auto* quaternion = data->xquat + 4 * body;
+        Pose3D hold{};
+        GetHoldPose(hold);
+        std::string joints;
+        for (int address : qpos_addr) {
+            if (!joints.empty()) joints += ",";
+            joints += std::to_string(data->qpos[address]);
+        }
+        return " body_z=" + std::to_string(position[2]) + " body_quat=[" +
+            std::to_string(quaternion[0]) + "," + std::to_string(quaternion[1]) + "," +
+            std::to_string(quaternion[2]) + "," + std::to_string(quaternion[3]) +
+            "] tilt_rad=" + std::to_string(std::acos(std::clamp(rotation[8], -1.0, 1.0))) +
+            " collision_bottom_z=" + std::to_string(BodyLowestCollisionPoint(body)) +
+            " table_top_z=" + std::to_string(TableTop()) +
+            " table_gap_m=" + std::to_string(BodyLowestCollisionPoint(body) - TableTop()) +
+            " hold_pose=[" + std::to_string(hold.x) + "," + std::to_string(hold.y) + "," +
+            std::to_string(hold.z) + "," + std::to_string(hold.qw) + "," +
+            std::to_string(hold.qx) + "," + std::to_string(hold.qy) + "," +
+            std::to_string(hold.qz) + "] joints=[" + joints + "]";
+    }
+#endif
 
     bool BodyInsideDropZoneXY(int body_id, std::string* detail) const {
         const int zone_body_id = mj_name2id(model, mjOBJ_BODY, "zone_drop");
@@ -879,6 +1475,9 @@ struct MujocoGraspExecutor::Impl {
         const bool inside_xy = BodyInsideDropZoneXY(target_body_id, &detail);
         if (inside_zone) *inside_zone = inside_xy;
         const char* target_name = mj_id2name(model, mjOBJ_BODY, target_body_id);
+#ifdef HAVE_MANIPULATION_MUJOCO
+        if (runtime) detail += DescribeSupportGeometry(target_body_id);
+#endif
         return std::string("target=") + (target_name ? target_name : "object") +
             " " + detail;
     }
@@ -1190,7 +1789,18 @@ struct MujocoGraspExecutor::Impl {
         const bool use_orientation =
             constrain_orientation && NormalizeQuaternion(target, target_quat);
         constexpr double kOrientationWeight = 0.20;
-        constexpr double kOrientationToleranceRad = 0.10;
+        double orientation_tolerance = 0.10;
+        double position_tolerance = config.ik_position_tolerance_m;
+#ifdef HAVE_MANIPULATION_MUJOCO
+        if (runtime && cup_placement) {
+            // Millimetre tabletop clearance requires a tighter pose than coarse transit IK.
+            orientation_tolerance = 0.005;
+            position_tolerance = std::min(position_tolerance, 0.0002);
+        } else if (runtime && cup_retreat) {
+            orientation_tolerance = 0.01;
+            position_tolerance = std::min(position_tolerance, 0.001);
+        }
+#endif
 
         std::vector<double> jacp(3 * model->nv, 0.0);
         std::vector<double> jacr(3 * model->nv, 0.0);
@@ -1258,9 +1868,9 @@ struct MujocoGraspExecutor::Impl {
                 best_orientation_error = orientation_error_norm;
                 best_joints = CurrentJoints();
             }
-            if (err_norm <= config.ik_position_tolerance_m &&
+            if (err_norm <= position_tolerance &&
                 (!use_orientation ||
-                    orientation_error_norm <= kOrientationToleranceRad)) {
+                    orientation_error_norm <= orientation_tolerance)) {
                 if (solution) *solution = CurrentJoints();
                 std::copy(saved_qpos.begin(), saved_qpos.end(), data->qpos);
                 std::copy(saved_qvel.begin(), saved_qvel.end(), data->qvel);
@@ -1367,6 +1977,13 @@ MujocoGraspExecutor::MujocoGraspExecutor(const ExecutorConfig& config)
 
 MujocoGraspExecutor::~MujocoGraspExecutor() = default;
 
+#ifdef HAVE_MANIPULATION_MUJOCO
+std::shared_ptr<spacemit::manipulation::MujocoRuntime>
+MujocoGraspExecutor::SimulationRuntime() const {
+    return impl_->runtime;
+}
+#endif
+
 void MujocoGraspExecutor::SetTargetLabel(const std::string& target_label) {
     impl_->target_label = target_label;
     impl_->last_pre_grasp_valid = false;
@@ -1400,6 +2017,12 @@ bool MujocoGraspExecutor::Init() {
         RecordResult(GraspResult::MOVE_FAILED, "init", error);
         return false;
     }
+#ifdef HAVE_MANIPULATION_MUJOCO
+    if (impl_->runtime) {
+        RecordResult(GraspResult::SUCCESS, "init");
+        return true;
+    }
+#endif
     if (config_.home_joints.size() == impl_->joint_ids.size()) {
         impl_->SetJointPositionsDirect(config_.home_joints);
     }
@@ -1417,6 +2040,80 @@ GraspResult MujocoGraspExecutor::MoveToJointsSim(
     const std::vector<float>& joints,
     const char* action,
     bool allow_target_contact) {
+#ifdef HAVE_MANIPULATION_MUJOCO
+    if (impl_->runtime) {
+        namespace control = spacemit::manipulation;
+        try {
+            if (impl_->cup_placement_blocked) {
+                throw control::CommandRejected("cup placement incomplete; reset the simulation scene");
+            }
+            if (impl_->cup_departure_pending && !impl_->cup_retreat) {
+                throw control::CommandRejected("cup departure incomplete; reset the simulation scene");
+            }
+            if (impl_->cup_placement || impl_->cup_retreat) {
+                impl_->SyncSnapshot();
+                const auto start = impl_->CurrentJoints();
+                if (start.size() != joints.size()) {
+                    throw control::CommandRejected("cup placement joint count mismatch");
+                }
+                const std::vector<mjtNum> saved_qpos(impl_->data->qpos,
+                    impl_->data->qpos + impl_->model->nq);
+                const std::vector<mjtNum> saved_qvel(impl_->data->qvel,
+                    impl_->data->qvel + impl_->model->nv);
+                const std::vector<mjtNum> saved_ctrl(impl_->data->ctrl,
+                    impl_->data->ctrl + impl_->model->nu);
+                const auto saved_contacts = impl_->cup_pad_contacts;
+                const auto restore = [&] {
+                    std::copy(saved_qpos.begin(), saved_qpos.end(), impl_->data->qpos);
+                    std::copy(saved_qvel.begin(), saved_qvel.end(), impl_->data->qvel);
+                    std::copy(saved_ctrl.begin(), saved_ctrl.end(), impl_->data->ctrl);
+                    impl_->cup_pad_contacts = saved_contacts;
+                    impl_->ForwardWithAttachments();
+                };
+                std::string collision;
+                const bool clear = CheckMujocoJointPath(start, joints,
+                    [&](const auto& point) { impl_->SetJointPositionsDirect(point); },
+                    [&](std::string* detail) {
+                        return impl_->HasUnsafeCollision(allow_target_contact, detail);
+                    },
+                    restore, &collision);
+                impl_->SyncSnapshot();
+                if (!clear) {
+                    RecordResult(GraspResult::MOVE_FAILED, action,
+                        "cup placement path precheck: " + collision);
+                    return GraspResult::MOVE_FAILED;
+                }
+            }
+            control::JointPoint target;
+            target.target_rad.assign(joints.begin(), joints.end());
+            target.speed_scale = config_.move_speed;
+            std::string collision;
+            // Planning prechecks are supplemented by sampled live contacts, not a safety-rated
+            // per-timestep guard. A colliding snapshot cancels through the common hold path.
+            const auto result = impl_->RunSettledCommand([&]() {
+                bool before_submission = true;
+                return impl_->device->MoveArm(target, [&]() {
+                    impl_->SyncSnapshot();
+                    // The common layer calls this once before admission: rendering here would
+                    // insert a frame delay between our still sample and the final busy check.
+                    if (!before_submission && impl_->visual_step_callback) {
+                        impl_->visual_step_callback();
+                    }
+                    before_submission = false;
+                    return impl_->HasUnsafeCollision(allow_target_contact, &collision);
+                });
+            });
+            impl_->SyncSnapshot();
+            const auto status = result.status == control::Result::kSucceeded
+                ? GraspResult::SUCCESS : GraspResult::MOVE_FAILED;
+            RecordResult(status, action, collision.empty() ? result.detail : collision);
+            return status;
+        } catch (const std::exception& failure) {
+            RecordResult(GraspResult::MOVE_FAILED, action, failure.what());
+            return GraspResult::MOVE_FAILED;
+        }
+    }
+#endif
     if (joints.size() != impl_->joint_ids.size()) {
         const std::string detail = "joint target size mismatch";
         RecordResult(GraspResult::OUT_OF_RANGE, action, detail);
@@ -1483,10 +2180,15 @@ GraspResult MujocoGraspExecutor::MoveToPoseSim(const Pose3D& pose,
                                                 const char* action,
                                                 bool constrain_orientation,
                                                 bool allow_target_contact) {
+    impl_->SyncSnapshot();
     const Pose3D solver_pose = impl_->SolverPoseForHoldPose(pose);
     Pose3D compensated_pose = solver_pose;
     constexpr int kMaximumTrackingCorrections = 8;
     double position_error = std::numeric_limits<double>::infinity();
+    double tracking_tolerance = config_.mujoco.cartesian_tracking_tolerance_m;
+#ifdef HAVE_MANIPULATION_MUJOCO
+    if (impl_->runtime && impl_->cup_placement) tracking_tolerance = std::min(tracking_tolerance, 0.00025);
+#endif
     for (int attempt = 0; attempt < kMaximumTrackingCorrections; ++attempt) {
         std::vector<float> joints;
         std::string detail;
@@ -1512,8 +2214,17 @@ GraspResult MujocoGraspExecutor::MoveToPoseSim(const Pose3D& pose,
             std::pow(static_cast<double>(solver_pose.x - actual_pose.x), 2) +
             std::pow(static_cast<double>(solver_pose.y - actual_pose.y), 2) +
             std::pow(static_cast<double>(solver_pose.z - actual_pose.z), 2));
-        if (position_error <=
-            config_.mujoco.cartesian_tracking_tolerance_m) {
+#ifdef HAVE_MANIPULATION_MUJOCO
+        if (impl_->runtime && impl_->cup_retreat) {
+            mjtNum expected[4], actual[4];
+            if (!NormalizeQuaternion(solver_pose, expected) || !NormalizeQuaternion(actual_pose, actual) ||
+                MujocoQuaternionDistance(expected, actual) > 0.01) {
+                RecordResult(GraspResult::MOVE_FAILED, action, "cup retreat orientation tracking failed");
+                return GraspResult::MOVE_FAILED;
+            }
+        }
+#endif
+        if (position_error <= tracking_tolerance) {
             return GraspResult::SUCCESS;
         }
         compensated_pose.x += solver_pose.x - actual_pose.x;
@@ -1522,13 +2233,45 @@ GraspResult MujocoGraspExecutor::MoveToPoseSim(const Pose3D& pose,
     }
     const std::string detail = "Cartesian motion did not settle; error_m=" +
         std::to_string(position_error) + " tolerance_m=" +
-        std::to_string(config_.mujoco.cartesian_tracking_tolerance_m);
+        std::to_string(tracking_tolerance);
     RecordResult(GraspResult::TIMEOUT, action, detail);
     return GraspResult::TIMEOUT;
 }
 
 GraspResult MujocoGraspExecutor::SetGripperCtrl(float ctrl,
                                                 const char* action) {
+#ifdef HAVE_MANIPULATION_MUJOCO
+    if (impl_->runtime) {
+        if (impl_->cup_placement_blocked) {
+            throw spacemit::manipulation::CommandRejected(
+                "cup placement incomplete; reset the simulation scene");
+        }
+        if (impl_->cup_departure_pending) {
+            throw spacemit::manipulation::CommandRejected(
+                "cup departure incomplete; reset the simulation scene");
+        }
+        const double position = (ctrl - config_.mujoco.gripper_close_ctrl) /
+            (config_.mujoco.gripper_open_ctrl - config_.mujoco.gripper_close_ctrl);
+        const double duration = std::max(0.1,
+            config_.mujoco.settle_steps * impl_->model->opt.timestep);
+        const auto result = impl_->RunSettledCommand([&]() {
+            bool before_submission = true;
+            return impl_->device->MoveEffector({{position}, duration}, [&]() {
+                impl_->SyncSnapshot();
+                if (!before_submission && impl_->visual_step_callback) {
+                    impl_->visual_step_callback();
+                }
+                before_submission = false;
+                return false;
+            });
+        });
+        impl_->SyncSnapshot();
+        const auto status = result.status == spacemit::manipulation::Result::kSucceeded
+            ? GraspResult::SUCCESS : GraspResult::MOVE_FAILED;
+        RecordResult(status, action, result.detail);
+        return status;
+    }
+#endif
     if (impl_->gripper_actuator_id < 0) {
         RecordResult(GraspResult::MOVE_FAILED, action,
                     "missing gripper actuator");
@@ -1699,6 +2442,7 @@ GraspResult MujocoGraspExecutor::ValidateGraspPoses(
     bool use_top_constraints,
     int timeout_ms,
     std::string* detail) {
+    impl_->SyncSnapshot();
     (void)timeout_ms;
     impl_->validated_pre_grasp_path.clear();
     impl_->validated_grasp_path.clear();
@@ -1893,6 +2637,108 @@ void MujocoGraspExecutor::SetSupportPlane(
     (void)support_plane;
 }
 
+GraspResult MujocoGraspExecutor::PrepareCupRelease() {
+#ifdef HAVE_MANIPULATION_MUJOCO
+    if (impl_->HoldingCup()) {
+        bool completed = false;
+        struct BlockFailedPlacement {
+            bool& blocked;
+            bool& completed;
+            ~BlockFailedPlacement() { if (!completed) blocked = true; }
+        } failure_guard{impl_->cup_placement_blocked, completed};
+        impl_->WaitForDeviceSettle("before_cup_placement");
+        impl_->BeginCupPlacement();
+        struct ResetPlanning {
+            bool& active;
+            ~ResetPlanning() { active = false; }
+        } reset{impl_->cup_placement};
+        // Right the held cup above the table, preserving its measured position and yaw.
+        // Releasing an inclined cup inside the open fingers can leave it leaning on a pad.
+        Pose3D target = impl_->UprightCupHoldPose();
+        const auto upright = MoveToPoseSim(target, "upright_cup_above_table", true, true);
+        if (upright != GraspResult::SUCCESS) return upright;
+        impl_->WaitForDeviceSettle("after_cup_upright");
+        if (std::acos(std::clamp(impl_->data->xmat[9 * impl_->held_body_id + 8], -1.0, 1.0)) > 0.025) {
+            RecordResult(GraspResult::MOVE_FAILED, "prepare_cup_release",
+                "held cup did not reach its upright placement pose");
+            return GraspResult::MOVE_FAILED;
+        }
+        // The generic transfer height is not a release height. Approach the real tabletop
+        // in bounded, orientation-preserving steps; leave a positive collision clearance.
+        for (int step = 0; step < 8; ++step) {
+            impl_->SyncSnapshot();
+            if (std::acos(std::clamp(impl_->data->xmat[9 * impl_->held_body_id + 8], -1.0, 1.0)) > 0.025) {
+                RecordResult(GraspResult::MOVE_FAILED, "prepare_cup_release",
+                    "held cup lost its upright placement pose");
+                return GraspResult::MOVE_FAILED;
+            }
+            const double gap = impl_->BodyLowestCollisionPoint(impl_->held_body_id) -
+                impl_->TableTop();
+            if (!std::isfinite(gap) || gap < 0.002) {
+                RecordResult(GraspResult::MOVE_FAILED, "prepare_cup_release",
+                    "cup tabletop clearance is invalid");
+                return GraspResult::MOVE_FAILED;
+            }
+            if (gap <= 0.003) break;
+            Pose3D current;
+            impl_->GetHoldPose(current);
+            target.z = current.z - static_cast<float>(std::min(0.03, gap - kMujocoCupReleaseGap));
+            const auto result = MoveToPoseSim(target, "lower_cup_to_table", true, true);
+            if (result != GraspResult::SUCCESS) return result;
+        }
+        impl_->WaitForDeviceSettle("before_cup_release");
+        std::string detail;
+        if (!impl_->CupReadyForRelease(&detail)) {
+            RecordResult(GraspResult::MOVE_FAILED, "prepare_cup_release", detail);
+            return GraspResult::MOVE_FAILED;
+        }
+        RecordResult(GraspResult::SUCCESS, "prepare_cup_release", detail);
+        completed = true;
+    }
+#endif
+    return GraspResult::SUCCESS;
+}
+
+GraspResult MujocoGraspExecutor::RetreatFromCup() {
+#ifdef HAVE_MANIPULATION_MUJOCO
+    impl_->WaitForDeviceSettle("before_cup_retreat");
+    const auto tool = impl_->device->ReadEffector();
+    if (tool.positions.size() != 1 || tool.positions[0] < 0.97) {
+        RecordResult(GraspResult::MOVE_FAILED, "cup_retreat", "cup retreat requires an open gripper");
+        return GraspResult::MOVE_FAILED;
+    }
+    impl_->WaitForCupSettle();
+    impl_->BeginCupRetreat();
+    struct ResetRetreat {
+        bool& active;
+        ~ResetRetreat() { active = false; }
+    } reset{impl_->cup_retreat};
+    Pose3D start;
+    impl_->GetHoldPose(start);
+    for (int step = 1; step <= 10; ++step) {
+        Pose3D target = start;
+        const double distance = 0.01 * step;
+        target.x += static_cast<float>(distance * impl_->cup_retreat_axis[0]);
+        target.y += static_cast<float>(distance * impl_->cup_retreat_axis[1]);
+        target.z += static_cast<float>(distance * impl_->cup_retreat_axis[2]);
+        const auto result = MoveToPoseSim(target, "cup_retreat", true, false);
+        if (result != GraspResult::SUCCESS) return result;
+    }
+    impl_->WaitForDeviceSettle("after_cup_retreat");
+    std::string collision;
+    if (impl_->HasUnsafeCollision(false, &collision) || !impl_->cup_pad_contacts.empty() ||
+        impl_->CupPadSeparation() < 0.01) {
+        RecordResult(GraspResult::MOVE_FAILED, "cup_retreat",
+            "cup retreat did not establish clearance: " + collision);
+        return GraspResult::MOVE_FAILED;
+    }
+    impl_->cup_departure_pending = false;
+    impl_->released_cup_body = -1;
+    RecordResult(GraspResult::SUCCESS, "cup_retreat");
+#endif
+    return GraspResult::SUCCESS;
+}
+
 GraspResult MujocoGraspExecutor::MoveToPlace() {
     const auto move_place_pose = [this](
             const Pose3D& pose, const char* action) {
@@ -1987,7 +2833,7 @@ GraspResult MujocoGraspExecutor::MoveToPlace() {
         }
         if (impl_->HeldObjectInsideDropZoneXY(&detail)) {
             RecordResult(GraspResult::SUCCESS, "move_to_place", detail);
-            return GraspResult::SUCCESS;
+            return PrepareCupRelease();
         }
         std::cout << "[MujocoExecutor] place correction "
                 << (attempt + 1) << "/"
@@ -1999,12 +2845,52 @@ GraspResult MujocoGraspExecutor::MoveToPlace() {
 }
 
 GraspResult MujocoGraspExecutor::ReleaseObject() {
+#ifdef HAVE_MANIPULATION_MUJOCO
+    const bool releasing_cup = impl_->HoldingCup();
+    bool release_completed = false;
+    struct BlockFailedRelease {
+        bool enabled;
+        bool& blocked;
+        bool& completed;
+        ~BlockFailedRelease() { if (enabled && !completed) blocked = true; }
+    } failure_guard{releasing_cup, impl_->cup_placement_blocked, release_completed};
+    if (impl_->HoldingCup()) {
+        impl_->WaitForDeviceSettle("before_cup_open");
+        std::string readiness;
+        if (!impl_->CupReadyForRelease(&readiness)) {
+            RecordResult(GraspResult::MOVE_FAILED, "release_object", readiness);
+            return GraspResult::MOVE_FAILED;
+        }
+    }
+#endif
     bool inside_before_release = false;
     const std::string before_release =
         impl_->DescribeTargetDropStatus(&inside_before_release);
-    impl_->ReleaseHeldObject(0);
+    bool release_after_open = false;
+#ifdef HAVE_MANIPULATION_MUJOCO
+    release_after_open = static_cast<bool>(impl_->runtime);
+#endif
+    if (!release_after_open) impl_->ReleaseHeldObject(0);
     GraspResult result = SetGripperCtrl(
         config_.mujoco.gripper_open_ctrl, "release_object");
+    if (release_after_open && result == GraspResult::SUCCESS) {
+        // This backend uses an explicit contact-assisted scene constraint. Keep it until
+        // opening is confirmed: releasing it into closed pads can keep the passive fingers
+        // moving and prevent the common layer from safely admitting the open command.
+        // An unsuccessful opening leaves the constraint in place; never teleport the object.
+#ifdef HAVE_MANIPULATION_MUJOCO
+        std::string readiness;
+        if (!impl_->CupReadyForRelease(&readiness)) {
+            RecordResult(GraspResult::MOVE_FAILED, "release_object", readiness);
+            return GraspResult::MOVE_FAILED;
+        }
+        if (impl_->HoldingCup()) {
+            impl_->cup_departure_pending = true;
+            impl_->released_cup_body = impl_->held_body_id;
+        }
+#endif
+        impl_->ReleaseHeldObject(config_.mujoco.settle_steps);
+    }
     bool inside_zone = false;
     const std::string detail = impl_->DescribeTargetDropStatus(&inside_zone);
     if (result == GraspResult::SUCCESS && !inside_zone) {
@@ -2013,6 +2899,10 @@ GraspResult MujocoGraspExecutor::ReleaseObject() {
     RecordResult(result, "release_object", detail);
     std::cout << "[MujocoExecutor] release_object: before={"
             << before_release << "} after={" << detail << "}" << std::endl;
+#ifdef HAVE_MANIPULATION_MUJOCO
+    if (result == GraspResult::SUCCESS && impl_->cup_departure_pending) result = RetreatFromCup();
+    release_completed = result == GraspResult::SUCCESS;
+#endif
     return result;
 }
 
@@ -2040,16 +2930,35 @@ GraspResult MujocoGraspExecutor::ExecutePlace() {
 }
 
 void MujocoGraspExecutor::EmergencyStop() {
+#ifdef HAVE_MANIPULATION_MUJOCO
+    if (impl_->runtime) {
+        const auto arm = impl_->device->HoldArm();
+        const auto effector = impl_->device->HoldEffector();
+        const bool stopped = arm.status == spacemit::manipulation::Result::kSucceeded &&
+            effector.status == spacemit::manipulation::Result::kSucceeded;
+        RecordResult(stopped ? GraspResult::SUCCESS : GraspResult::MOVE_FAILED,
+            "emergency_stop", arm.detail + "; " + effector.detail);
+        impl_->SyncSnapshot();
+        return;
+    }
+#endif
     impl_->HoldCurrentState();
     RecordResult(GraspResult::SUCCESS, "emergency_stop",
                 "motion stopped at current state");
 }
 
 bool MujocoGraspExecutor::GetCurrentPose(Pose3D& pose) {
+    impl_->SyncSnapshot();
     return impl_->GetHoldPose(pose);
 }
 
 void MujocoGraspExecutor::Tick(float dt_s) {
+#ifdef HAVE_MANIPULATION_MUJOCO
+    if (impl_->runtime) {
+        impl_->SyncSnapshot();
+        return;
+    }
+#endif
     if (!std::isfinite(dt_s) || dt_s <= 0.0f) {
         return;
     }

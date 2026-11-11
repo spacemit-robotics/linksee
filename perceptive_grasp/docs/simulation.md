@@ -1,5 +1,76 @@
 # MuJoCo 仿真运行
 
+## manipulation 仿真后端
+
+本指南以 `manipulation` 共享仿真为主入口，支持 PC 或 K3 本机服务，以及 PC 服务与 K3 客户端分开部署。
+安装、构建和运行命令见 [README 的仿真运行](../README.md#7-仿真运行)；K3 桌面/GPU 与实体设备的验收边界见[验证范围](../README.md#53-验证范围)。
+构建、场景和设备配置如下：
+
+| 文件或目录 | 用途 |
+| --- | --- |
+| `scripts/run_manipulation_simulation.py` | 构建、启动场景、运行抓取 |
+| `config/grasp_pipeline_manipulation_mujoco.yaml` | 本机服务、RGB-D 相机与规划配置 |
+| `config/grasp_pipeline_manipulation_remote.yaml` | 本机或 K3 抓取客户端配置 |
+| `simulation/mujoco/manipulation/device.yaml` | 独立选择机械臂、夹爪驱动及设备限制 |
+| `simulation/mujoco/manipulation/mapping.yaml` | 场景、关节和执行器映射 |
+| `simulation/mujoco/manipulation_scene.xml` | 场景、初始姿态及物理参数 |
+| `build_manipulation/prefix/` | 本示例使用的组件安装目录 |
+| `build_manipulation/app/` | 本机服务与抓取客户端 |
+| `build_manipulation/client/` | `build --client-only` 生成的客户端，不依赖本机 MuJoCo 或图形库 |
+
+`manipulator.mujoco.device_plan` 选择 `manipulation` 后端；空值使用独立 MuJoCo 执行器。
+服务通过 `DeviceSession` 控制机械臂和夹爪，物理步进、相机和窗口共用一个世界。
+逆运动学与路径检查使用状态副本，不移动场景中的物体。服务配置不作为独立 pipeline 的配置使用。
+
+场景显式保存起始姿态和伺服参数，不在通用驱动中改写模型。
+本后端要求映射设置 `synchronized_joint_point: true`，使关节点位按同一时间比例推进，保持规划路径的轴间关系。
+夹爪双指接触目标后才建立抓持约束；空抓不会附着物体。约束释放后物体继续参与物理仿真。
+杯体放置时先将杯子扶正，再按实际几何降低释放高度；检查姿态与桌面净空后开夹，退离杯体并返回初始位。
+放杯或退离失败会阻止后续动作，须重置场景后重新开始。
+
+应用服务使用原有 `remote_mujoco` 抓取协议，默认回环端口 `9090`，包含感知和抓取任务。
+组件工具 `manipulation-simulation` 使用独立的通用设备协议，默认回环端口 `9100`，提供设备控制与图像读取。
+两者不可互换端口或客户端。跨机连接使用 SSH 转发，不向公网开放仿真服务。
+应用协议按顺序处理请求，执行期间不支持并行取消或采帧；客户端断连不代表动作停止。
+通用设备服务的租约与断连保持机制不适用于该应用协议。
+
+### 图形环境
+
+PC 使用 GLFW/OpenGL；K3 使用原生 X11/gl4es，底层 EGL/GLES 驱动由系统桌面镜像提供。
+图形上下文在主线程创建，相机与窗口读取物理快照。
+`--no-viewer` 仅隐藏窗口，RGB-D 渲染仍需要 `DISPLAY`。没有桌面会话时，可以只在 K3 构建远程客户端。
+该后端暂不提供 EGL 或 OSMesa 无显示渲染。
+启动脚本将 Mesa 软件渲染线程数默认设为 `2`，可通过 `LP_NUM_THREADS` 覆盖；不改变硬件渲染方式。
+
+### 检测与场景
+
+示例允许依据场景颜色生成目标掩码，未安装 YOLO 模型时仍可完成几何估计和抓取。
+颜色分割仅适用于配套合成场景；模型准确率与真机抓取能力需要分别评估。
+场景参数变化时，应同步检查相机外参、关节映射、抓取尺寸和规划工作区。
+
+### 共享仿真的语音控制
+
+先完成 [README 的远程部署](../README.md#73-pc-显示k3-远程抓取)，保持服务与 SSH 转发运行，并按[语音控制](voice_control.md)准备 Python 依赖、模型及音频设备。
+`build --client-only` 关闭 WebRTC AEC；在 `config/grasp_pipeline_manipulation_remote.yaml` 中将 `voice.echo_cancellation.mode` 设为 `half_duplex`，播报期间暂停录音。
+音频设备已提供硬件回声消除时，可选择 `hardware_aec`；需要软件 AEC 时须另行构建 `ENABLE_WEBRTC_AEC=ON` 的客户端。
+
+在应用目录运行：
+
+```bash
+source ~/.venv-grasp/bin/activate
+./build_manipulation/client/perceptive_grasp \
+  --voice-control \
+  --config config/grasp_pipeline_manipulation_remote.yaml \
+  --remote-host 127.0.0.1
+```
+
+语音模型与音频设备在客户端运行；应用仿真协议的取消、断连边界仍按本页的说明执行。
+
+## 原有仿真后端
+
+以下第 1–6 节仅供继续使用独立 MuJoCo 兼容后端的部署，配置为 `grasp_pipeline_mujoco_ur5e.yaml` 和 `grasp_pipeline_remote_mujoco_ur5e.yaml`。
+该后端的物理仿真与渲染仅运行在 x86_64 PC；K3 本机服务使用本页开头的共享仿真入口。第 7 节列出两种后端共同的任务验收条件。
+
 本方案将仿真环境和抓取 pipeline 分为独立进程：
 
 - PC 运行 MuJoCo 物理仿真、RGB-D 渲染和第三视角窗口。
@@ -206,7 +277,7 @@ source ~/.venv-grasp/bin/activate
 
 出现 `[VoiceBridge] Listening` 后，说“抓苹果”“抓香蕉”“抓木块”或“抓杯子”。语音桥在 K3 执行 VAD、ASR、AEC 和 TTS，并通过同一个 pipeline 状态机控制 PC 中的仿真机械臂。
 
-K3 本地运行 MuJoCo 不属于当前支持范围。K3 使用 RISC-V 64 位架构，MuJoCo 官方未提供对应的预编译运行库；物理仿真与渲染保持在 x86_64 PC。
+上述原有仿真后端的物理仿真与渲染运行在 x86_64 PC。K3 本机运行使用本页开头的 `manipulation` 后端。
 
 ## 7. 验收仿真结果
 
@@ -226,7 +297,9 @@ K3 本地运行 MuJoCo 不属于当前支持范围。K3 使用 RISC-V 64 位架�
 
 ## 8. 配置文件
 
-- [`grasp_pipeline_mujoco_ur5e.yaml`](../config/grasp_pipeline_mujoco_ur5e.yaml)：PC 仿真服务的场景、相机、UR5e 和物理参数。
-- [`grasp_pipeline_remote_mujoco_ur5e.yaml`](../config/grasp_pipeline_remote_mujoco_ur5e.yaml)：PC 或 K3 抓取 pipeline 的远程相机、机械臂和语音配置。
+- [`grasp_pipeline_manipulation_mujoco.yaml`](../config/grasp_pipeline_manipulation_mujoco.yaml)：PC 或 K3 共享仿真服务的场景、相机和设备配置。
+- [`grasp_pipeline_manipulation_remote.yaml`](../config/grasp_pipeline_manipulation_remote.yaml)：共享仿真的本机或远程客户端配置。
+- [`grasp_pipeline_mujoco_ur5e.yaml`](../config/grasp_pipeline_mujoco_ur5e.yaml)：兼容后端的 PC 服务配置。
+- [`grasp_pipeline_remote_mujoco_ur5e.yaml`](../config/grasp_pipeline_remote_mujoco_ur5e.yaml)：兼容后端的 PC 或 K3 客户端配置。
 
 字段说明见[抓取配置参考](grasp_config.md)。

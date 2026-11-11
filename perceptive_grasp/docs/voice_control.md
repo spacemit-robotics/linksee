@@ -145,17 +145,18 @@ source ~/.venv-grasp/bin/activate
 
 ### 5.1 控制远程仿真
 
-PC 启动 MuJoCo 仿真服务后，在 K3 运行：
+按 [README](../README.md#73-pc-显示k3-远程抓取)启动共享仿真服务、构建 K3 客户端并保持 SSH 转发。
+该客户端默认不构建 WebRTC AEC；先在 `config/grasp_pipeline_manipulation_remote.yaml` 中将 `voice.echo_cancellation.mode` 改为 `half_duplex`，并按实际设备设置录音与播放参数。在应用目录运行：
 
 ```bash
 source ~/.venv-grasp/bin/activate
-./build_remote_mujoco/perceptive_grasp \
+./build_manipulation/client/perceptive_grasp \
   --voice-control \
-  --config config/grasp_pipeline_remote_mujoco_ur5e.yaml \
-  --remote-host <pc_ip>
+  --config config/grasp_pipeline_manipulation_remote.yaml \
+  --remote-host 127.0.0.1
 ```
 
-语音设备、VAD、ASR、AEC 和 TTS 均运行在 K3。`remote_mujoco` 只传输 RGB-D 数据和机械臂命令，不传输音频。完整构建和启动步骤见[仿真运行](simulation.md#6-在-k3-启用语音控制)。
+语音设备、VAD、ASR 和 TTS 均运行在 K3。`remote_mujoco` 只传输 RGB-D 数据和机械臂命令，不传输音频。回声处理选项及协议限制见[共享仿真的语音控制](simulation.md#共享仿真的语音控制)；使用兼容后端时见[兼容后端语音步骤](simulation.md#6-在-k3-启用语音控制)。
 
 ## 6. 验证命令解析
 

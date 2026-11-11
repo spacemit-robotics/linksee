@@ -7,10 +7,8 @@
  */
 
 #include "grasp_executor.h"
-
-extern "C" {
-#include "grasp.h"
-}
+#include "executor_device.h"
+#include "manipulation/device.h"
 
 #include <algorithm>
 #include <chrono>
@@ -23,18 +21,49 @@ namespace perceptive_grasp {
 
 namespace {
 
-const char* GraspStateName(grasp_state_t state) {
+enum class GripperState { IDLE, MOVING, HOLDING, EMPTY, ERROR };
+
+const char* GraspStateName(GripperState state) {
     switch (state) {
-        case GRASP_STATE_IDLE: return "IDLE";
-        case GRASP_STATE_MOVING: return "MOVING";
-        case GRASP_STATE_HOLDING: return "HOLDING";
-        case GRASP_STATE_EMPTY: return "EMPTY";
-        case GRASP_STATE_ERROR: return "ERROR";
+        case GripperState::IDLE: return "IDLE";
+        case GripperState::MOVING: return "MOVING";
+        case GripperState::HOLDING: return "HOLDING";
+        case GripperState::EMPTY: return "EMPTY";
+        case GripperState::ERROR: return "ERROR";
     }
     return "UNKNOWN";
 }
 
 }  // namespace
+
+bool GraspExecutor::SetGripperPosition(float position) {
+    if (!device_) return false;
+    try {
+        device_->FollowGripper(position, config_.gripper_command_duration_s);
+        return true;
+    } catch (const std::exception& error) {
+        RecordResult(GraspResult::MOVE_FAILED, "gripper_command", error.what());
+        return false;
+    }
+}
+
+bool GraspExecutor::ReadGripperFeedback(GripperFeedbackSample& sample, bool& moving) {
+    if (!device_) return false;
+    try {
+        const auto feedback = device_->ReadGripper();
+        sample.position = static_cast<float>(feedback.positions[0]);
+        // Preserve the established holding thresholds while using the public signed load unit.
+        constexpr float kPerMille = 1000.0f;
+        sample.load = static_cast<float>(std::abs(feedback.loads[0])) * kPerMille;
+        moving = feedback.moving || feedback.command_active;
+        sample.state_holding = !moving && feedback.holding == true;
+        sample.state_empty = !moving && feedback.holding == false;
+        return true;
+    } catch (const std::exception& error) {
+        RecordResult(GraspResult::MOVE_FAILED, "gripper_feedback", error.what());
+        return false;
+    }
+}
 
 void GraspExecutor::CaptureEmptyClosedPosition() {
     if (gripper_baseline_.valid) return;
@@ -46,27 +75,17 @@ void GraspExecutor::CaptureEmptyClosedPosition() {
     std::vector<GripperFeedbackSample> samples;
     samples.reserve(static_cast<size_t>(sample_count));
     for (int index = 0; index < sample_count; ++index) {
-        const float interval_s =
-            static_cast<float>(interval_ms) / 1000.0f;
-        grasp_tick(gripper_, interval_s);
-        const grasp_state_t state = grasp_get_state(gripper_);
-        float position = NAN;
-        float load = NAN;
-        if (grasp_get_feedback(
-                gripper_, &position, &load) == GRASP_OK &&
-            std::isfinite(position) && std::isfinite(load)) {
-            if (state == GRASP_STATE_HOLDING ||
-                load >= config_.gripper_hold_load_threshold) {
+        GripperFeedbackSample sample;
+        bool moving = false;
+        if (!ReadGripperFeedback(sample, moving)) return;
+        if (std::isfinite(sample.position) && std::isfinite(sample.load)) {
+            if (sample.state_holding || sample.load >= config_.gripper_hold_load_threshold) {
                 std::cout << "[GraspExecutor] empty gripper baseline "
                             "skipped: feedback indicates a possible held "
                             "object" << std::endl;
                 return;
             }
-            samples.push_back(
-                GripperFeedbackSample{
-                    position, load, false,
-                    state == GRASP_STATE_EMPTY ||
-                        state == GRASP_STATE_IDLE});
+            if (!moving) samples.push_back(sample);
         }
         std::this_thread::sleep_for(
             std::chrono::milliseconds(interval_ms));
@@ -99,7 +118,7 @@ GraspResult GraspExecutor::OpenGripperForGrasp(float minimum_opening) {
     std::cout << "[GraspExecutor] opening gripper: configured="
             << config_.gripper_open << " requested=" << minimum_opening
             << " command=" << opening << std::endl;
-    if (grasp_set_position(gripper_, opening) != GRASP_OK) {
+    if (!SetGripperPosition(opening)) {
         RecordResult(
             GraspResult::MOVE_FAILED, "open_gripper_for_grasp",
             "failed to set grasp opening");
@@ -127,12 +146,12 @@ bool GraspExecutor::WaitGripperOpening(float target_position) {
     float position = NAN;
     float load = NAN;
     while (std::chrono::steady_clock::now() < deadline) {
-        grasp_tick(
-            gripper_, static_cast<float>(kPollIntervalMs) / 1000.0f);
-        const grasp_state_t state = grasp_get_state(gripper_);
-        if (state == GRASP_STATE_ERROR) return false;
-        if (grasp_get_feedback(gripper_, &position, &load) == GRASP_OK &&
-            std::isfinite(position) &&
+        GripperFeedbackSample sample;
+        bool moving = false;
+        if (!ReadGripperFeedback(sample, moving)) return false;
+        position = sample.position;
+        load = sample.load;
+        if (!moving && std::isfinite(position) &&
             position >= target_position - kPositionTolerance) {
             std::cout << "[GraspExecutor] gripper opening reached: target="
                     << target_position << " position=" << position
@@ -146,15 +165,14 @@ bool GraspExecutor::WaitGripperOpening(float target_position) {
     std::cerr << "[GraspExecutor] gripper opening timeout: target="
             << target_position << " position=" << position
             << " load=" << load << std::endl;
+    if (device_) device_->Fail();
     return false;
 }
 
 GraspResult GraspExecutor::CloseGripperAndCheck() {
     std::this_thread::sleep_for(
         std::chrono::milliseconds(config_.timing.grasp_settle_ms));
-    if (grasp_execute(
-            gripper_, GRASP_CMD_GRAB,
-            config_.gripper_effort) != GRASP_OK) {
+    if (!SetGripperPosition(0.0f)) {
         RecordResult(
             GraspResult::MOVE_FAILED, "close_gripper_and_check",
             "failed to start gripper close");
@@ -168,7 +186,7 @@ GraspResult GraspExecutor::CloseGripperAndCheck() {
 
 GraspResult GraspExecutor::CheckGripperHolding(
     const char* phase, bool after_lift) {
-    grasp_state_t state = GRASP_STATE_ERROR;
+    GripperState state = GripperState::ERROR;
     int performed_checks = 0;
     std::vector<GripperFeedbackSample> samples;
 
@@ -192,24 +210,15 @@ GraspResult GraspExecutor::CheckGripperHolding(
     holding_config.required_consecutive_samples = required_holding;
     GripperHoldingEvidence evidence;
     for (int index = 0; index < maximum_checks; ++index) {
-        const float interval_s =
-            static_cast<float>(config_.timing.grasp_check_interval_ms) /
-            1000.0f;
-        grasp_tick(gripper_, interval_s);
         performed_checks++;
-        state = grasp_get_state(gripper_);
-
-        float current_position = NAN;
-        float current_load = NAN;
-        grasp_get_feedback(
-            gripper_, &current_position, &current_load);
-        samples.push_back(
-            GripperFeedbackSample{
-                current_position,
-                current_load,
-                state == GRASP_STATE_HOLDING,
-                state == GRASP_STATE_EMPTY ||
-                    state == GRASP_STATE_IDLE});
+        GripperFeedbackSample sample;
+        bool moving = false;
+        if (!ReadGripperFeedback(sample, moving)) return GraspResult::MOVE_FAILED;
+        state = moving ? GripperState::MOVING :
+            sample.state_holding ? GripperState::HOLDING : GripperState::EMPTY;
+        // Motion samples cannot establish holding or empty evidence.
+        if (moving) sample.load = NAN;
+        samples.push_back(sample);
         evidence = EvaluateGripperHolding(
             samples, gripper_baseline_, holding_config);
 
@@ -227,7 +236,7 @@ GraspResult GraspExecutor::CheckGripperHolding(
     diagnostics_.gripper_check.phase = phase;
     diagnostics_.gripper_check.state = GraspStateName(state);
     const bool driver_empty_at_calibrated_position =
-        (state == GRASP_STATE_EMPTY || state == GRASP_STATE_IDLE) &&
+        (state == GripperState::EMPTY || state == GripperState::IDLE) &&
         std::isfinite(evidence.position) &&
         std::isfinite(evidence.load) &&
         evidence.position <= evidence.minimum_object_position &&
@@ -330,8 +339,7 @@ GraspResult GraspExecutor::CheckGripperHolding(
 }
 
 GraspResult GraspExecutor::ReleaseObject() {
-    if (grasp_set_position(
-            gripper_, config_.place_release_open) != GRASP_OK) {
+    if (!SetGripperPosition(config_.place_release_open)) {
         RecordResult(
             GraspResult::MOVE_FAILED, "release_object",
             "failed to set release opening");
@@ -339,13 +347,17 @@ GraspResult GraspExecutor::ReleaseObject() {
     }
     std::this_thread::sleep_for(
         std::chrono::milliseconds(config_.timing.release_wait_ms));
+    if (!WaitGripperOpening(config_.place_release_open)) {
+        RecordResult(GraspResult::TIMEOUT, "release_object", "release opening not confirmed");
+        return GraspResult::TIMEOUT;
+    }
     gripper_baseline_ = GripperBaseline{};
     RecordResult(GraspResult::SUCCESS, "release_object");
     return GraspResult::SUCCESS;
 }
 
 GraspResult GraspExecutor::CloseGripper() {
-    if (grasp_set_position(gripper_, 0.0f) != GRASP_OK) {
+    if (!SetGripperPosition(0.0f)) {
         RecordResult(
             GraspResult::MOVE_FAILED, "close_gripper",
             "failed to set closed position");
