@@ -3,7 +3,7 @@
 schema_version: 3
 device:
     arm:
-        driver: mujoco
+        driver: mujoco_ur5e
         device_id: grasp_arm
         resource_id: perceptive_grasp_simulation
         options: {mapping_file: mapping.yaml}
@@ -17,7 +17,7 @@ device:
             - {name: robot_wrist_2_joint, minimum_rad: -6.2831, maximum_rad: 6.2831}
             - {name: robot_wrist_3_joint, minimum_rad: -6.2831, maximum_rad: 6.2831}
     effector:
-        driver: mujoco
+        driver: mujoco_robotiq_2f85
         device_id: grasp_gripper
         resource_id: perceptive_grasp_simulation
         options: {mapping_file: mapping.yaml}

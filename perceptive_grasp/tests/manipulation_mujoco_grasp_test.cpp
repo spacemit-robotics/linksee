@@ -91,6 +91,8 @@ void CheckContracts() {
     mapping["scene"] = config.mujoco.xml_path;
     device["device"]["arm"]["options"]["mapping_file"] = (path / "mapping.yaml").string();
     device["device"]["effector"]["options"]["mapping_file"] = (path / "mapping.yaml").string();
+    // Custom mappings may use another order; the application's IK still has a fixed order.
+    device["device"]["arm"]["driver"] = "mujoco_mapped_arm";
     const auto first_joint = YAML::Clone(device["device"]["arm"]["joints"][0]);
     device["device"]["arm"]["joints"][0] = YAML::Clone(device["device"]["arm"]["joints"][1]);
     device["device"]["arm"]["joints"][1] = first_joint;
@@ -138,6 +140,8 @@ void CheckContracts() {
     mapping["scene"] = config.mujoco.xml_path;
     // A valid split of the scene's final arm actuator into a second tool channel is not a
     // single-gripper application profile, even though the common driver can represent it.
+    device["device"]["arm"]["driver"] = "mujoco_mapped_arm";
+    device["device"]["effector"]["driver"] = "mujoco_mapped_effector";
     device["device"]["arm"]["joints"].remove(5);
     mapping["arm"].remove(5);
     config.mujoco.joint_names.pop_back();
@@ -157,7 +161,24 @@ void CheckContracts() {
     config.mujoco.device_plan = (path / "device.yaml").string();
     spacemit::manipulation::LoadDevicePlan(config.mujoco.device_plan, registry);
     CheckRejected(config, "one gripper channel");
-    std::cout << "planning/device contracts rejected before world startup" << std::endl;
+    config = Configuration();
+    device = YAML::LoadFile(config.mujoco.device_plan);
+    const auto original_mapping = (std::filesystem::path(config.mujoco.device_plan)
+        .parent_path() / "mapping.yaml").string();
+    device["device"]["arm"]["options"]["mapping_file"] = original_mapping;
+    device["device"]["effector"]["options"]["mapping_file"] = original_mapping;
+    device["device"]["arm"]["driver"] = "mujoco";
+    config.mujoco.device_plan = (path / "device.yaml").string();
+    for (const auto* effector_driver : {"mujoco", "mujoco_robotiq_2f85"}) {
+        device["device"]["effector"]["driver"] = effector_driver;
+        std::ofstream(path / "device.yaml") << device;
+        MujocoGraspExecutor executor(config);
+        if (!executor.Init() || !executor.SimulationRuntime()) {
+            throw std::runtime_error("compatible simulation driver names were rejected: " +
+                executor.GetDiagnostics().last_detail);
+        }
+    }
+    std::cout << "planning/device contracts and driver compatibility passed" << std::endl;
 }
 
 std::array<float, 3> BodyPosition(MujocoGraspExecutor* executor, const std::string& body) {

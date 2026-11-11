@@ -4,13 +4,13 @@
 
 ![perceptive_grasp 真机抓取链路](docs/assets/grasp-system-flow-v2.svg)
 
-同一套 pipeline 可连接 Linksee 真实硬件或 MuJoCo 仿真环境。真机模式用于实际部署，仿真模式用于在没有真实机械臂时验证完整方案，并为后续 Sim2Real 提供一致的配置结构和后端接口。
+同一套 pipeline 可连接 Linksee 真实硬件或 UR5e / Robotiq 2F-85 仿真场景，两种模式共用感知、规划、任务控制和语音接口。
 
 | 运行模式 | 配置 | RGB-D 输入 | 机械臂执行 | 部署方式 |
 |---|---|---|---|---|
 | Linksee 真机 | `config/grasp_pipeline.yaml` | RealSense D435i / `spacemit_las2` | SO101 / Linksee 底盘 | 感知、规划和执行均运行在 Linksee |
-| 本机 MuJoCo | `config/grasp_pipeline_manipulation_mujoco.yaml` | 模拟 RGB-D 相机 | `manipulation` 仿真驱动 | PC 或 K3 本机显示场景并执行抓取 |
-| 远程 MuJoCo | `config/grasp_pipeline_manipulation_remote.yaml` | 远程模拟 RGB-D 相机 | 远程仿真服务 | PC 显示场景，K3 运行抓取 pipeline |
+| 本机 MuJoCo | `config/grasp_pipeline_manipulation_mujoco.yaml` | 模拟 RGB-D 相机 | UR5e / Robotiq 2F-85 | PC 或 K3 本机显示场景并执行抓取 |
+| 远程 MuJoCo | `config/grasp_pipeline_manipulation_remote.yaml` | 远程模拟 RGB-D 相机 | 远程 UR5e / Robotiq 2F-85 服务 | PC 显示场景，K3 运行抓取 pipeline |
 
 ## 1. 功能范围
 
@@ -39,9 +39,9 @@
 | 手眼标定 | `manipulation` 标定会话 | 采集静止姿态与图像，求解和导出相机外参 |
 | 底盘辅助 | `libchassis` | 调整机器人与目标的相对位置 |
 | 语音交互 | `spacemit_audio` / VAD / ASR / TTS | 接收语音命令并播报任务状态 |
-| MuJoCo 仿真 | `mujoco` / `remote_mujoco` | 在没有真实机械臂时验证感知、规划和执行方案，并提供 Sim2Real 验证环境 |
+| MuJoCo 仿真 | UR5e / Robotiq 2F-85 场景 | 运行物理仿真、模拟 RGB-D 相机与抓取执行器 |
 
-MuJoCo 模式复用真机 pipeline 的目标检测、三维估计、抓取规划、状态机和语音控制接口，通过仿真相机与仿真执行器替代真实硬件。开发者可以在没有真实机械臂的环境中验证完整抓取流程，并通过一致的配置结构和后端接口降低后续 Sim2Real 迁移成本。
+MuJoCo 模式通过仿真相机与仿真执行器替代真实硬件。机械臂与夹爪分别使用 `mujoco_ur5e` 和 `mujoco_robotiq_2f85` 驱动，与真机模式使用相同的设备接口。
 
 ## 3. 准备环境
 
@@ -134,20 +134,6 @@ python3 scripts/check_runtime_env.py \
 [SUMMARY] ready
 ```
 
-### 5.3 验证范围
-
-截至 2026-11-11，K3 隔离构建已完成以下软件回归：
-
-| 检查 | 结果 | 覆盖范围 |
-| --- | --- | --- |
-| 公共 MuJoCo 组件 | 22/22 通过 | 物理仿真、远程协议与模拟相机 |
-| 仿真抓取应用 | 30/30 通过 | 四类物体、空抓与保护检查，苹果和杯子的完整 RGB-D 抓取 |
-| 真机执行器应用 | 22/22 通过 | 离线、模拟设备和配置检查；不代表实体机械臂验收 |
-
-渲染测试使用 Xvfb、gl4es 和 llvmpipe 软件渲染；K3 实际桌面窗口与 GPU 显示尚未验收。
-PC 共享仿真回归也已通过 30/30，使用 GLFW 和 Xvfb，包含基于模拟 RGB-D 的苹果、杯子完整抓放流程。
-实体 SO101 抓取与真实相机标定采样仍待完成。验证使用隔离安装，未替换 K3 正式安装的程序与库。
-
 ## 6. 运行抓取
 
 **以下命令会驱动机械臂和底盘。启动前清理机器人工作空间，确认急停和断电装置可用，并保持人员远离运动范围。**
@@ -217,7 +203,7 @@ source ~/.venv-grasp/bin/activate
 
 示例使用 UR5e、Robotiq 2F-85 和固定式 RGB-D 相机，将绿色区域内的物体搬运到红色区域。
 支持 PC 或 K3 本机运行，也支持 PC 运行场景、K3 远程执行抓取。仿真不会连接真实设备。
-本节使用 `manipulation` 共享仿真后端；已通过的测试与待验收项目见[验证范围](#53-验证范围)。
+本节使用 `manipulation` 共享仿真后端，机械臂、夹爪和模拟 RGB-D 相机共用一个物理世界。
 
 ### 7.1 安装与构建
 

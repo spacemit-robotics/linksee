@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file mujoco_grasp_executor.cpp
- * @brief MuJoCo-backed grasp executor for PC simulation.
+ * @brief MuJoCo-backed grasp executor for simulated manipulation.
  */
 
 #include "mujoco_grasp_executor.h"
@@ -29,6 +29,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include "manipulation/device_plan.h"
+#include "manipulation/mujoco_driver.h"
 #include "manipulation/mujoco_runtime.h"
 #include "mujoco_cup_placement.h"
 #include "mujoco_native_snapshot.h"
@@ -435,8 +436,8 @@ struct MujocoGraspExecutor::Impl {
             }
             const auto registry = control::MakeBuiltinDeviceRegistry();
             const auto plan = control::LoadDevicePlan(config.mujoco.device_plan, registry);
-            if (plan.composition.arm_driver != "mujoco" ||
-                plan.composition.effector_driver != "mujoco" ||
+            if (!control::IsMujocoArmDriver(plan.composition.arm_driver) ||
+                !control::IsMujocoEffectorDriver(plan.composition.effector_driver) ||
                 plan.composition.arm_options != plan.composition.effector_options) {
                 throw std::runtime_error("grasp simulation requires one shared MuJoCo device plan");
             }

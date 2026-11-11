@@ -22,7 +22,7 @@ def _load(name):
 
 
 class BackendProfilesTest(unittest.TestCase):
-    def test_default_profile_keeps_validated_hardware_backends(self):
+    def test_default_profile_keeps_hardware_backends(self):
         config = _load("grasp_pipeline.yaml")
         self.assertEqual(config["camera"]["type"], "realsense")
         self.assertEqual(
@@ -36,7 +36,7 @@ class BackendProfilesTest(unittest.TestCase):
         self.assertEqual(config["grasp"]["top"]["verification_lift_m"], 0.0)
         self.assertEqual(config["grasp"]["top"]["minimum_grasp_height"], 0.0)
 
-    def test_default_profile_matches_k3_validated_grasp_behavior(self):
+    def test_default_profile_keeps_grasp_behavior(self):
         config = _load("grasp_pipeline.yaml")
         top = config["grasp"]["top"]
         self.assertEqual(top["approach_height"], 0.10)
@@ -58,7 +58,7 @@ class BackendProfilesTest(unittest.TestCase):
             {"joint": 3, "min": -1.790, "max": 1.670},
         )
 
-    def test_simulation_profiles_explicitly_opt_into_new_planning(self):
+    def test_simulation_profiles_enable_geometry_filters(self):
         for name in (
             "grasp_pipeline_mujoco_ur5e.yaml",
             "grasp_pipeline_remote_mujoco_ur5e.yaml",
@@ -99,8 +99,8 @@ class BackendProfilesTest(unittest.TestCase):
         self.assertEqual(settings["arm_stiffness_scale"], 1.0)
         plan = (CONFIG / settings["device_plan"]).resolve()
         definition = yaml.safe_load(plan.read_text(encoding="utf-8"))["device"]
-        self.assertEqual(definition["arm"]["driver"], "mujoco")
-        self.assertEqual(definition["effector"]["driver"], "mujoco")
+        self.assertEqual(definition["arm"]["driver"], "mujoco_ur5e")
+        self.assertEqual(definition["effector"]["driver"], "mujoco_robotiq_2f85")
         self.assertEqual(definition["arm"]["options"], definition["effector"]["options"])
         self.assertFalse(config["mobile_base"]["enabled"])
         self.assertEqual(config["camera"]["mujoco"]["xml_path"], settings["xml_path"])

@@ -328,7 +328,7 @@ place:
 
 ### 4.1 配置 MuJoCo 执行器
 
-`manipulator.driver: "mujoco_ur5e"` 保留上层执行器名称；`manipulator.mujoco.device_plan` 非空时选择共享仿真后端。配套服务配置使用以下字段：
+`manipulator.driver: "mujoco_ur5e"` 选择 UR5e 仿真执行器；`manipulator.mujoco.device_plan` 非空时使用 `manipulation` 共享设备后端。设备配置中的机械臂驱动为 `mujoco_ur5e`，夹爪驱动为 `mujoco_robotiq_2f85`。配套服务配置使用以下字段：
 
 ```yaml
 manipulator:

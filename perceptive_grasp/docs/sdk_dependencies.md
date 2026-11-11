@@ -358,4 +358,4 @@ python3 scripts/run_manipulation_simulation.py build --client-only
 本机构建将公共组件安装到 `build_manipulation/prefix/`，服务与客户端生成在 `build_manipulation/app/`；仅客户端构建到 `build_manipulation/client/`，不需要本机 MuJoCo 或显示器。
 两种构建均关闭真机执行器、LAS2 和 WebRTC AEC。启用语音时须按[共享仿真的语音控制](simulation.md#共享仿真的语音控制)选择回声处理模式。
 
-安装依赖与运行命令见 [README](../README.md#7-仿真运行)，独立兼容后端的构建和语音步骤见[原有仿真后端](simulation.md#原有仿真后端)。
+安装依赖与运行命令见 [README](../README.md#7-仿真运行)，独立后端的构建和语音步骤见[独立 MuJoCo 后端](simulation.md#独立-mujoco-后端)。
