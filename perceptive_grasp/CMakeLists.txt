@@ -84,7 +84,7 @@ if(ENABLE_MUJOCO_EXECUTOR)
         message(FATAL_ERROR
             "[Simulation] failed to prepare pinned MuJoCo Menagerie assets")
     endif()
-    include("${CMAKE_CURRENT_SOURCE_DIR}/../../../../components/simulation/mujoco/cmake/FindMuJoCo.cmake")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../../../../components/control/manipulation/simulation/mujoco/cmake/FindMuJoCo.cmake")
     set(HAVE_MUJOCO_EXECUTOR ON)
     message(STATUS "[Executor] mujoco ur5e simulation backend enabled")
     # Preserve the standalone GLFW camera on PC. K3 uses only the shared renderer.
@@ -407,7 +407,8 @@ if(HAVE_MUJOCO_EXECUTOR)
     if(ENABLE_MANIPULATION_MUJOCO)
         find_package(manipulation CONFIG REQUIRED)
         if(NOT TARGET mujoco_sim::render)
-            message(FATAL_ERROR "The installed MuJoCo component requires MUJOCO_BUILD_RENDERER=ON")
+            message(FATAL_ERROR
+                "Build and install manipulation with MANIPULATION_ENABLE_SIMULATION_RENDERER=ON")
         endif()
         add_definitions(-DHAVE_MANIPULATION_MUJOCO=1)
         list(APPEND EXTRA_LIBRARIES spacemit::manipulation_motion

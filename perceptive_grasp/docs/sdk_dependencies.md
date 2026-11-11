@@ -343,6 +343,8 @@ cmake --build build -j"$(nproc)"
 - `USE_OPENCV_DNN`：使用 OpenCV DNN 检测器，主要用于 PC 仿真和未部署 `vision_service` 的独立构建。
 - `USE_MOCK_EXECUTOR`：使用 mock 执行器，不控制真实机械臂。
 
+共享仿真的物理世界与渲染库由 SDK 的 `components/control/manipulation/simulation/mujoco/` 提供，随 `manipulation` 一同构建、安装。
+
 共享仿真使用独立构建目录。PC 或 K3 本机服务执行：
 
 ```bash

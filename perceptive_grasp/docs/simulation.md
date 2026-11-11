@@ -5,7 +5,9 @@
 本指南以 `manipulation` 共享仿真为主入口，支持 PC 或 K3 本机服务，以及 PC 服务与 K3 客户端分开部署。
 安装、构建和运行命令见 [README 的仿真运行](../README.md#7-仿真运行)。
 
-构建、场景和设备配置如下：
+物理世界与渲染库位于 SDK 的 `components/control/manipulation/simulation/mujoco/`，由 `manipulation` 仓库维护。
+
+下表路径相对 `perceptive_grasp/`；应用的 `simulation/mujoco/` 保存抓取场景与设备映射：
 
 | 文件或目录 | 用途 |
 | --- | --- |
