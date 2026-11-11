@@ -92,7 +92,8 @@ camera:
 - `mujoco.width`、`mujoco.height`：渲染图像尺寸，单位像素。
 - `mujoco.depth.min_m`、`mujoco.depth.max_m`：输出深度图的有效距离范围，单位米。
 
-共享后端由服务端从同一物理世界读取相机；其服务配置不能直接用于独立 pipeline。兼容后端的场景为 `../simulation/mujoco/ur5e_scene.xml`。
+- **共享后端**：服务端从同一物理世界读取相机；其服务配置不能直接用于独立 pipeline。
+- **兼容后端**：场景为 `../simulation/mujoco/ur5e_scene.xml`。
 
 `camera.type: "remote_mujoco"` 从远程仿真服务获取相同格式的彩色图、深度图和相机内参。远程服务地址由 [`remote_mujoco`](#7-配置-mujoco-服务与远程连接) 配置块统一设置。
 
@@ -118,7 +119,15 @@ MuJoCo 配置还支持以下合成场景字段：
 - `detection.label_remap`：检测模型类别名到仿真场景目标名的映射。键和值均不能为空。
 - `detection.allow_color_only_fallback`：模型未检出目标时，是否允许从 `detection.simulation_color_targets` 生成候选掩码。该字段只能用于 `mujoco` 和 `remote_mujoco` 相机后端。
 - `detection.refine_with_simulation_colors`：是否使用场景颜色范围细化模型输出的同名目标掩码。该字段只能用于 MuJoCo 相机后端。
-- `detection.simulation_color_targets`：合成场景颜色目标列表。每项包含 `label`、`hsv_min`、`hsv_max`、`min_area`、`max_area` 和可选的 `score`。HSV 范围使用 OpenCV 取值：H 为 `0–179`，S 和 V 为 `0–255`；`max_area: 0` 表示不设面积上限；`score` 取值范围为 `(0, 1]`，默认值为 `0.99`。
+- `detection.simulation_color_targets`：合成场景颜色目标列表。每项包含 `label`、`hsv_min`、`hsv_max`、`min_area`、`max_area` 和可选的 `score`。
+
+颜色目标字段的取值约束：
+
+| 字段 | 取值 |
+| --- | --- |
+| `hsv_min`、`hsv_max` | 使用 OpenCV HSV 范围：H 为 `0–179`，S 和 V 为 `0–255` |
+| `max_area` | `0` 表示不设面积上限 |
+| `score` | 范围 `(0, 1]`，默认 `0.99` |
 
 ## 2. 配置手眼标定结果
 
@@ -149,7 +158,10 @@ calibration:
 - `translation`：相机坐标系到机械臂基座坐标系的平移，单位米。
 - `rotation`：相机坐标系到机械臂基座坐标系的旋转，单位弧度。
 
-程序只加载 `camera.type` 对应的标定结果。真机标定通过[手眼标定](hand_eye_calibration.md)生成或更新；MuJoCo 标定必须与场景 XML 中的虚拟相机位姿一致。更换真机相机、机械臂安装位置或固定结构后，必须重新标定对应相机后端。
+程序只加载 `camera.type` 对应的标定结果：
+
+- **真机**：通过[手眼标定](hand_eye_calibration.md)生成或更新。更换相机、机械臂安装位置或固定结构后，必须重新标定对应相机后端。
+- **MuJoCo**：标定必须与场景 XML 中的虚拟相机位姿一致。
 
 ## 3. 配置抓取策略
 
@@ -269,7 +281,12 @@ orientation:
 - `orientation.enabled`：是否根据二维分割掩码估计顶抓夹爪方向。Linksee 真机默认开启；顶抓路径在同一 IK 分支内局部修正 TCP，避免五自由度机械臂为追踪偏置 TCP 而突变到不可达的腕部分支。
 - `orientation.aspect_ratio_threshold`：二维目标长宽比低于该值时不覆盖顶抓腕部方向。
 
-`auto` 使用点云、桌面平面和 `geometry` 参数选择抓取策略。选中顶抓后，pipeline 使用二维分割掩码和对齐深度生成抓取位姿，并读取 `top` 和顶抓方向参数；选中侧抓后读取 `side` 参数。公共夹爪和工作空间参数对两种策略生效。
+`auto` 使用点云、桌面平面和 `geometry` 参数选择抓取策略：
+
+- **顶抓**：使用二维分割掩码和对齐深度生成抓取位姿，并读取 `top` 和顶抓方向参数。
+- **侧抓**：读取 `side` 参数。
+
+公共夹爪和工作空间参数对两种策略生效。
 
 底盘将目标移动到舒适区后，pipeline 会重新检测并重新构建点云。新的抓取候选仍需通过工作空间和 IK 可达性检查。
 
@@ -322,13 +339,20 @@ place:
 - `place_joints`：抓取成功后的放置姿态，关节角单位弧度。Linksee 在底座转向放置侧时受腕部线束耦合影响，第 5 轴使用真机稳定角 `0.330 rad`，不复用观察位的 `0.188 rad`。
 - `release_open`：放置目标时的夹爪张开度，范围为 `[0, 1]`。
 
-文件路径相对所属配置解析。连接只读取状态；运行前机械臂与夹爪须已按现场规程使能。
-抓取执行器要求单通道位置反馈夹爪、负载与夹持判断、可确认停止的保持能力。
-更换驱动不等于更换抓取策略，模型、工作空间和预定义姿态仍须匹配实际安装。
+文件路径相对所属配置解析。运行前检查以下要求：
+
+- 连接只读取状态；机械臂与夹爪须已按现场规程使能。
+- 抓取执行器要求单通道位置反馈夹爪、负载与夹持判断、可确认停止的保持能力。
+- 更换驱动不等于更换抓取策略，模型、工作空间和预定义姿态仍须匹配实际安装。
 
 ### 4.1 配置 MuJoCo 执行器
 
-`manipulator.driver: "mujoco_ur5e"` 选择 UR5e 仿真执行器；`manipulator.mujoco.device_plan` 非空时使用 `manipulation` 共享设备后端。设备配置中的机械臂驱动为 `mujoco_ur5e`，夹爪驱动为 `mujoco_robotiq_2f85`。配套服务配置使用以下字段：
+`manipulator.driver: "mujoco_ur5e"` 选择 UR5e 仿真执行器。`manipulator.mujoco.device_plan` 非空时使用 `manipulation` 共享设备后端，其设备配置分别指定：
+
+- 机械臂驱动：`mujoco_ur5e`。
+- 夹爪驱动：`mujoco_robotiq_2f85`。
+
+配套服务配置使用以下字段：
 
 ```yaml
 manipulator:
@@ -386,14 +410,30 @@ manipulator:
 - `manipulator.mujoco.settle_steps`：动作或夹爪命令后用于稳定物理状态的仿真步数。
 - `manipulator.mujoco.max_motion_steps`：单次机械臂动作允许的最大仿真步数。
 
-共享后端将重力补偿和伺服参数保存在 MJCF 场景中，要求 `gravity_compensation: false`、`arm_stiffness_scale: 1.0`。
-独立兼容后端不设置 `device_plan`，使用 `ur5e_scene.xml`；其配套配置为 `gravity_compensation: true`、`arm_stiffness_scale: 12.0`，不能直接套用到共享后端。
+两种后端的重力补偿和伺服配置不同，不能直接混用：
 
-机械臂进入观察位时会连续采集空夹爪位置和负载，建立本次任务的基线分布。夹爪闭合后会检查持物状态，抬起后再检查一次。pipeline 综合夹爪开度、负载和驱动状态判断是否持物；持续负载与明显高于空夹噪声的部分开度可以共同确认持物，但单独出现空夹硬限位负载时不会判为成功。抬升后的证据仍不确定时，pipeline 保留可能持物状态并执行安全放置恢复，不会按抓空再次接近目标。
+| 后端 | 场景与参数配置 | `gravity_compensation` | `arm_stiffness_scale` |
+| --- | --- | --- | --- |
+| 共享后端 | MJCF 场景 | `false` | `1.0` |
+| 独立兼容后端 | 使用 `ur5e_scene.xml`，不设置 `device_plan` | `true` | `12.0` |
 
-侧抓时，机械臂先协调移动到 `side_ready_joints`，其中第四关节保持更快的前导进度。随后保持夹爪闭合并抬升到目标顶部以上，转动第一关节并移动到高位安全预抓取位。该阶段的末端路径保持在根据目标点云估计的物体顶部安全高度以上。
+夹持状态处理流程：
 
-到达高位安全预抓取位后，夹爪先张开，再下降到目标前方并沿水平接近方向移动 `side.approach_distance_m`，最后闭合夹爪。高位入口、下降和水平进给路径会在机械臂动作前统一完成 IK 与路径安全检查；任一路径无解时不会开始靠近目标。
+1. 机械臂进入观察位时，连续采集空夹爪位置和负载，建立本次任务的基线分布。
+2. 夹爪闭合后，检查持物状态。
+3. 目标抬起后，再检查一次持物状态。
+
+pipeline 综合夹爪开度、负载和驱动状态判断是否持物。持续负载与明显高于空夹噪声的部分开度可以共同确认持物，单独出现空夹硬限位负载时不会判为成功。
+
+抬升后的证据仍不确定时，pipeline 保留可能持物状态并执行安全放置恢复，不会按抓空再次接近目标。
+
+侧抓动作按以下顺序执行：
+
+1. 协调移动到 `side_ready_joints`，其中第四关节保持更快的前导进度。
+2. 保持夹爪闭合并抬升到目标顶部以上，转动第一关节并移动到高位安全预抓取位。该阶段的末端路径保持在根据目标点云估计的物体顶部安全高度以上。
+3. 到达高位安全预抓取位后，先张开夹爪，再下降到目标前方并沿水平接近方向移动 `side.approach_distance_m`，最后闭合夹爪。
+
+高位入口、下降和水平进给路径会在机械臂动作前统一完成 IK 与路径安全检查；任一路径无解时不会开始靠近目标。
 
 ## 5. 配置底盘辅助对齐
 
@@ -570,5 +610,13 @@ remote_mujoco:
 - `remote_mujoco.frame_timeout_ms`：等待远程 RGB-D 帧的超时时间，单位毫秒。
 - `remote_mujoco.action_timeout_ms`：等待远程机械臂动作完成的超时时间，单位毫秒。
 
-以上数值取自 `grasp_pipeline_manipulation_remote.yaml`。直接运行应用时，`--remote-host` 和 `--remote-port` 会同时覆盖相机与机械臂使用的共享端点；共享仿真脚本的 `grasp` 子命令对应使用 `--host` 和 `--port`。
-应用抓取服务的 `9090` 端口不能替换为组件通用设备服务的 `9100` 端口。部署步骤见[MuJoCo 仿真运行](simulation.md)。
+以上数值取自 `grasp_pipeline_manipulation_remote.yaml`。命令行覆盖方式如下：
+
+| 入口 | 主机参数 | 端口参数 |
+| --- | --- | --- |
+| 直接运行应用 | `--remote-host` | `--remote-port` |
+| 共享仿真脚本的 `grasp` 子命令 | `--host` | `--port` |
+
+直接运行应用时，覆盖后的共享端点同时用于相机与机械臂。应用抓取服务的 `9090` 端口不能替换为组件通用设备服务的 `9100` 端口。
+
+部署步骤见[MuJoCo 仿真运行](simulation.md)。
