@@ -1133,6 +1133,9 @@ if(HAVE_REALSENSE_CAMERA)
             ${VISION_LIBRARY}
             spacemit::manipulation_kinematics
         )
+        add_test(NAME debug_grasp_cli_test COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_debug_grasp_cli.py
+            --binary $<TARGET_FILE:debug_grasp>)
         install(TARGETS debug_grasp DESTINATION bin)
     endif()
 else()
