@@ -102,7 +102,7 @@ def _find_simulation_server(build_dir: str = "") -> str:
 
 def check_mujoco_simulation(root: Dict[str, Any], config_path: str,
                             build_dir: str = "") -> bool:
-    """Check the local MuJoCo service and scene paths."""
+    """Check the local simulation service and public device plan."""
     server = _find_simulation_server(build_dir)
     ok = status(
         bool(server),
@@ -111,27 +111,17 @@ def check_mujoco_simulation(root: Dict[str, Any], config_path: str,
     )
 
     config_dir = os.path.dirname(os.path.abspath(config_path))
-    configured_paths = []
-    camera = root.get("camera", {}) if isinstance(root, dict) else {}
-    manipulator = root.get("manipulator", {}) \
-        if isinstance(root, dict) else {}
-    for field, profile in (
-            ("camera.mujoco.xml_path", camera.get("mujoco", {})),
-            ("manipulator.mujoco.xml_path",
-             manipulator.get("mujoco", {}))):
-        value = profile.get("xml_path", "") \
-            if isinstance(profile, dict) else ""
-        resolved = expand_config_path(str(value))
-        if resolved and not os.path.isabs(resolved):
-            resolved = os.path.normpath(os.path.join(config_dir, resolved))
-        configured_paths.append((field, resolved))
-
-    for field, scene_path in configured_paths:
-        ok &= status(
-            bool(scene_path) and os.path.isfile(scene_path),
-            field,
-            scene_path or "not configured",
-        )
+    manipulator = root.get("manipulator", {}) if isinstance(root, dict) else {}
+    profile = manipulator.get("mujoco", {}) if isinstance(manipulator, dict) else {}
+    value = profile.get("device_plan", "") if isinstance(profile, dict) else ""
+    resolved = expand_config_path(str(value))
+    if resolved and not os.path.isabs(resolved):
+        resolved = os.path.normpath(os.path.join(config_dir, resolved))
+    ok &= status(
+        bool(resolved) and os.path.isfile(resolved),
+        "manipulator.mujoco.device_plan",
+        resolved or "not configured",
+    )
     return ok
 
 

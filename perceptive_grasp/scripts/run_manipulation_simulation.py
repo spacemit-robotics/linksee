@@ -48,7 +48,6 @@ def build(args):
         "-DENABLE_WEBRTC_AEC=OFF", "-DENABLE_LAS2_CAMERA=OFF",
         "-DENABLE_REMOTE_MUJOCO=ON",
         f"-DENABLE_MUJOCO_EXECUTOR={'OFF' if args.client_only else 'ON'}",
-        f"-DENABLE_MANIPULATION_MUJOCO={'OFF' if args.client_only else 'ON'}",
     ]
     if not args.client_only:
         command.append(f"-DCMAKE_PREFIX_PATH={prefix}")

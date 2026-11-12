@@ -1,78 +1,93 @@
 # MuJoCo 仿真运行
 
-## manipulation 仿真后端
+本指南使用 `manipulation` 运行 UR5e、Robotiq 2F-85 与 RGB-D 抓取场景，支持 PC 或 K3 本机运行，也支持 PC 服务与 K3 客户端分开部署。
+安装、构建和首次抓取步骤见 [README 的仿真运行](../README.md#7-仿真运行)。
 
-本指南以 `manipulation` 共享仿真为主入口，支持 PC 或 K3 本机服务，以及 PC 服务与 K3 客户端分开部署。
-安装、构建和运行命令见 [README 的仿真运行](../README.md#7-仿真运行)。
+## 1. 文件与职责
 
-物理世界与渲染库位于 SDK 的 `components/control/manipulation/simulation/mujoco/`，由 `manipulation` 仓库维护。
+物理世界、设备控制与渲染由 SDK 的 `components/control/manipulation/` 提供。应用保存抓取场景、感知与规划配置；服务中的机械臂、夹爪、相机和窗口共用同一个物理世界。
 
-下表路径相对 `perceptive_grasp/`；应用的 `simulation/mujoco/` 保存抓取场景与设备映射：
+下表路径相对 `perceptive_grasp/`：
 
 | 文件或目录 | 用途 |
 | --- | --- |
 | `scripts/run_manipulation_simulation.py` | 构建、启动场景、运行抓取 |
-| `config/grasp_pipeline_manipulation_mujoco.yaml` | 本机服务、RGB-D 相机与规划配置 |
-| `config/grasp_pipeline_manipulation_remote.yaml` | 本机或 K3 抓取客户端配置 |
-| `simulation/mujoco/manipulation/device.yaml` | 独立选择机械臂、夹爪驱动及设备限制 |
+| `config/grasp_pipeline_manipulation_mujoco.yaml` | 本机 pipeline、仿真服务、RGB-D 相机与规划配置 |
+| `config/grasp_pipeline_manipulation_remote.yaml` | 本机或远程抓取客户端配置 |
+| `simulation/mujoco/manipulation/device.yaml` | 机械臂、夹爪驱动及设备限制 |
 | `simulation/mujoco/manipulation/mapping.yaml` | 场景、关节和执行器映射 |
 | `simulation/mujoco/manipulation_scene.xml` | 场景、初始姿态及物理参数 |
-| `build_manipulation/prefix/` | 本示例使用的组件安装目录 |
+| `build_manipulation/prefix/` | 示例使用的公共组件安装目录 |
 | `build_manipulation/app/` | 本机服务与抓取客户端 |
-| `build_manipulation/client/` | `build --client-only` 生成的客户端，不依赖本机 MuJoCo 或图形库 |
+| `build_manipulation/client/` | `build --client-only` 生成的客户端 |
 
-`manipulator.mujoco.device_plan` 选择 `manipulation` 后端；空值使用独立 MuJoCo 执行器。
+`manipulator.mujoco.device_plan` 是仿真执行器的必填项，指向公共设备配置。设备配置选择 `mujoco_ur5e` 与 `mujoco_robotiq_2f85`，映射文件中的 `scene` 指定唯一的 MJCF 场景来源。
 
-服务通过 `DeviceSession` 控制机械臂和夹爪，物理步进、相机和窗口共用一个世界。
-逆运动学与路径检查使用状态副本，不移动场景中的物体。
+服务通过 `DeviceSession` 控制机械臂与夹爪，`MujocoRuntime` 维护物理世界。相机与窗口读取世界快照；逆运动学和路径检查使用状态副本，不移动场景中的物体。
 
-配置要求：
+## 2. 构建与运行
 
-- 服务配置不作为独立 pipeline 的配置使用。
-- 场景显式保存起始姿态和伺服参数，不在通用驱动中改写模型。
-- 映射设置 `synchronized_joint_point: true`，使关节点位按同一时间比例推进，保持规划路径的轴间关系。
+在应用目录构建本机服务和客户端：
 
-抓持与放置行为：
+```bash
+python3 scripts/run_manipulation_simulation.py build
+python3 scripts/run_manipulation_simulation.py serve
+```
 
-- 夹爪双指接触目标后才建立抓持约束；空抓不会附着物体。约束释放后物体继续参与物理仿真。
-- 杯体放置时先将杯子扶正，再按实际几何降低释放高度；检查姿态与桌面净空后开夹，退离杯体并返回初始位。
-- 放杯或退离失败会阻止后续动作，须重置场景后重新开始。
+保持服务运行，在同一目录的另一终端执行抓取：
 
-应用服务与组件工具使用不同协议：
+```bash
+python3 scripts/run_manipulation_simulation.py grasp apple
+```
 
-| 服务 | 协议 | 默认回环端口 | 用途 |
-| --- | --- | --- | --- |
-| 应用仿真服务 | `remote_mujoco` 抓取协议 | `9090` | 感知和抓取任务 |
-| `manipulation-simulation` | 通用设备协议 | `9100` | 设备控制与图像读取 |
+目标可选 `apple`、`banana`、`cube` 和 `cup`。前三种使用顶抓，杯子使用侧抓。`serve` 使用服务配置，`grasp` 使用客户端配置；本机抓取也通过回环地址连接服务。
 
-两者不可互换端口或客户端。跨机连接使用 SSH 转发，不向公网开放仿真服务。
+仅构建远程客户端时执行：
 
-应用协议的执行限制：
+```bash
+python3 scripts/run_manipulation_simulation.py build --client-only
+```
 
-- 按顺序处理请求，执行期间不支持并行取消或采帧。
-- 客户端断连不代表动作停止；通用设备服务的租约与断连保持机制不适用于该应用协议。
+该构建不需要客户端安装 MuJoCo 或图形库。PC/K3 跨机部署的 SSH 转发步骤见 [README](../README.md#73-pc-显示k3-远程抓取)。
 
 ### 图形环境
 
 | 平台 | 图形后端 |
 | --- | --- |
 | PC | GLFW/OpenGL |
-| K3 | 原生 X11/gl4es，底层 EGL/GLES 驱动由系统桌面镜像提供 |
+| K3 | 原生 X11/gl4es，底层 EGL/GLES 驱动由系统镜像提供 |
 
-图形上下文在主线程创建，相机与窗口读取物理快照。
+图形上下文在主线程创建。鼠标可旋转、平移和缩放窗口视角。
 
-`--no-viewer` 仅隐藏窗口，RGB-D 渲染仍需要 `DISPLAY`；该后端不提供 EGL 或 OSMesa 无显示渲染。没有桌面会话时，可以只在 K3 构建远程客户端。
+`serve --no-viewer` 只隐藏窗口，模拟 RGB-D 相机仍需要可用的 `DISPLAY`。可使用桌面会话、SSH X11 转发或 Xvfb 虚拟显示；仅远程客户端不需要显示环境。
 
-启动脚本将 Mesa 软件渲染线程数默认设为 `2`，可通过 `LP_NUM_THREADS` 覆盖；不改变硬件渲染方式。
+启动脚本将 Mesa 软件渲染线程数默认设为 `2`，可通过 `LP_NUM_THREADS` 覆盖；该设置不改变硬件渲染方式。
 
-### 检测与场景
+### 服务地址
 
-示例允许依据场景颜色生成目标掩码，未安装 YOLO 模型时仍可完成几何估计和抓取。
-颜色分割仅适用于配套合成场景；模型准确率与真机抓取能力需要分别评估。
+| 服务 | 默认回环端口 | 用途 |
+| --- | --- | --- |
+| 应用仿真服务 | `9090` | 提供 RGB-D 输入，执行规划、抓取与放置任务 |
+| `manipulation-simulation` | `9100` | 通过公共设备协议控制机械臂、末端和读取图像 |
 
-场景参数变化时，应同步检查相机外参、关节映射、抓取尺寸和规划工作区。
+应用服务内部使用 `manipulation`。其 `remote_mujoco` 抓取协议与组件通用设备协议不同，客户端和端口不能互换。跨机部署使用 SSH 转发。
 
-### 共享仿真的语音控制
+应用协议按顺序处理请求，执行期间不支持并行取消或采帧。客户端断连不代表动作停止；应用须等待动作结果并处理失败状态。
+
+## 3. 场景与任务行为
+
+场景的初始姿态、重力补偿和伺服参数由 MJCF 定义。设备映射设置 `synchronized_joint_point: true`，使关节点位按共同时间比例推进，保持规划路径的轴间关系。
+
+示例允许依据场景颜色生成目标掩码，未安装 YOLO 模型时仍可完成几何估计和抓取。颜色分割只适用于配套合成场景；真机使用检测模型输出。
+
+- 夹爪双指接触目标后才建立抓持约束；空抓不会附着物体。约束释放后物体继续参与物理仿真。
+- 杯体放置时先将杯子扶正，再按实际几何降低释放高度；检查姿态与桌面净空后开夹，退离杯体并返回初始位。
+- 放杯或退离失败会阻止后续动作，须重置场景后重新开始。
+- 切换目标保留其余待抓物体和已放置物体的状态；重新启动服务恢复初始场景。
+
+场景参数变化时，同步检查相机外参、关节映射、抓取尺寸和规划工作区。抓持约束是仿真简化，不能据此判断纯摩擦抓持或真实夹爪的抓稳能力。
+
+## 4. 共享仿真的语音控制
 
 先完成 [README 的远程部署](../README.md#73-pc-显示k3-远程抓取)，保持服务与 SSH 转发运行，并按[语音控制](voice_control.md)准备 Python 依赖、模型及音频设备。
 
@@ -94,261 +109,17 @@ source ~/.venv-grasp/bin/activate
   --remote-host 127.0.0.1
 ```
 
-语音模型与音频设备在客户端运行；应用仿真协议的取消、断连边界仍按本页的说明执行。
+语音模型与音频设备在客户端运行。应用支持 `sensevoice` 和 `qwen3_asr`，可通过 `--asr-backend` 选择；语音接入不改变应用协议的执行与断连语义。
 
-## 独立 MuJoCo 后端
+## 5. 检查运行结果
 
-以下第 1–6 节介绍独立 MuJoCo 后端，配置为 `grasp_pipeline_mujoco_ur5e.yaml` 和 `grasp_pipeline_remote_mujoco_ur5e.yaml`。
+一次完整任务包含以下结果：
 
-该后端的物理仿真与渲染仅运行在 x86_64 PC；K3 本机服务使用本页开头的共享仿真入口。第 7 节说明两种后端的任务结果。
+1. `apple`、`banana` 和 `cube` 选择顶抓，`cup` 选择侧抓。
+2. 目标位于绿色取物区，机械臂按通过碰撞检查的路径接近目标。
+3. 双指接触目标后建立抓持，目标随夹爪抬升并移动到红色放置区。
+4. 夹爪张开后释放目标，服务端确认目标落在放置区内。
+5. pipeline 完成接近、抓持、抬升、放置和归位，最终摘要显示 `result=SUCCESS`。
+6. 切换抓取目标后，已完成任务的场景状态保持。
 
-本方案将仿真环境和抓取 pipeline 分为独立进程：
-
-- PC 运行 MuJoCo 物理仿真、RGB-D 渲染和第三视角窗口。
-- 抓取 pipeline 可以运行在同一台 PC，也可以运行在 K3。
-- 两个进程通过 `remote_mujoco` 协议传输彩色图、深度图、相机内参和机械臂命令。
-
-仿真和真机均使用 `perceptive_grasp` 启动器。状态机、目标检测、三维估计、抓取规划和语音状态协议保持一致，配置文件只切换相机与机械臂后端。
-
-## 1. 功能范围
-
-仿真场景提供以下能力：
-
-- 使用 MuJoCo Menagerie 的 UR5e 和 Robotiq 2F-85 MJCF、外观网格及简化碰撞体。
-- 苹果和香蕉使用 stl 外观网格与表面纹理，简化碰撞体只参与物理接触，不参与渲染。
-- 使用固定虚拟 RGB-D 相机输出像素对齐的彩色图像、深度信息和相机内参。相机位姿取自 Linksee 真机手眼标定结果，以斜向下视角覆盖工作区。
-- 复用真机的 YOLOv8-Seg 模型、检测结果格式、目标点云、桌面平面、顶抓和侧抓规划。K3 使用 `vision_service`，PC 使用 OpenCV DNN 加载同一类 ONNX 模型。
-- 低矮目标的有效点云不足时，使用分割掩码深度和估计得到的桌面平面生成顶抓位姿，并继续执行 TCP 桌面净空、IK 和完整路径检查。
-- 使用 MuJoCo 执行关节驱动、接触求解、重力、摩擦和物体运动。
-- 检查机械臂与桌面、机械臂自碰撞以及完整抓取和放置路径。
-- 仅在两个指垫同时接触目标后建立夹持约束；未接触目标时不允许物体随夹爪移动。
-- 抓取后由机械臂将物体搬运到桌面红色区域，释放后检查目标是否位于区域内。
-- 在互不重叠的绿色取物区和红色放置区之间完成搬运。
-
-仿真配置关闭底盘对齐。加宽的绿色取物区位于机械臂前方，红色放置区位于机械臂右侧，两者互不重叠。
-
-`apple`、`banana`、`cube` 和 `cup` 根据旋转后的占用宽度动态排成一行，避免目标在相机视角中相互遮挡。每次重置场景时，程序都会随机调整排列顺序、位置和水平摆放角度。前三个目标执行顶抓，`cup` 执行侧抓。
-
-语音交互运行在抓取 pipeline 所在设备。PC/K3 跨机部署时，麦克风、扬声器、VAD、ASR、AEC 和 TTS 均运行在 K3，PC 仿真服务不处理音频。
-
-检测始终先执行 YOLOv8-Seg，并保留模型输出的类别和置信度。由于合成纹理与 COCO 训练域存在差异，两份仿真配置使用场景中已知的实例颜色细化同名目标的分割掩码；模型未检出场景目标时，同一颜色配置可生成候选掩码。
-
-颜色分割仅用于仿真相机后端。真机配置只接受检测模型输出，模型加载失败会直接阻止运行。
-
-## 2. 准备 PC 环境
-
-PC 需要 x86_64 Linux 和支持 OpenGL 的桌面会话。安装窗口与渲染依赖：
-
-```bash
-sudo apt update
-sudo apt install -y libglfw3-dev libgl1-mesa-dev
-```
-
-UR5e 和 Robotiq 2F-85 使用固定版本的 MuJoCo Menagerie 资源，苹果和香蕉使用固定版本的 `Piper_Mujoco_Sim` 资源。下载清单记录上游 commit 和 SHA-256，启用 MuJoCo 后端时，CMake 会自动下载并校验。也可以在配置前手动准备：
-
-```bash
-python3 scripts/prepare_mujoco_assets.py
-```
-
-离线构建前应先执行该命令。资源下载完成后，可以使用 `python3 scripts/prepare_mujoco_assets.py --check` 校验完整性。各资源的来源和许可见 [`simulation/mujoco/LICENSES.md`](../simulation/mujoco/LICENSES.md)。
-
-项目优先使用 `MUJOCO_DIR`、`/usr/local` 或 `/opt/mujoco` 中的 MuJoCo。未找到时，CMake 会下载固定版本到 `~/.cache/thirdparty/mujoco`。配置成功时应显示：
-
-```text
--- [Executor] mujoco ur5e simulation backend enabled
--- [Camera] mujoco rendered camera backend enabled
-```
-
-## 3. 构建 PC 仿真服务
-
-```bash
-cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
-cmake -S . -B build_mujoco \
-  -DUSE_OPENCV_DNN=ON \
-  -DUSE_MOCK_EXECUTOR=ON \
-  -DENABLE_WEBRTC_AEC=OFF \
-  -DENABLE_LAS2_CAMERA=OFF \
-  -DENABLE_MUJOCO_EXECUTOR=ON \
-  -DENABLE_REMOTE_MUJOCO=ON
-cmake --build build_mujoco -j"$(nproc)"
-```
-
-`USE_MOCK_EXECUTOR` 只作用于 PC 上不使用的 pipeline 核心程序。MuJoCo 服务仍使用 `mujoco_ur5e` 执行器。
-
-构建完成后检查仿真服务、场景资源和 pipeline 程序：
-
-```bash
-python3 scripts/check_runtime_env.py \
-  --config config/grasp_pipeline_mujoco_ur5e.yaml \
-  --build-dir build_mujoco \
-  --skip-voice \
-  --no-fix
-```
-
-最后一行应显示 `[SUMMARY] ready`。
-
-## 4. 启动 PC 仿真服务
-
-```bash
-./build_mujoco/perceptive_grasp \
-  --serve-simulation \
-  --config config/grasp_pipeline_mujoco_ur5e.yaml \
-  --listen 0.0.0.0 \
-  --port 9090 \
-  --viewer
-```
-
-服务启动后输出监听地址，并显示 `perceptive_grasp mujoco simulation` 窗口。主画面为可调第三视角，右上角为虚拟 RGB-D 相机的彩色画面。
-
-- 左键拖动：水平旋转。
-- `shift` + 左键拖动：俯仰旋转。
-- 右键拖动：平移。
-- 中键拖动或滚轮：缩放。
-
-场景状态按以下规则更新：
-
-- 启动服务或显式重置场景时，生成新的单行排列顺序、位置和水平摆放角度。
-- 切换抓取目标时，保留已经放入红色区域的物体和其余待抓物体的当前状态。
-
-服务端通过 `[MujocoSimulation] Pickup layout:` 输出当前布局的物体位置和 `yaw`，用于确认随机化结果。
-
-## 5. 选择 pipeline 部署位置
-
-### 5.1 在 PC 本地运行
-
-保持仿真服务运行，在第二个终端启动抓取 pipeline：
-
-```bash
-./build_mujoco/perceptive_grasp \
-  --config config/grasp_pipeline_remote_mujoco_ur5e.yaml \
-  --target apple \
-  --remote-host 127.0.0.1
-```
-
-PC 本地和 PC/K3 跨机部署使用同一个 `remote_mujoco` 客户端路径。区别仅为 `--remote-host` 的地址和检测器运行平台。
-
-### 5.2 在 K3 运行
-
-在 K3 构建远程客户端和软件 AEC：
-
-```bash
-cd ~/spacemit_robot
-source build/envsetup.sh
-cd application/ros2/linksee/perceptive_grasp
-cmake -S . -B build_remote_mujoco \
-  -DENABLE_REMOTE_MUJOCO=ON \
-  -DENABLE_LAS2_CAMERA=OFF \
-  -DENABLE_WEBRTC_AEC=ON
-cmake --build build_remote_mujoco -j"$(nproc)"
-```
-
-该构建使用 K3 的 `vision_service` 和 SpaceMIT EP 执行 YOLOv8-Seg，相机和机械臂使用远程仿真后端。
-
-确认 PC 仿真服务、构建产物、标定配置和可选语音设备：
-
-```bash
-source ~/.venv-grasp/bin/activate
-python3 scripts/check_runtime_env.py \
-  --config config/grasp_pipeline_remote_mujoco_ur5e.yaml \
-  --build-dir build_remote_mujoco \
-  --no-fix
-```
-
-最后一行显示 `[SUMMARY] ready` 后启动抓取：
-
-```bash
-./build_remote_mujoco/perceptive_grasp \
-  --config config/grasp_pipeline_remote_mujoco_ur5e.yaml \
-  --target apple \
-  --remote-host <pc_ip>
-```
-
-将 `--target` 设置为 `apple`、`banana` 或 `cube` 可验证顶抓。将目标改为 `cup` 可验证侧抓。
-
-在同一个服务进程中依次验证四个物体：
-
-```bash
-for target in apple banana cup cube; do
-  ./build_remote_mujoco/perceptive_grasp \
-    --config config/grasp_pipeline_remote_mujoco_ur5e.yaml \
-    --target "$target" \
-    --remote-host <pc_ip> || break
-done
-```
-
-每次命令只切换当前目标。服务端保留其余待抓物体和已经放入红色区域的物体，直到服务重启或收到显式场景重置命令。
-
-顶层 `remote_mujoco` 配置块同时设置相机和机械臂服务地址。`--remote-host` 和 `--remote-port` 可在启动时指定 PC 地址。
-
-## 6. 在 K3 启用语音控制
-
-将远程仿真配置中的设备编号对应到 K3 的麦克风和扬声器：
-
-```yaml
-voice:
-  echo_cancellation:
-    mode: "webrtc_aec"
-  asr:
-    backend: "qwen3_asr"
-    device: 1
-    device_name: "2K USB Camera"
-    rate: 16000
-    channels: 1
-    channel_index: -1
-    mixer_volume: 40
-  tts:
-    playback_device: 1
-    playback_device_name: "2K USB Camera"
-```
-
-以上配置适用于使用 2K USB Camera 录音和播放的 K3。语音桥优先按设备名称解析当前编号，避免重启或插拔设备后编号变化。
-
-使用其他音频硬件时，应根据环境检查结果更新名称、编号和声道数。只有录音设备已输出硬件回声消除结果时才使用 `hardware_aec`。
-
-仿真语音链路与真机共用 `qwen3_asr` 和 `sensevoice` 后端：
-
-| 配置 | 默认 ASR 后端 |
-| --- | --- |
-| 远程仿真 | `qwen3_asr` |
-| 真机 | `sensevoice` |
-
-两者都可通过 `--asr-backend` 在启动时选择。本机 Qwen 服务由语音桥自动管理，`remote_mujoco` 协议和抓取 pipeline 不需要调整。
-
-启动语音控制：
-
-```bash
-source ~/.venv-grasp/bin/activate
-./build_remote_mujoco/perceptive_grasp \
-  --voice-control \
-  --config config/grasp_pipeline_remote_mujoco_ur5e.yaml \
-  --remote-host <pc_ip>
-```
-
-出现 `[VoiceBridge] Listening` 后，说“抓苹果”“抓香蕉”“抓木块”或“抓杯子”。语音桥在 K3 执行 VAD、ASR、AEC 和 TTS，并通过同一个 pipeline 状态机控制 PC 中的仿真机械臂。
-
-独立 MuJoCo 后端的物理仿真与渲染运行在 x86_64 PC。K3 本机运行使用本页开头的 `manipulation` 后端。
-
-## 7. 检查运行结果
-
-一次完整任务应满足以下条件：
-
-1. `apple`、`banana` 和 `cube` 选择 `top`，`cup` 选择 `side`。
-2. 绿色区域和四个物体完整出现在相机画面中，物体之间没有互相遮挡。
-3. 夹爪到达目标并产生双指接触后，目标才随夹爪移动。
-4. 机械臂抬起目标并移动到桌面红色区域上方。
-5. 夹爪张开后目标受重力落到桌面，服务端输出 `inside_zone_xy=true`。
-6. 连续抓取后，已放置的目标保持在红色区域内，后续目标选择不会重置场景。
-7. pipeline 依次完成 `APPROACHING`、`GRASPING`、`LIFTING`、`PLACING` 和 `HOMING`，最终摘要为 `result=SUCCESS`。
-
-服务端在释放时输出物体相对红色区域中心的偏移、扣除物体尺寸后的可用半宽和 `inside_zone_xy=true`。该结果表示完整物体留有边界余量地落入放置区。
-
-发生机械臂与桌面碰撞、路径碰撞、空抓、目标落在放置区域外或通信超时时，任务返回失败并进入恢复流程。
-
-## 8. 配置文件
-
-- [`grasp_pipeline_manipulation_mujoco.yaml`](../config/grasp_pipeline_manipulation_mujoco.yaml)：PC 或 K3 共享仿真服务的场景、相机和设备配置。
-- [`grasp_pipeline_manipulation_remote.yaml`](../config/grasp_pipeline_manipulation_remote.yaml)：共享仿真的本机或远程客户端配置。
-- [`grasp_pipeline_mujoco_ur5e.yaml`](../config/grasp_pipeline_mujoco_ur5e.yaml)：兼容后端的 PC 服务配置。
-- [`grasp_pipeline_remote_mujoco_ur5e.yaml`](../config/grasp_pipeline_remote_mujoco_ur5e.yaml)：兼容后端的 PC 或 K3 客户端配置。
-
-字段说明见[抓取配置参考](grasp_config.md)。
+发生路径碰撞、空抓、通信超时或放置检查失败时，检查失败日志与恢复结果。字段和约束见[抓取配置参考](grasp_config.md)。

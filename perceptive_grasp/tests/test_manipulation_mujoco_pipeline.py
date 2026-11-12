@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import time
 
+import yaml
+
 
 def receive(stream, count):
     data = bytearray()
@@ -70,6 +72,8 @@ def main():
     parser.add_argument("--target", choices=["apple", "banana", "cup", "cube"], default="apple")
     parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--local", action="store_true")
+    parser.add_argument("--cancel-local", action="store_true")
     args = parser.parse_args()
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
@@ -78,6 +82,60 @@ def main():
         directory = Path(temporary)
         environment = dict(os.environ, MANIPULATION_LOCK_DIRECTORY=str(directory / "locks"))
         environment.setdefault("LP_NUM_THREADS", "2")
+        if args.local:
+            profile = yaml.safe_load((args.source / "config/grasp_pipeline_manipulation_mujoco.yaml").read_text())
+            profile["manipulator"]["mujoco"]["device_plan"] = str(
+                args.source / "simulation/mujoco/manipulation/device.yaml")
+            profile["detection"]["config_path"] = str(args.source / "config/yolov8_seg.yaml")
+            profile["debug"] = {"save_grasp_debug": True, "output_dir": str(directory / "frames")}
+            config = directory / "local.yaml"
+            config.write_text(yaml.safe_dump(profile))
+            command = [args.xvfb, "-a", str(args.client), "--config", str(config),
+                       "--target", args.target, "--status-stdout", "--step"]
+            if args.cancel_local:
+                pid_path = directory / "client.pid"
+                command[2:2] = ["sh", "-c", 'echo "$$" > "$1"; shift; exec "$@"',
+                                "sh", str(pid_path)]
+                log_path = directory / "local.log"
+                with log_path.open("w") as output:
+                    process = subprocess.Popen(command, cwd=directory, env=environment,
+                                               stdin=subprocess.PIPE, stdout=output,
+                                               stderr=subprocess.STDOUT, text=True)
+                    try:
+                        process.stdin.write("y\n" * 24)
+                        process.stdin.close()
+                        deadline = time.monotonic() + 100
+                        while "grasp phase=descend_to_target" not in log_path.read_text():
+                            if process.poll() is not None or time.monotonic() > deadline:
+                                raise RuntimeError("local cancellation never reached the moving grasp stage")
+                            time.sleep(0.02)
+                        os.kill(int(pid_path.read_text()), signal.SIGINT)
+                        process.wait(timeout=80)
+                        output_text = log_path.read_text()
+                        print(output_text)
+                        if process.returncode or "Shutdown" not in output_text:
+                            raise RuntimeError("local cancellation did not finish graceful shutdown")
+                        if "grasp phase=close_gripper" in output_text:
+                            raise RuntimeError("cancelled local grasp closed the gripper")
+                    finally:
+                        if process.poll() is None:
+                            if pid_path.exists():
+                                os.kill(int(pid_path.read_text()), signal.SIGKILL)
+                            process.wait(timeout=10)
+                return
+            process = subprocess.run(command, cwd=directory, env=environment, input="y\n" * 24,
+                                     capture_output=True, text=True, timeout=180)
+            print(process.stdout)
+            print(process.stderr)
+            if process.returncode or "after={" not in process.stdout:
+                raise RuntimeError("local RGB-D pipeline did not complete physical placement")
+            capture = process.stdout.find("_grasp_pose.png")
+            close = process.stdout.find("grasp phase=close_gripper")
+            if capture < 0 or close < capture:
+                raise RuntimeError("local step capture did not precede gripper closure")
+            if not list((directory / "frames").rglob("*grasp_pose*")):
+                raise RuntimeError("local step mode did not save the grasp-pose camera frame")
+            return
         log_path = directory / "server.log"
         with log_path.open("w") as log:
             server = subprocess.Popen([

@@ -60,8 +60,8 @@ class BackendProfilesTest(unittest.TestCase):
 
     def test_simulation_profiles_enable_geometry_filters(self):
         for name in (
-            "grasp_pipeline_mujoco_ur5e.yaml",
-            "grasp_pipeline_remote_mujoco_ur5e.yaml",
+            "grasp_pipeline_manipulation_mujoco.yaml",
+            "grasp_pipeline_manipulation_remote.yaml",
         ):
             config = _load(name)
             top = config["grasp"]["top"]
@@ -71,14 +71,14 @@ class BackendProfilesTest(unittest.TestCase):
             self.assertFalse(config["manipulator"]["legacy_top_ik"], name)
 
     def test_local_mujoco_profile_is_explicit_and_hardware_independent(self):
-        config = _load("grasp_pipeline_mujoco_ur5e.yaml")
+        config = _load("grasp_pipeline_manipulation_mujoco.yaml")
         self.assertEqual(config["camera"]["type"], "mujoco")
         self.assertEqual(config["manipulator"]["driver"], "mujoco_ur5e")
         self.assertFalse(config["mobile_base"]["enabled"])
         self.assertNotIn("uart_device", config["manipulator"])
 
     def test_remote_mujoco_profile_uses_one_shared_endpoint(self):
-        config = _load("grasp_pipeline_remote_mujoco_ur5e.yaml")
+        config = _load("grasp_pipeline_manipulation_remote.yaml")
         self.assertEqual(config["camera"]["type"], "remote_mujoco")
         self.assertEqual(config["manipulator"]["driver"], "remote_mujoco")
         self.assertIn("host", config["remote_mujoco"])
@@ -103,11 +103,10 @@ class BackendProfilesTest(unittest.TestCase):
         self.assertEqual(definition["effector"]["driver"], "mujoco_robotiq_2f85")
         self.assertEqual(definition["arm"]["options"], definition["effector"]["options"])
         self.assertFalse(config["mobile_base"]["enabled"])
-        self.assertEqual(config["camera"]["mujoco"]["xml_path"], settings["xml_path"])
+        self.assertNotIn("xml_path", settings)
+        self.assertNotIn("xml_path", config["camera"]["mujoco"])
         scene = ET.parse(ROOT / "simulation/mujoco/manipulation_scene.xml").getroot()
         self.assertEqual(scene.find("option/flag").get("multiccd"), "enable")
-        legacy = ET.parse(ROOT / "simulation/mujoco/ur5e_scene.xml").getroot()
-        self.assertIsNone(legacy.find("option/flag"))
 
     def test_shared_world_remote_profile_defaults_to_loopback(self):
         config = _load("grasp_pipeline_manipulation_remote.yaml")

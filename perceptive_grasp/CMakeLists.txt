@@ -29,12 +29,6 @@ option(ENABLE_REMOTE_MUJOCO
        "Enable remote MuJoCo client backends for split PC/K3 simulation" OFF)
 option(ENABLE_MUJOCO_EXECUTOR
        "Enable optional MuJoCo UR5e executor backend for PC simulation" OFF)
-option(ENABLE_MANIPULATION_MUJOCO
-       "Execute the simulation example through the manipulation shared-world driver" OFF)
-if(ENABLE_MANIPULATION_MUJOCO AND NOT ENABLE_MUJOCO_EXECUTOR)
-    message(FATAL_ERROR "ENABLE_MANIPULATION_MUJOCO requires ENABLE_MUJOCO_EXECUTOR")
-endif()
-
 # X86_STANDALONE 是主机侧规划与仿真验证构建的快捷选项。
 if(X86_STANDALONE)
     set(USE_OPENCV_DNN ON)
@@ -69,12 +63,6 @@ endif()
 set(HAVE_MUJOCO_EXECUTOR OFF)
 set(HAVE_MUJOCO_CAMERA OFF)
 if(ENABLE_MUJOCO_EXECUTOR)
-    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64" AND
-       NOT (ENABLE_MANIPULATION_MUJOCO AND CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64"))
-        message(FATAL_ERROR
-            "[Executor] MuJoCo executor is PC/x86_64 only; disable "
-            "ENABLE_MUJOCO_EXECUTOR for K3 builds")
-    endif()
     execute_process(
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_CURRENT_SOURCE_DIR}/scripts/prepare_mujoco_assets.py"
@@ -84,19 +72,16 @@ if(ENABLE_MUJOCO_EXECUTOR)
         message(FATAL_ERROR
             "[Simulation] failed to prepare pinned MuJoCo Menagerie assets")
     endif()
+    find_package(manipulation CONFIG REQUIRED)
+    if(NOT TARGET mujoco_sim::render OR NOT TARGET spacemit::manipulation_motion)
+        message(FATAL_ERROR
+            "Build and install manipulation with MANIPULATION_ENABLE_MUJOCO=ON and MANIPULATION_ENABLE_SIMULATION_RENDERER=ON")
+    endif()
+    # Application IK and collision planning use private native snapshots.
     include("${CMAKE_CURRENT_SOURCE_DIR}/../../../../components/control/manipulation/simulation/mujoco/cmake/FindMuJoCo.cmake")
     set(HAVE_MUJOCO_EXECUTOR ON)
-    message(STATUS "[Executor] mujoco ur5e simulation backend enabled")
-    # Preserve the standalone GLFW camera on PC. K3 uses only the shared renderer.
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
-        find_package(glfw3 QUIET)
-        if(glfw3_FOUND)
-            set(HAVE_MUJOCO_CAMERA ON)
-            message(STATUS "[Camera] mujoco rendered camera backend enabled")
-        else()
-            message(STATUS "[Camera] MuJoCo rendered camera backend disabled: glfw3 not found")
-        endif()
-    endif()
+    set(HAVE_MUJOCO_CAMERA ON)
+    message(STATUS "[Simulation] manipulation runtime and RGB-D renderer enabled")
 endif()
 
 set(REALSENSE2_HINTS)
@@ -316,7 +301,7 @@ endif()
 
 if(NOT HAVE_REALSENSE_CAMERA AND NOT HAVE_LAS2_CAMERA AND
    NOT HAVE_MUJOCO_CAMERA AND NOT HAVE_REMOTE_MUJOCO_CAMERA AND
-   NOT X86_STANDALONE AND NOT ENABLE_MANIPULATION_MUJOCO)
+   NOT X86_STANDALONE)
     message(FATAL_ERROR
         "No stereo camera backend found. Install realsense dependencies or "
         "place spacemit_las2 in ~/las2_runtime.")
@@ -390,30 +375,14 @@ else()
     list(APPEND EXTRA_LIBRARIES ${VISION_LIBRARY})
 endif()
 
-# MuJoCo is self-contained and must not inherit real manipulator SDK links.
+# Local simulation uses the public runtime for control, stepping and rendering.
 if(HAVE_MUJOCO_EXECUTOR)
-    list(APPEND SOURCES
-        src/mujoco_grasp_executor.cpp
-        src/mujoco_simulation.cpp
-    )
+    list(APPEND SOURCES src/mujoco_grasp_executor.cpp src/manipulation_mujoco_camera.cpp)
     list(APPEND EXTRA_INCLUDE_DIRS ${MUJOCO_INCLUDE_DIR})
     list(APPEND EXTRA_LIBRARIES ${MUJOCO_LIB})
-    add_definitions(-DHAVE_MUJOCO_EXECUTOR=1)
-    if(HAVE_MUJOCO_CAMERA)
-        list(APPEND SOURCES src/mujoco_stereo_camera.cpp)
-        list(APPEND EXTRA_LIBRARIES glfw)
-        add_definitions(-DHAVE_MUJOCO_CAMERA=1)
-    endif()
-    if(ENABLE_MANIPULATION_MUJOCO)
-        find_package(manipulation CONFIG REQUIRED)
-        if(NOT TARGET mujoco_sim::render)
-            message(FATAL_ERROR
-                "Build and install manipulation with MANIPULATION_ENABLE_SIMULATION_RENDERER=ON")
-        endif()
-        add_definitions(-DHAVE_MANIPULATION_MUJOCO=1)
-        list(APPEND EXTRA_LIBRARIES spacemit::manipulation_motion
-            spacemit::manipulation_drivers mujoco_sim::world)
-    endif()
+    list(APPEND EXTRA_LIBRARIES spacemit::manipulation_motion
+        spacemit::manipulation_drivers mujoco_sim::world mujoco_sim::render)
+    add_definitions(-DHAVE_MUJOCO_EXECUTOR=1 -DHAVE_MUJOCO_CAMERA=1)
 endif()
 
 # ============ 执行器选择 ============
@@ -663,8 +632,8 @@ add_test(NAME config_validation_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_config_validation.py
         --binary $<TARGET_FILE:perceptive_grasp_core>
         --config ${CMAKE_CURRENT_SOURCE_DIR}/config/grasp_pipeline.yaml
-        --config ${CMAKE_CURRENT_SOURCE_DIR}/config/grasp_pipeline_mujoco_ur5e.yaml
-        --config ${CMAKE_CURRENT_SOURCE_DIR}/config/grasp_pipeline_remote_mujoco_ur5e.yaml)
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/config/grasp_pipeline_manipulation_mujoco.yaml
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/config/grasp_pipeline_manipulation_remote.yaml)
 
 add_executable(grasp_geometry_test
     tests/grasp_geometry_test.cpp
@@ -775,70 +744,70 @@ if(ENABLE_REMOTE_MUJOCO OR HAVE_MUJOCO_CAMERA)
 endif()
 
 if(HAVE_MUJOCO_EXECUTOR)
-    add_executable(mujoco_grasp_executor_test
-        tests/mujoco_grasp_executor_test.cpp
+    add_executable(manipulation_mujoco_scene_test
+        tests/manipulation_mujoco_scene_test.cpp
+        src/manipulation_mujoco_camera.cpp
         src/mujoco_grasp_executor.cpp
-        src/mujoco_simulation.cpp
     )
-    target_include_directories(mujoco_grasp_executor_test PRIVATE
+    target_include_directories(manipulation_mujoco_scene_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${MUJOCO_INCLUDE_DIR}
         ${OpenCV_INCLUDE_DIRS}
     )
-    target_link_libraries(mujoco_grasp_executor_test PRIVATE
+    target_link_libraries(manipulation_mujoco_scene_test PRIVATE
         ${MUJOCO_LIB}
         ${OpenCV_LIBS}
         pthread
     )
-    target_compile_definitions(mujoco_grasp_executor_test PRIVATE
+    target_compile_definitions(manipulation_mujoco_scene_test PRIVATE
         HAVE_MUJOCO_EXECUTOR=1
         MOCK_EXECUTOR=1
         PERCEPTIVE_GRASP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(NAME mujoco_grasp_executor_test
-        COMMAND mujoco_grasp_executor_test)
-    if(ENABLE_MANIPULATION_MUJOCO)
-        target_link_libraries(mujoco_grasp_executor_test PRIVATE
-            spacemit::manipulation_motion spacemit::manipulation_drivers mujoco_sim::world yaml-cpp)
-        add_executable(manipulation_mujoco_grasp_test
-            tests/manipulation_mujoco_grasp_test.cpp
-            src/mujoco_grasp_executor.cpp src/mujoco_simulation.cpp)
-        target_include_directories(manipulation_mujoco_grasp_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include ${MUJOCO_INCLUDE_DIR} ${OpenCV_INCLUDE_DIRS})
-        target_link_libraries(manipulation_mujoco_grasp_test PRIVATE
-            spacemit::manipulation_motion spacemit::manipulation_drivers mujoco_sim::world
-            ${MUJOCO_LIB} ${OpenCV_LIBS} pthread yaml-cpp)
-        target_compile_definitions(manipulation_mujoco_grasp_test PRIVATE
-            MOCK_EXECUTOR=1 PERCEPTIVE_GRASP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-        add_test(NAME manipulation_mujoco_grasp_test COMMAND manipulation_mujoco_grasp_test)
-        set_tests_properties(manipulation_mujoco_grasp_test PROPERTIES TIMEOUT 480 RUN_SERIAL TRUE)
-        add_test(NAME manipulation_mujoco_contract_test
-            COMMAND manipulation_mujoco_grasp_test --contract-only)
-        add_test(NAME manipulation_mujoco_release_guard_test
-            COMMAND manipulation_mujoco_grasp_test --release-guard-only)
-        set_tests_properties(manipulation_mujoco_release_guard_test PROPERTIES
-            TIMEOUT 90 RUN_SERIAL TRUE)
-        add_test(NAME manipulation_mujoco_path_guard_test
-            COMMAND manipulation_mujoco_grasp_test --path-guard-only)
-        add_test(NAME manipulation_mujoco_departure_guard_test
-            COMMAND manipulation_mujoco_grasp_test --departure-guard-only)
-        set_tests_properties(manipulation_mujoco_departure_guard_test PROPERTIES
-            TIMEOUT 120 RUN_SERIAL TRUE)
-        add_test(NAME manipulation_mujoco_placement_guard_test
-            COMMAND manipulation_mujoco_grasp_test --placement-guard-only)
-        set_tests_properties(manipulation_mujoco_placement_guard_test PROPERTIES
-            TIMEOUT 120 RUN_SERIAL TRUE)
-        add_test(NAME manipulation_mujoco_cup_opening_guard_test
-            COMMAND manipulation_mujoco_grasp_test --cup-opening-guard-only)
-        set_tests_properties(manipulation_mujoco_cup_opening_guard_test PROPERTIES
-            TIMEOUT 120 RUN_SERIAL TRUE)
+    find_program(XVFB_RUN_EXECUTABLE xvfb-run)
+    if(XVFB_RUN_EXECUTABLE)
+        add_test(NAME manipulation_mujoco_scene_test
+            COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:manipulation_mujoco_scene_test>)
     endif()
+    target_link_libraries(manipulation_mujoco_scene_test PRIVATE
+        spacemit::manipulation_motion spacemit::manipulation_drivers mujoco_sim::world mujoco_sim::render yaml-cpp)
+    add_executable(manipulation_mujoco_grasp_test
+        tests/manipulation_mujoco_grasp_test.cpp
+        src/mujoco_grasp_executor.cpp)
+    target_include_directories(manipulation_mujoco_grasp_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${MUJOCO_INCLUDE_DIR} ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(manipulation_mujoco_grasp_test PRIVATE
+        spacemit::manipulation_motion spacemit::manipulation_drivers mujoco_sim::world
+        ${MUJOCO_LIB} ${OpenCV_LIBS} pthread yaml-cpp)
+    target_compile_definitions(manipulation_mujoco_grasp_test PRIVATE
+        MOCK_EXECUTOR=1 PERCEPTIVE_GRASP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME manipulation_mujoco_grasp_test COMMAND manipulation_mujoco_grasp_test)
+    set_tests_properties(manipulation_mujoco_grasp_test PROPERTIES TIMEOUT 480 RUN_SERIAL TRUE)
+    add_test(NAME manipulation_mujoco_contract_test
+        COMMAND manipulation_mujoco_grasp_test --contract-only)
+    add_test(NAME manipulation_mujoco_release_guard_test
+        COMMAND manipulation_mujoco_grasp_test --release-guard-only)
+    set_tests_properties(manipulation_mujoco_release_guard_test PROPERTIES
+        TIMEOUT 90 RUN_SERIAL TRUE)
+    add_test(NAME manipulation_mujoco_path_guard_test
+        COMMAND manipulation_mujoco_grasp_test --path-guard-only)
+    add_test(NAME manipulation_mujoco_departure_guard_test
+        COMMAND manipulation_mujoco_grasp_test --departure-guard-only)
+    set_tests_properties(manipulation_mujoco_departure_guard_test PROPERTIES
+        TIMEOUT 120 RUN_SERIAL TRUE)
+    add_test(NAME manipulation_mujoco_placement_guard_test
+        COMMAND manipulation_mujoco_grasp_test --placement-guard-only)
+    set_tests_properties(manipulation_mujoco_placement_guard_test PROPERTIES
+        TIMEOUT 120 RUN_SERIAL TRUE)
+    add_test(NAME manipulation_mujoco_cup_opening_guard_test
+        COMMAND manipulation_mujoco_grasp_test --cup-opening-guard-only)
+    set_tests_properties(manipulation_mujoco_cup_opening_guard_test PROPERTIES
+        TIMEOUT 120 RUN_SERIAL TRUE)
 endif()
 
-if(HAVE_MUJOCO_CAMERA OR ENABLE_MANIPULATION_MUJOCO)
+if(HAVE_MUJOCO_CAMERA)
     add_executable(mujoco_grasp_sim_server
         tools/mujoco_grasp_sim_server.cpp
         src/mujoco_grasp_executor.cpp
-        src/mujoco_simulation.cpp
         src/remote_mujoco_protocol.cpp
     )
     target_include_directories(mujoco_grasp_sim_server PRIVATE
@@ -855,17 +824,30 @@ if(HAVE_MUJOCO_CAMERA OR ENABLE_MANIPULATION_MUJOCO)
     target_compile_definitions(mujoco_grasp_sim_server PRIVATE
         HAVE_MUJOCO_EXECUTOR=1
         MOCK_EXECUTOR=1)
-    if(HAVE_MUJOCO_CAMERA)
-        target_sources(mujoco_grasp_sim_server PRIVATE src/mujoco_stereo_camera.cpp)
-        target_link_libraries(mujoco_grasp_sim_server PRIVATE glfw)
-        target_compile_definitions(mujoco_grasp_sim_server PRIVATE HAVE_MUJOCO_CAMERA=1)
-    endif()
-    if(ENABLE_MANIPULATION_MUJOCO)
-        target_sources(mujoco_grasp_sim_server PRIVATE src/manipulation_mujoco_camera.cpp)
+    target_sources(mujoco_grasp_sim_server PRIVATE src/manipulation_mujoco_camera.cpp)
+    target_link_libraries(mujoco_grasp_sim_server PRIVATE mujoco_sim::render)
+    target_compile_definitions(mujoco_grasp_sim_server PRIVATE HAVE_MUJOCO_CAMERA=1)
+    if(HAVE_MUJOCO_EXECUTOR)
         target_link_libraries(mujoco_grasp_sim_server PRIVATE
             spacemit::manipulation_motion spacemit::manipulation_drivers
             mujoco_sim::world mujoco_sim::render)
         find_program(XVFB_RUN_EXECUTABLE xvfb-run)
+        if(XVFB_RUN_EXECUTABLE)
+            add_test(NAME manipulation_mujoco_local_pipeline_test COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_manipulation_mujoco_pipeline.py
+                --server $<TARGET_FILE:mujoco_grasp_sim_server>
+                --client $<TARGET_FILE:perceptive_grasp_core>
+                --source ${CMAKE_CURRENT_SOURCE_DIR} --xvfb ${XVFB_RUN_EXECUTABLE} --local)
+            set_tests_properties(manipulation_mujoco_local_pipeline_test PROPERTIES
+                TIMEOUT 240 RUN_SERIAL TRUE)
+            add_test(NAME manipulation_mujoco_local_cancel_test COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_manipulation_mujoco_pipeline.py
+                --server $<TARGET_FILE:mujoco_grasp_sim_server>
+                --client $<TARGET_FILE:perceptive_grasp_core>
+                --source ${CMAKE_CURRENT_SOURCE_DIR} --xvfb ${XVFB_RUN_EXECUTABLE} --local --cancel-local)
+            set_tests_properties(manipulation_mujoco_local_cancel_test PROPERTIES
+                TIMEOUT 180 RUN_SERIAL TRUE)
+        endif()
         if(XVFB_RUN_EXECUTABLE AND ENABLE_REMOTE_MUJOCO)
             add_test(NAME manipulation_mujoco_pipeline_test COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_manipulation_mujoco_pipeline.py
@@ -975,8 +957,7 @@ if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA OR HAVE_MUJOCO_CAMERA OR
     endif()
     if(HAVE_MUJOCO_CAMERA)
         list(APPEND DEBUG_VIEW_SOURCES
-            src/mujoco_stereo_camera.cpp
-            src/mujoco_simulation.cpp
+            src/manipulation_mujoco_camera.cpp
         )
     endif()
 
@@ -1013,7 +994,16 @@ if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA OR HAVE_MUJOCO_CAMERA OR
     endif()
     if(HAVE_MUJOCO_CAMERA)
         target_include_directories(debug_view PRIVATE ${MUJOCO_INCLUDE_DIR})
-        target_link_libraries(debug_view PRIVATE ${MUJOCO_LIB} glfw)
+        target_link_libraries(debug_view PRIVATE spacemit::manipulation_motion
+            spacemit::manipulation_drivers mujoco_sim::world mujoco_sim::render)
+        if(XVFB_RUN_EXECUTABLE)
+            add_test(NAME manipulation_mujoco_camera_tool_test COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_manipulation_camera_tool.py
+                --binary $<TARGET_FILE:debug_view>
+                --config ${CMAKE_CURRENT_SOURCE_DIR}/config/grasp_pipeline_manipulation_mujoco.yaml
+                --xvfb ${XVFB_RUN_EXECUTABLE})
+            set_tests_properties(manipulation_mujoco_camera_tool_test PROPERTIES TIMEOUT 40)
+        endif()
     endif()
 
     if(USE_OPENCV_DNN)
@@ -1053,8 +1043,7 @@ if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA OR HAVE_MUJOCO_CAMERA OR
     endif()
     if(HAVE_MUJOCO_CAMERA)
         list(APPEND DEBUG_LOCALIZE_SOURCES
-            src/mujoco_stereo_camera.cpp
-            src/mujoco_simulation.cpp
+            src/manipulation_mujoco_camera.cpp
         )
     endif()
 
@@ -1092,7 +1081,8 @@ if(HAVE_REALSENSE_CAMERA OR HAVE_LAS2_CAMERA OR HAVE_MUJOCO_CAMERA OR
     endif()
     if(HAVE_MUJOCO_CAMERA)
         target_include_directories(debug_localize PRIVATE ${MUJOCO_INCLUDE_DIR})
-        target_link_libraries(debug_localize PRIVATE ${MUJOCO_LIB} glfw)
+        target_link_libraries(debug_localize PRIVATE spacemit::manipulation_motion
+            spacemit::manipulation_drivers mujoco_sim::world mujoco_sim::render)
     endif()
 
     if(USE_OPENCV_DNN)

@@ -460,7 +460,7 @@ class GripperSafetySourceTest(unittest.TestCase):
             self.pipeline, "void GraspPipeline::HandleGrasping")
         open_index = grasping.find("OpenGripperForGrasp")
         move_index = grasping.find("MoveToGrasp")
-        close_index = grasping.find("CloseGripperAndCheck")
+        close_index = grasping.find("CloseGripperAndCheck", move_index)
         self.assertGreaterEqual(open_index, 0)
         self.assertLess(open_index, move_index)
         self.assertLess(move_index, close_index)

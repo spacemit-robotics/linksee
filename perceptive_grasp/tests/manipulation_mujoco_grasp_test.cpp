@@ -20,6 +20,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include "grasp_executor.h"
+#include "mujoco_test_config.h"
 #include "manipulation/device_plan.h"
 #include "manipulation/mujoco_runtime.h"
 #include "mujoco_cup_placement.h"
@@ -33,39 +34,8 @@ using perceptive_grasp::ExecutorConfig;
 using perceptive_grasp::GraspResult;
 using perceptive_grasp::MujocoGraspExecutor;
 using perceptive_grasp::Pose3D;
+using perceptive_grasp::test::Configuration;
 
-ExecutorConfig Configuration() {
-    ExecutorConfig config;
-    const std::string root = PERCEPTIVE_GRASP_SOURCE_DIR;
-    config.manip_driver = "mujoco_ur5e";
-    config.mujoco.device_plan = root + "/simulation/mujoco/manipulation/device.yaml";
-    config.mujoco.xml_path = root + "/simulation/mujoco/manipulation_scene.xml";
-    config.mujoco.end_effector_site = "robot_gripper_pinch";
-    config.mujoco.gripper_actuator = "robot_gripper_fingers_actuator";
-    config.mujoco.robot_root_body = "robot_base";
-    config.mujoco.gripper_root_body = "robot_gripper_base_mount";
-    config.mujoco.gravity_compensation = false;
-    config.mujoco.arm_stiffness_scale = 1;
-    config.mujoco.gripper_open_ctrl = 0;
-    config.mujoco.gripper_close_ctrl = 255;
-    config.mujoco.joint_names = {"robot_shoulder_pan_joint", "robot_shoulder_lift_joint",
-            "robot_elbow_joint", "robot_wrist_1_joint", "robot_wrist_2_joint",
-            "robot_wrist_3_joint"};
-    config.mujoco.actuator_names = {"robot_shoulder_pan", "robot_shoulder_lift", "robot_elbow",
-            "robot_wrist_1", "robot_wrist_2", "robot_wrist_3"};
-    config.home_joints = {-1.5708f, -1.5708f, 1.5708f, -1.5708f, -1.5708f, 0};
-    config.observe_joints = config.home_joints;
-    config.side_ready_joints = {0.2f, -0.9f, 1.3f, -1.8f, -1.57f, 0};
-    config.place_joints = {-1.2f, -1.0f, 1.4f, -1.9f, -1.57f, 0};
-    config.move_speed = 0.6f;
-    config.mujoco.ik_iterations = 300;
-    config.mujoco.ik_damping = 0.010f;
-    config.mujoco.ik_step_scale = 0.80f;
-    config.mujoco.ik_position_tolerance_m = 0.006f;
-    config.mujoco.cartesian_tracking_tolerance_m = 0.003f;
-    config.mujoco.settle_steps = 500;
-    return config;
-}
 
 void CheckRejected(const ExecutorConfig& config, const std::string& expected) {
     MujocoGraspExecutor executor(config);
@@ -76,6 +46,9 @@ void CheckRejected(const ExecutorConfig& config, const std::string& expected) {
 }
 
 void CheckContracts() {
+    auto missing = Configuration();
+    missing.mujoco.device_plan.clear();
+    CheckRejected(missing, "device_plan is required");
     auto config = Configuration();
     const auto path = std::filesystem::temp_directory_path() /
         ("grasp-contract-" + std::to_string(std::chrono::steady_clock::now()
@@ -88,7 +61,7 @@ void CheckContracts() {
     auto device = YAML::LoadFile(config.mujoco.device_plan);
     auto mapping = YAML::LoadFile((std::filesystem::path(config.mujoco.device_plan)
         .parent_path() / "mapping.yaml").string());
-    mapping["scene"] = config.mujoco.xml_path;
+    mapping["scene"] = std::string(PERCEPTIVE_GRASP_SOURCE_DIR) + "/simulation/mujoco/manipulation_scene.xml";
     device["device"]["arm"]["options"]["mapping_file"] = (path / "mapping.yaml").string();
     device["device"]["effector"]["options"]["mapping_file"] = (path / "mapping.yaml").string();
     // Custom mappings may use another order; the application's IK still has a fixed order.
@@ -110,7 +83,7 @@ void CheckContracts() {
     device = YAML::LoadFile(config.mujoco.device_plan);
     mapping = YAML::LoadFile((std::filesystem::path(config.mujoco.device_plan)
         .parent_path() / "mapping.yaml").string());
-    mapping["scene"] = config.mujoco.xml_path;
+    mapping["scene"] = std::string(PERCEPTIVE_GRASP_SOURCE_DIR) + "/simulation/mujoco/manipulation_scene.xml";
     device["device"]["arm"]["options"]["mapping_file"] = (path / "mapping.yaml").string();
     device["device"]["effector"]["options"]["mapping_file"] = (path / "mapping.yaml").string();
     std::ofstream(path / "device.yaml") << device;
@@ -137,7 +110,7 @@ void CheckContracts() {
     device = YAML::LoadFile(config.mujoco.device_plan);
     mapping = YAML::LoadFile((std::filesystem::path(config.mujoco.device_plan)
         .parent_path() / "mapping.yaml").string());
-    mapping["scene"] = config.mujoco.xml_path;
+    mapping["scene"] = std::string(PERCEPTIVE_GRASP_SOURCE_DIR) + "/simulation/mujoco/manipulation_scene.xml";
     // A valid split of the scene's final arm actuator into a second tool channel is not a
     // single-gripper application profile, even though the common driver can represent it.
     device["device"]["arm"]["driver"] = "mujoco_mapped_arm";
@@ -167,9 +140,9 @@ void CheckContracts() {
         .parent_path() / "mapping.yaml").string();
     device["device"]["arm"]["options"]["mapping_file"] = original_mapping;
     device["device"]["effector"]["options"]["mapping_file"] = original_mapping;
-    device["device"]["arm"]["driver"] = "mujoco";
+    device["device"]["arm"]["driver"] = "mujoco_mapped_arm";
     config.mujoco.device_plan = (path / "device.yaml").string();
-    for (const auto* effector_driver : {"mujoco", "mujoco_robotiq_2f85"}) {
+    for (const auto* effector_driver : {"mujoco_mapped_effector", "mujoco_robotiq_2f85"}) {
         device["device"]["effector"]["driver"] = effector_driver;
         std::ofstream(path / "device.yaml") << device;
         MujocoGraspExecutor executor(config);
@@ -178,7 +151,14 @@ void CheckContracts() {
                 executor.GetDiagnostics().last_detail);
         }
     }
-    std::cout << "planning/device contracts and driver compatibility passed" << std::endl;
+    device["device"]["arm"]["driver"] = "mujoco";
+    std::ofstream(path / "device.yaml") << device;
+    CheckRejected(config, "unknown arm driver");
+    device["device"]["arm"]["driver"] = "mujoco_ur5e";
+    device["device"]["effector"]["driver"] = "mujoco";
+    std::ofstream(path / "device.yaml") << device;
+    CheckRejected(config, "unknown effector driver");
+    std::cout << "planning/device contracts and named simulation drivers passed" << std::endl;
 }
 
 std::array<float, 3> BodyPosition(MujocoGraspExecutor* executor, const std::string& body) {

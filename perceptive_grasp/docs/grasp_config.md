@@ -3,10 +3,8 @@
 本文说明以下配置的字段、示例值和约束：
 
 - [`grasp_pipeline.yaml`](../config/grasp_pipeline.yaml)：Linksee 真机。
-- [`grasp_pipeline_manipulation_mujoco.yaml`](../config/grasp_pipeline_manipulation_mujoco.yaml)：PC 或 K3 的 `manipulation` 共享仿真服务。
+- [`grasp_pipeline_manipulation_mujoco.yaml`](../config/grasp_pipeline_manipulation_mujoco.yaml)：PC 或 K3 的本机仿真 pipeline 与服务。
 - [`grasp_pipeline_manipulation_remote.yaml`](../config/grasp_pipeline_manipulation_remote.yaml)：共享仿真的本机或远程客户端。
-- [`grasp_pipeline_mujoco_ur5e.yaml`](../config/grasp_pipeline_mujoco_ur5e.yaml)：独立兼容后端的 PC 服务。
-- [`grasp_pipeline_remote_mujoco_ur5e.yaml`](../config/grasp_pipeline_remote_mujoco_ur5e.yaml)：独立兼容后端的 PC 或 K3 客户端。
 
 修改真机配置前，按[硬件部署](hardware_setup.md)确认设备路径和权限。
 
@@ -78,7 +76,6 @@ camera:
 camera:
   type: "mujoco"
   mujoco:
-    xml_path: "../simulation/mujoco/manipulation_scene.xml"
     camera_name: "realsense"
     width: 640
     height: 480
@@ -87,13 +84,11 @@ camera:
       max_m: 3.0
 ```
 
-- `mujoco.xml_path`：MuJoCo 场景 XML 路径，相对主配置文件所在目录解析。
 - `mujoco.camera_name`：场景 XML 中用于 RGB-D 渲染的相机名称。
 - `mujoco.width`、`mujoco.height`：渲染图像尺寸，单位像素。
 - `mujoco.depth.min_m`、`mujoco.depth.max_m`：输出深度图的有效距离范围，单位米。
 
-- **共享后端**：服务端从同一物理世界读取相机；其服务配置不能直接用于独立 pipeline。
-- **兼容后端**：场景为 `../simulation/mujoco/ur5e_scene.xml`。
+相机的场景来源是 `manipulator.mujoco.device_plan` 指向的设备配置及其映射文件中的 `scene`。本机 pipeline 和仿真服务中的相机绑定执行器使用的同一个公共物理世界；单独采集相机时也按该设备配置创建公共物理世界。
 
 `camera.type: "remote_mujoco"` 从远程仿真服务获取相同格式的彩色图、深度图和相机内参。远程服务地址由 [`remote_mujoco`](#7-配置-mujoco-服务与远程连接) 配置块统一设置。
 
@@ -347,18 +342,17 @@ place:
 
 ### 4.1 配置 MuJoCo 执行器
 
-`manipulator.driver: "mujoco_ur5e"` 选择 UR5e 仿真执行器。`manipulator.mujoco.device_plan` 非空时使用 `manipulation` 共享设备后端，其设备配置分别指定：
+`manipulator.driver: "mujoco_ur5e"` 选择 UR5e 仿真执行器。必须设置 `manipulator.mujoco.device_plan`，通过 `manipulation` 控制设备；其设备配置分别指定：
 
 - 机械臂驱动：`mujoco_ur5e`。
 - 夹爪驱动：`mujoco_robotiq_2f85`。
 
-配套服务配置使用以下字段：
+配套本机仿真配置使用以下字段：
 
 ```yaml
 manipulator:
   driver: "mujoco_ur5e"
   mujoco:
-    xml_path: "../simulation/mujoco/manipulation_scene.xml"
     device_plan: "../simulation/mujoco/manipulation/device.yaml"
     end_effector_site: "robot_gripper_pinch"
     gripper_actuator: "robot_gripper_fingers_actuator"
@@ -382,40 +376,32 @@ manipulator:
     gripper_close_ctrl: 255.0
     gravity_compensation: false
     arm_stiffness_scale: 1.0
-    joint_tolerance_rad: 0.04
     ik_position_tolerance_m: 0.006
     cartesian_tracking_tolerance_m: 0.003
     ik_step_scale: 0.80
     ik_damping: 0.010
     ik_iterations: 300
     settle_steps: 500
-    max_motion_steps: 4000
 ```
 
-- `manipulator.mujoco.xml_path`：执行器加载的 MuJoCo 场景 XML 路径。
-- `manipulator.mujoco.device_plan`：相对主配置解析的共享设备配置；要求构建 `ENABLE_MANIPULATION_MUJOCO=ON`。设备关节顺序、执行器名称和夹爪端点须与本配置一致，映射须设置 `synchronized_joint_point: true`。
+- `manipulator.mujoco.device_plan`：仿真执行器必填，相对主配置解析的公共设备配置；要求构建 `ENABLE_MUJOCO_EXECUTOR=ON`。设备关节顺序、执行器名称和夹爪端点须与本配置一致，映射须设置 `synchronized_joint_point: true`。
 - `manipulator.mujoco.end_effector_site`：用于末端位姿和逆运动学的 site 名称。
 - `manipulator.mujoco.gripper_actuator`：夹爪控制器名称。
 - `manipulator.mujoco.robot_root_body`、`manipulator.mujoco.gripper_root_body`：机器人与夹爪碰撞树的根 body 名称。
 - `manipulator.mujoco.joint_names`、`manipulator.mujoco.actuator_names`：机械臂关节与控制器名称列表；两个列表的顺序与 `home_joints`、`observe_joints` 和 `place_joints` 一致。
 - `manipulator.mujoco.gripper_open_ctrl`、`manipulator.mujoco.gripper_close_ctrl`：夹爪完全张开和闭合时发送给 MuJoCo 控制器的控制值。
-- `manipulator.mujoco.gravity_compensation`：是否向机械臂控制器加入重力补偿。
-- `manipulator.mujoco.arm_stiffness_scale`：机械臂位置控制刚度倍率，必须为正数。
-- `manipulator.mujoco.joint_tolerance_rad`：关节动作完成判定容差，单位弧度。
+- `manipulator.mujoco.gravity_compensation`：仅接受 `false`；重力补偿由 MJCF 场景配置。
+- `manipulator.mujoco.arm_stiffness_scale`：仅接受 `1.0`；伺服参数由 MJCF 场景配置。
 - `manipulator.mujoco.ik_position_tolerance_m`：逆运动学位置收敛容差，单位米。
 - `manipulator.mujoco.cartesian_tracking_tolerance_m`：笛卡尔路径跟踪允许误差，单位米。
 - `manipulator.mujoco.ik_step_scale`：每次逆运动学迭代应用的步长比例。
 - `manipulator.mujoco.ik_damping`：阻尼最小二乘逆运动学的阻尼系数。
 - `manipulator.mujoco.ik_iterations`：单个目标位姿允许的最大逆运动学迭代次数。
-- `manipulator.mujoco.settle_steps`：动作或夹爪命令后用于稳定物理状态的仿真步数。
-- `manipulator.mujoco.max_motion_steps`：单次机械臂动作允许的最大仿真步数。
+- `manipulator.mujoco.settle_steps`：夹爪动作和释放物体后的等待步数，按 MJCF 的时间步换算为秒；夹爪动作时长至少为 `0.1` 秒。
 
-两种后端的重力补偿和伺服配置不同，不能直接混用：
+设备映射的 `scene` 指定 MJCF 文件，统一定义初始姿态和物理参数。应用不在加载阶段改写重力补偿或伺服刚度，以上两个字段使用其他值时初始化失败。
 
-| 后端 | 场景与参数配置 | `gravity_compensation` | `arm_stiffness_scale` |
-| --- | --- | --- | --- |
-| 共享后端 | MJCF 场景 | `false` | `1.0` |
-| 独立兼容后端 | 使用 `ur5e_scene.xml`，不设置 `device_plan` | `true` | `12.0` |
+动作到位容差和超时由公共设备配置中的 `device.arm.tolerance_rad`、`device.arm.timeout_s`、`device.effector.tolerance` 与 `device.effector.timeout_s` 设置。
 
 夹持状态处理流程：
 

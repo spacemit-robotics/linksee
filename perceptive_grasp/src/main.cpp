@@ -330,8 +330,6 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
                     "camera.mujoco configuration is required");
             }
             auto& settings = cfg.camera.mujoco;
-            settings.xml_path = mujoco["xml_path"].as<std::string>(
-                settings.xml_path);
             settings.camera_name = mujoco["camera_name"].as<std::string>(
                 settings.camera_name);
             settings.width = mujoco["width"].as<int>(settings.width);
@@ -728,8 +726,6 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
 
         if (auto mj = m["mujoco"]) {
             auto& mujoco = cfg.executor.mujoco;
-            mujoco.xml_path = mj["xml_path"].as<std::string>(
-                mujoco.xml_path);
             mujoco.device_plan = mj["device_plan"].as<std::string>(
                 mujoco.device_plan);
             mujoco.end_effector_site =
@@ -761,9 +757,6 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
                 throw std::runtime_error(
                     "manipulator.mujoco.arm_stiffness_scale must be positive");
             }
-            mujoco.joint_tolerance_rad =
-                mj["joint_tolerance_rad"].as<float>(
-                    mujoco.joint_tolerance_rad);
             mujoco.ik_position_tolerance_m =
                 mj["ik_position_tolerance_m"].as<float>(
                     mujoco.ik_position_tolerance_m);
@@ -778,9 +771,6 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
                 mj["ik_iterations"].as<int>(mujoco.ik_iterations);
             mujoco.settle_steps =
                 mj["settle_steps"].as<int>(mujoco.settle_steps);
-            mujoco.max_motion_steps =
-                mj["max_motion_steps"].as<int>(
-                    mujoco.max_motion_steps);
             if (auto names = mj["joint_names"]) {
                 mujoco.joint_names.clear();
                 for (size_t i = 0; i < names.size(); ++i) {
@@ -1159,6 +1149,20 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         throw std::runtime_error(
             "grasp.gripper_empty_position_margin must be non-negative");
     }
+    if (cfg.executor.manip_driver == "mujoco") {
+        throw std::runtime_error("unsupported manipulator.driver: mujoco; use mujoco_ur5e");
+    }
+    if (cfg.camera.type == "mujoco" && cfg.executor.manip_driver != "mujoco_ur5e") {
+        throw std::runtime_error("local simulation camera requires manipulator.driver=mujoco_ur5e");
+    }
+    if (cfg.executor.manip_driver == "mujoco_ur5e") {
+        if (cfg.executor.mujoco.device_plan.empty()) {
+            throw std::runtime_error("manipulator.mujoco.device_plan is required");
+        }
+        if (cfg.executor.mujoco.gravity_compensation || cfg.executor.mujoco.arm_stiffness_scale != 1.0f) {
+            throw std::runtime_error("simulation physical parameters must be set in the device-plan MJCF scene");
+        }
+    }
     if (cfg.camera.type == "remote_mujoco" &&
         cfg.executor.manip_driver == "remote_mujoco" &&
         (cfg.camera.remote_mujoco.host !=
@@ -1320,19 +1324,12 @@ int main(int argc, char* argv[]) {
     ResolveConfigPath(config_dir, &cfg.debug_output_dir);
     ResolveConfigPath(config_dir, &cfg.camera.spacemit_las2.model_path);
     ResolveConfigPath(config_dir, &cfg.camera.spacemit_las2.calib_path);
-    ResolveConfigPath(config_dir, &cfg.camera.mujoco.xml_path);
-    ResolveConfigPath(config_dir, &cfg.executor.mujoco.xml_path);
     ResolveConfigPath(config_dir, &cfg.executor.mujoco.device_plan);
+    cfg.camera.mujoco.device_plan = cfg.executor.mujoco.device_plan;
 
     if (validate_config_only) {
         std::cout << "[Config] valid" << std::endl;
         return 0;
-    }
-    if (!cfg.executor.mujoco.device_plan.empty()) {
-        std::cerr << "This configuration starts the shared simulation service: use "
-                << "mujoco_grasp_sim_server --config; use the remote profile for perception."
-                << std::endl;
-        return 1;
     }
 
     // 创建并初始化 Pipeline

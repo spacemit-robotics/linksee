@@ -131,14 +131,14 @@ bool SavePipelineStepCameraDebug(
         const std::string stem = "grasp_" + task_id + "_" + phase;
         const fs::path color_path = directory / (stem + ".png");
         const fs::path depth_path = directory / (stem + "_depth.png");
-        cv::imwrite(color_path.string(), color);
+        if (!cv::imwrite(color_path.string(), color)) return false;
 
         cv::Mat depth_8u;
         cv::Mat depth_color;
         depth.convertTo(depth_8u, CV_8UC1, 255.0 / 1000.0);
         cv::applyColorMap(depth_8u, depth_color, cv::COLORMAP_TURBO);
         depth_color.setTo(cv::Scalar(0, 0, 0), depth == 0);
-        cv::imwrite(depth_path.string(), depth_color);
+        if (!cv::imwrite(depth_path.string(), depth_color)) return false;
         std::cout << "[Pipeline] Step camera debug saved: "
             << color_path << ", " << depth_path << std::endl;
         return true;

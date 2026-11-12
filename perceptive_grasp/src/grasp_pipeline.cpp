@@ -19,6 +19,7 @@
 #endif
 #ifdef HAVE_MUJOCO_EXECUTOR
 #include "mujoco_grasp_executor.h"
+#include "manipulation_mujoco_camera.h"
 #endif
 #ifdef HAVE_REMOTE_MUJOCO
 #include "remote_mujoco_grasp_executor.h"
@@ -349,7 +350,29 @@ bool GraspPipeline::Init() {
     std::cout << "[Init] START module=camera" << std::endl;
     const auto camera_start = std::chrono::steady_clock::now();
     const auto camera_cpu_start = ProcessCpuMillis();
-    camera_ = CreateStereoCamera(config_.camera);
+    bool executor_initialized = false;
+    if (config_.camera.type == "mujoco") {
+#ifdef HAVE_MUJOCO_EXECUTOR
+        if (config_.executor.manip_driver != "mujoco_ur5e") {
+            std::cerr << "[Pipeline] local simulation camera requires manipulator.driver=mujoco_ur5e"
+                    << std::endl;
+            log_init_failure("camera");
+            return false;
+        }
+        auto simulation = std::make_unique<MujocoGraspExecutor>(config_.executor);
+        if (!simulation->Init()) {
+            log_init_failure("executor");
+            return false;
+        }
+        camera_ = CreateManipulationMujocoCamera(simulation->SimulationRuntime(), config_.camera);
+        executor_ = std::move(simulation);
+        executor_initialized = true;
+#else
+        camera_ = CreateStereoCamera(config_.camera);
+#endif
+    } else {
+        camera_ = CreateStereoCamera(config_.camera);
+    }
     if (!camera_) {
         std::cerr << "[Pipeline] Failed to create stereo camera backend: "
                     << config_.camera.type << std::endl;
@@ -421,7 +444,9 @@ bool GraspPipeline::Init() {
     std::cout << "[Init] START module=executor" << std::endl;
     const auto executor_start = std::chrono::steady_clock::now();
     const auto executor_cpu_start = ProcessCpuMillis();
-    if (config_.executor.manip_driver == "remote_mujoco") {
+    if (executor_initialized) {
+        // The local simulation camera already shares this initialized executor.
+    } else if (config_.executor.manip_driver == "remote_mujoco") {
 #ifdef HAVE_REMOTE_MUJOCO
         executor_ = std::make_unique<RemoteMujocoGraspExecutor>(
             config_.executor);
@@ -431,8 +456,7 @@ bool GraspPipeline::Init() {
         log_init_failure("executor");
         return false;
 #endif
-    } else if (config_.executor.manip_driver == "mujoco" ||
-        config_.executor.manip_driver == "mujoco_ur5e") {
+    } else if (config_.executor.manip_driver == "mujoco_ur5e") {
 #ifdef HAVE_MUJOCO_EXECUTOR
         executor_ = std::make_unique<MujocoGraspExecutor>(config_.executor);
 #else
@@ -449,7 +473,7 @@ bool GraspPipeline::Init() {
         executor_ = std::make_unique<GraspExecutor>(config_.executor);
 #endif
     }
-    if (!executor_->Init()) {
+    if (!executor_initialized && !executor_->Init()) {
         std::cerr << "[Pipeline] Failed to init executor" << std::endl;
         log_init_failure("executor");
         return false;
@@ -777,6 +801,7 @@ void GraspPipeline::SetCallback(PipelineCallback callback) {
 }
 
 void GraspPipeline::ResetTaskState() {
+    simulation_grasp_close_pending_ = false;
     target_label_.clear();
     retry_count_ = 0;
     stable_count_ = 0;

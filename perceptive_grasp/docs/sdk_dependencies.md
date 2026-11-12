@@ -95,7 +95,7 @@ python3 -m pip install -r requirements.txt
 
 ## 4. 构建 SDK 组件
 
-`mm` 会构建当前组件并将公共头文件和动态库安装到 `~/spacemit_robot/output/staging`。按本节顺序构建，确保机械臂组件能够找到夹爪和运动学依赖。
+`mm` 会构建当前组件并将公共头文件和动态库安装到 `~/spacemit_robot/output/staging`。按本节顺序准备底盘、视觉与统一机械臂组件及其依赖。
 
 ### 4.1 构建底盘控制组件
 
@@ -337,9 +337,8 @@ cmake --build build -j"$(nproc)"
 
 - `ENABLE_WEBRTC_AEC`：启用本地语音桥的软件回声消除，默认开启。
 - `ENABLE_LAS2_CAMERA`：编译 `spacemit_las2` 双目相机后端，默认开启；未找到运行库时构建继续，运行时选择该后端会报错。
-- `ENABLE_REMOTE_MUJOCO`：编译 `remote_mujoco` 客户端后端，连接本机或远程仿真服务。
-- `ENABLE_MUJOCO_EXECUTOR`：编译本机 MuJoCo 执行器；独立兼容后端仅支持 x86_64 PC。
-- `ENABLE_MANIPULATION_MUJOCO`：通过 `manipulation` 共用物理世界、机械臂、夹爪和渲染接口，支持 x86_64 PC 与 riscv64 K3；须同时启用 `ENABLE_MUJOCO_EXECUTOR`。
+- `ENABLE_REMOTE_MUJOCO`：编译应用抓取协议客户端，连接本机或远程仿真服务；客户端不依赖本机 MuJoCo。
+- `ENABLE_MUJOCO_EXECUTOR`：通过 `manipulation` 构建仿真服务，机械臂、夹爪、相机和窗口共用一个物理世界，支持 x86_64 PC 与 riscv64 K3。
 - `USE_OPENCV_DNN`：使用 OpenCV DNN 检测器，主要用于 PC 仿真和未部署 `vision_service` 的独立构建。
 - `USE_MOCK_EXECUTOR`：使用 mock 执行器，不控制真实机械臂。
 
@@ -364,6 +363,6 @@ python3 scripts/run_manipulation_simulation.py build --client-only
 | 本机服务与客户端 | 公共组件：`build_manipulation/prefix/`；应用：`build_manipulation/app/` |
 | 仅客户端 | `build_manipulation/client/` |
 
-仅客户端不需要本机 MuJoCo 或显示器。两种构建均关闭真机执行器、LAS2 和 WebRTC AEC。启用语音时须按[共享仿真的语音控制](simulation.md#共享仿真的语音控制)选择回声处理模式。
+仅客户端不需要本机 MuJoCo 或显示器。两种构建均关闭真机执行器、LAS2 和 WebRTC AEC。启用语音时须按[共享仿真的语音控制](simulation.md#4-共享仿真的语音控制)选择回声处理模式。
 
-安装依赖与运行命令见 [README](../README.md#7-仿真运行)，独立后端的构建和语音步骤见[独立 MuJoCo 后端](simulation.md#独立-mujoco-后端)。
+安装依赖与运行命令见 [README](../README.md#7-仿真运行)，场景、协议和语音配置见[仿真运行](simulation.md)。

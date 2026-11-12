@@ -1,5 +1,4 @@
-# perceptive_grasp pc mujoco service configuration
-# The server provides rgb-d frames and physical ur5e execution.
+# Local pipeline and service share the manipulation UR5e + Robotiq simulation.
 
 mujoco_server:
   listen: "127.0.0.1"
@@ -8,7 +7,6 @@ mujoco_server:
 camera:
   type: "mujoco"
   mujoco:
-    xml_path: "../simulation/mujoco/manipulation_scene.xml"
     camera_name: "realsense"
     width: 640
     height: 480
@@ -115,7 +113,6 @@ manipulator:
   move_speed: 0.6
   line_speed: 0.5
   mujoco:
-    xml_path: "../simulation/mujoco/manipulation_scene.xml"
     device_plan: "../simulation/mujoco/manipulation/device.yaml"
     end_effector_site: "robot_gripper_pinch"
     gripper_actuator: "robot_gripper_fingers_actuator"
@@ -139,14 +136,12 @@ manipulator:
     gripper_close_ctrl: 255.0
     gravity_compensation: false
     arm_stiffness_scale: 1.0
-    joint_tolerance_rad: 0.04
     ik_position_tolerance_m: 0.006
     cartesian_tracking_tolerance_m: 0.003
     ik_step_scale: 0.80
     ik_damping: 0.010
     ik_iterations: 300
     settle_steps: 500
-    max_motion_steps: 4000
 
 place:
   place_joints: [-1.20, -1.00, 1.40, -1.90, -1.57, 0.0]

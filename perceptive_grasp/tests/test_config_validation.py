@@ -35,6 +35,18 @@ def main():
                 f"valid config rejected: {config}\n{result.stdout}{result.stderr}"
             )
 
+    for config in args.config:
+        simulation = yaml.safe_load(Path(config).read_text(encoding="utf-8"))
+        if simulation.get("manipulator", {}).get("driver") != "mujoco_ur5e":
+            continue
+        simulation["manipulator"]["mujoco"].pop("device_plan", None)
+        with tempfile.TemporaryDirectory() as directory:
+            invalid = Path(directory) / "missing_plan.yaml"
+            invalid.write_text(yaml.safe_dump(simulation), encoding="utf-8")
+            result = run(args.binary, invalid)
+        if result.returncode == 0 or "device_plan is required" not in result.stderr:
+            raise RuntimeError("local simulation accepted a missing device plan")
+
     source = Path(args.config[0])
     root = yaml.safe_load(source.read_text(encoding="utf-8"))
     root["manipulator"]["joint_limits"] = [[-1.0, 1.0]]

@@ -27,7 +27,7 @@ class SimulationLauncherTest(unittest.TestCase):
             self.assertIn(f"-DCMAKE_INSTALL_PREFIX={temporary}/prefix", commands[0])
             self.assertIn("-DMANIPULATION_ENABLE_NERO=OFF", commands[0])
             self.assertIn("-DMANIPULATION_ENABLE_SO101=OFF", commands[0])
-            self.assertIn("-DENABLE_MANIPULATION_MUJOCO=ON", commands[3])
+            self.assertIn("-DENABLE_MUJOCO_EXECUTOR=ON", commands[3])
             self.assertIn("-DUSE_MOCK_EXECUTOR=ON", commands[3])
             self.assertNotIn("output/staging", " ".join(sum(commands, [])))
 
@@ -37,7 +37,6 @@ class SimulationLauncherTest(unittest.TestCase):
         commands = [[str(item) for item in call.args[0]] for call in run.call_args_list]
         self.assertEqual(len(commands), 2)
         self.assertIn("-DENABLE_MUJOCO_EXECUTOR=OFF", commands[0])
-        self.assertIn("-DENABLE_MANIPULATION_MUJOCO=OFF", commands[0])
         self.assertIn("-DUSE_MOCK_EXECUTOR=ON", commands[0])
 
     def test_grasp_uses_explicit_loopback_and_simulation_profile(self):

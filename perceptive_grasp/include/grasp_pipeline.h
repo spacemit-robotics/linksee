@@ -216,6 +216,7 @@ private:
     float base_align_travel_m_ = 0.0f;
     int base_align_direction_reversals_ = 0;
     AsyncAction action_;
+    bool simulation_grasp_close_pending_ = false;
     bool failure_recovery_active_ = false;
     bool failure_recovery_succeeded_ = false;
     std::string pending_failure_message_;

@@ -126,29 +126,29 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("unreachable", output.getvalue())
 
-    def test_local_mujoco_checks_server_and_scene_paths(self):
+    def test_local_mujoco_checks_server_and_device_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             build = root / "build"
             config_dir = root / "config"
-            scene = root / "simulation" / "mujoco" / "scene.xml"
+            scene = root / "simulation" / "mujoco" / "device.yaml"
             build.mkdir()
             config_dir.mkdir()
             scene.parent.mkdir(parents=True)
             server = build / "mujoco_grasp_sim_server"
             server.write_text("#!/bin/sh\n", encoding="utf-8")
             server.chmod(0o755)
-            scene.write_text("<mujoco/>\n", encoding="utf-8")
+            scene.write_text("device: {}\n", encoding="utf-8")
             config = config_dir / "pipeline.yaml"
 
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 ok = check_runtime_env.check_mujoco_simulation({
                     "camera": {
-                        "mujoco": {"xml_path": "../simulation/mujoco/scene.xml"},
+                        "mujoco": {"device_plan": "../simulation/mujoco/device.yaml"},
                     },
                     "manipulator": {
-                        "mujoco": {"xml_path": "../simulation/mujoco/scene.xml"},
+                        "mujoco": {"device_plan": "../simulation/mujoco/device.yaml"},
                     },
                 }, str(config), str(build))
 
@@ -162,8 +162,8 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 ok = check_runtime_env.check_mujoco_simulation({
-                    "camera": {"mujoco": {"xml_path": "missing.xml"}},
-                    "manipulator": {"mujoco": {"xml_path": "missing.xml"}},
+                    "camera": {"mujoco": {"device_plan": "missing.yaml"}},
+                    "manipulator": {"mujoco": {"device_plan": "missing.yaml"}},
                 }, str(config), str(Path(tmp) / "build"))
 
         self.assertFalse(ok)

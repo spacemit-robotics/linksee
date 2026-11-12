@@ -14,6 +14,8 @@
 #include <opencv2/imgproc.hpp>
 
 #include "manipulation/mujoco_runtime.h"
+#include "manipulation/device_plan.h"
+#include "manipulation/mujoco_driver.h"
 #include "mujoco_render.h"
 #include "mujoco_world.h"
 #include "stereo_camera.h"
@@ -24,15 +26,33 @@ class ManipulationMujocoCamera final : public StereoCamera {
 public:
     ManipulationMujocoCamera(std::shared_ptr<spacemit::manipulation::MujocoRuntime> runtime,
             const StereoCameraConfig& config)
-        : runtime_(std::move(runtime)) {
+        : runtime_(std::move(runtime)), device_plan_(config.mujoco.device_plan) {
         spec_ = {config.mujoco.camera_name, config.mujoco.width, config.mujoco.height,
                 config.mujoco.min_depth_m, config.mujoco.max_depth_m};
     }
 
     bool Init() override {
-        cv::Mat color;
-        cv::Mat depth;
-        return GetFrames(color, depth);
+        try {
+            if (!runtime_) {
+                if (device_plan_.empty()) throw std::runtime_error("simulation camera requires device_plan");
+                const auto registry = spacemit::manipulation::MakeBuiltinDeviceRegistry();
+                const auto plan = spacemit::manipulation::LoadDevicePlan(device_plan_, registry);
+                if (!spacemit::manipulation::IsMujocoArmDriver(plan.composition.arm_driver) ||
+                    !spacemit::manipulation::IsMujocoEffectorDriver(plan.composition.effector_driver) ||
+                    plan.composition.arm_options != plan.composition.effector_options) {
+                    throw std::runtime_error("simulation camera requires one shared MuJoCo device plan");
+                }
+                runtime_ = std::make_shared<spacemit::manipulation::MujocoRuntime>(
+                    plan.definition, plan.composition.arm_options);
+                runtime_->Start();
+            }
+            cv::Mat color;
+            cv::Mat depth;
+            return GetFrames(color, depth);
+        } catch (const std::exception& error) {
+            std::cerr << "[SimulationCamera] " << error.what() << std::endl;
+            return false;
+        }
     }
 
     bool GetFrames(cv::Mat& color, cv::Mat& depth) override {
@@ -82,6 +102,7 @@ public:
 
 private:
     std::shared_ptr<spacemit::manipulation::MujocoRuntime> runtime_;
+    std::string device_plan_;
     mujoco_sim::Renderer renderer_;
     mujoco_sim::CameraSpec spec_;
     std::array<double, 9> intrinsics_{};

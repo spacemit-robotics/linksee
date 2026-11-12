@@ -156,7 +156,7 @@ source ~/.venv-grasp/bin/activate
   --remote-host 127.0.0.1
 ```
 
-语音设备、VAD、ASR 和 TTS 均运行在 K3。`remote_mujoco` 只传输 RGB-D 数据和机械臂命令，不传输音频。回声处理选项及协议限制见[共享仿真的语音控制](simulation.md#共享仿真的语音控制)；使用兼容后端时见[兼容后端语音步骤](simulation.md#6-在-k3-启用语音控制)。
+语音设备、VAD、ASR 和 TTS 均运行在 K3。`remote_mujoco` 只传输 RGB-D 数据和抓取任务请求，不传输音频；服务通过 `manipulation` 控制仿真机械臂与夹爪。回声处理选项及协议限制见[共享仿真的语音控制](simulation.md#4-共享仿真的语音控制)。
 
 ## 6. 验证命令解析
 

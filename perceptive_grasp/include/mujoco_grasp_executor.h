@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file mujoco_grasp_executor.h
- * @brief MuJoCo-backed grasp executor for PC simulation.
+ * @brief MuJoCo-backed grasp executor for shared simulation.
  */
 
 #ifndef MUJOCO_GRASP_EXECUTOR_H
@@ -16,11 +16,9 @@
 
 #include "grasp_executor.h"
 
-#ifdef HAVE_MANIPULATION_MUJOCO
 namespace spacemit::manipulation {
 class MujocoRuntime;
 }
-#endif
 
 namespace perceptive_grasp {
 
@@ -30,10 +28,8 @@ public:
     ~MujocoGraspExecutor() override;
 
     void SetVisualStepCallback(std::function<void()> callback);
-#ifdef HAVE_MANIPULATION_MUJOCO
-    /** The shared live world; null for the standalone compatibility backend. */
+    /** The shared live world; null before successful initialization. */
     std::shared_ptr<spacemit::manipulation::MujocoRuntime> SimulationRuntime() const;
-#endif
     /** Reset the scene; the shared-world backend restores its configured keyframe. */
     void ResetScene();
     void SetTargetLabel(const std::string& target_label) override;
@@ -82,6 +78,7 @@ private:
 
     void RecordResult(GraspResult result, const std::string& action,
                         const std::string& detail = "");
+    GraspResult RetreatFromOpenGrasp();
     GraspResult MoveToJointsSim(const std::vector<float>& joints,
                                 const char* action,
                                 bool allow_target_contact = false);

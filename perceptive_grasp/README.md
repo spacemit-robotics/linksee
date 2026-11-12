@@ -282,7 +282,7 @@ python3 scripts/run_manipulation_simulation.py grasp apple --client-only
 
 抓持在双指接触后建立约束，是仿真简化，不代表纯摩擦抓持或真机抓稳结果。
 
-兼容后端使用独立配置和构建目录；共享仿真的语音接入、兼容后端操作及故障处理见[仿真运行](docs/simulation.md)。
+仿真服务统一使用 `manipulation` 的设备控制、物理世界与渲染接口。服务地址、场景配置和语音接入见[仿真运行](docs/simulation.md)。
 
 ## 8. 文档导航
 

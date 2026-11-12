@@ -23,7 +23,7 @@
 #endif
 
 #ifdef HAVE_MUJOCO_CAMERA
-#include "mujoco_stereo_camera.h"
+#include "manipulation_mujoco_camera.h"
 #endif
 
 namespace perceptive_grasp {
@@ -73,7 +73,7 @@ public:
         std::cerr << "[StereoCamera] camera.type=mujoco requested, but the "
                 << "MuJoCo camera backend is not available in this build. "
                 << "Configure with -DENABLE_MUJOCO_EXECUTOR=ON and install "
-                << "glfw3." << std::endl;
+                << "the manipulation simulation renderer." << std::endl;
         return false;
     }
 
@@ -128,7 +128,7 @@ std::unique_ptr<StereoCamera> CreateStereoCamera(
 
     if (config.type == "mujoco") {
 #ifdef HAVE_MUJOCO_CAMERA
-        return CreateMujocoStereoCamera(config);
+        return CreateManipulationMujocoCamera(nullptr, config);
 #else
         return std::make_unique<UnsupportedMujocoCamera>();
 #endif

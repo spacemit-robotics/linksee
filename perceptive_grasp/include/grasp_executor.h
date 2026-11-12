@@ -196,8 +196,7 @@ struct ExecutorConfig {
     bool performance_log_enabled = false;
 
     struct MujocoConfig {
-        std::string xml_path;
-        // Optional manipulation device plan. Empty preserves the standalone executor.
+        // Required public plan; its mapping owns the scene and physical parameters.
         std::string device_plan;
         std::string end_effector_site = "pinch";
         std::string gripper_actuator = "fingers_actuator";
@@ -221,16 +220,14 @@ struct ExecutorConfig {
         };
         float gripper_open_ctrl = 0.0f;
         float gripper_close_ctrl = 255.0f;
-        bool gravity_compensation = true;
+        bool gravity_compensation = false;
         float arm_stiffness_scale = 1.0f;
-        float joint_tolerance_rad = 0.015f;
         float ik_position_tolerance_m = 0.006f;
         float cartesian_tracking_tolerance_m = 0.002f;
         float ik_step_scale = 0.65f;
         float ik_damping = 0.035f;
         int ik_iterations = 120;
         int settle_steps = 250;
-        int max_motion_steps = 2500;
     } mujoco;
 
     struct RemoteMujocoConfig {

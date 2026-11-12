@@ -1,5 +1,4 @@
-# perceptive_grasp k3 remote mujoco configuration
-# Start the pc simulation service before running this pipeline.
+# Remote perception and grasp client for the manipulation simulation service.
 
 # Shared endpoint for the remote camera and robot executor.
 remote_mujoco:

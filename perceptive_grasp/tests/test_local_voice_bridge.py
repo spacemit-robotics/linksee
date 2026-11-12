@@ -171,7 +171,7 @@ class LocalVoiceBridgeTest(unittest.TestCase):
 
     def test_remote_config_matches_mono_usb_microphone(self):
         config = yaml.safe_load(
-            (ROOT / "config" / "grasp_pipeline_remote_mujoco_ur5e.yaml").read_text(
+            (ROOT / "config" / "grasp_pipeline_manipulation_remote.yaml").read_text(
                 encoding="utf-8"
             )
         )

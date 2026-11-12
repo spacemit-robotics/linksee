@@ -219,7 +219,7 @@ class CameraBackendSourceTest(unittest.TestCase):
         self.assertIn("HAVE_REMOTE_MUJOCO_CAMERA)", self.cmake)
         self.assertIn("src/stereo_camera.cpp", self.cmake)
         self.assertIn("src/las2_stereo_camera.cpp", self.cmake)
-        self.assertIn("src/mujoco_stereo_camera.cpp", self.cmake)
+        self.assertIn("src/manipulation_mujoco_camera.cpp", self.cmake)
         self.assertIn("src/remote_mujoco_camera.cpp", self.cmake)
         self.assertIn("target_link_libraries(debug_view PRIVATE", self.cmake)
 
