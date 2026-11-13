@@ -127,11 +127,13 @@ ls ~/spacemit_robot/output/staging/lib/libchassis.so
 视觉组件提供 `vision_service` 接口，并通过 SpaceMIT EP 在 X100 AI 核上执行 YOLOv8-Seg 推理。
 
 ```bash
-cd ~/spacemit_robot/components/model_zoo/vision
-mm -- -C "$PWD/cmake/profiles/k3-system-cpp.cmake"
+cd ~/spacemit_robot
+source build/envsetup.sh
+cd components/model_zoo/vision
+mm -- -C "$SROBOTIS_ROOT/application/ros2/linksee/perceptive_grasp/cmake/vision-k3-system-cpp.cmake"
 ```
 
-`k3-system-cpp` 构建 C++ 视觉库和测试工具，使用系统 OpenCV、Eigen 和 OpenBLAS；Python 扩展、wheel 与示例程序不包含在此配置中。OpenBLAS 使用 `openblas-spacemit` 提供的同版本 LP64 头文件，配置阶段会检查头文件与系统运行库是否匹配。
+`vision-k3-system-cpp.cmake` 由 Linksee 提供，使用现有 `vision` 组件源码构建 C++ 视觉库和测试工具。该配置使用系统 OpenCV、Eigen 和 OpenBLAS，不构建 Python 扩展、wheel 或示例程序。OpenBLAS 使用 `openblas-spacemit` 提供的同版本 LP64 头文件；配置阶段检查头文件与系统运行库是否匹配。
 
 该配置会覆盖当前构建缓存中的依赖与功能开关，后续 `mm` 沿用该缓存。切换回全量构建时，使用新的构建目录或清理视觉组件的构建缓存。
 
