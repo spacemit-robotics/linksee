@@ -10,13 +10,22 @@
 
 ![perceptive_grasp 真机抓取链路](docs/assets/grasp-system-flow-v2.svg)
 
-同一套 pipeline 可连接 Linksee 真实硬件或 UR5e / Robotiq 2F-85 仿真场景，两种模式共用感知、规划、任务控制和语音接口。
+同一套 pipeline 支持三种部署方式，共用感知、规划、任务控制和语音接口。
 
-| 运行模式 | 配置 | RGB-D 输入 | 机械臂执行 | 部署方式 |
-|---|---|---|---|---|
-| Linksee 真机 | `config/grasp_pipeline.yaml` | RealSense D435i / `spacemit_las2` | SO101 / Linksee 底盘 | 感知、规划和执行均运行在 Linksee |
-| 本机 MuJoCo | `config/grasp_pipeline_manipulation_mujoco.yaml` | 模拟 RGB-D 相机 | UR5e / Robotiq 2F-85 | PC 或 K3 本机显示场景并执行抓取 |
-| 远程 MuJoCo | `config/grasp_pipeline_manipulation_remote.yaml` | 远程模拟 RGB-D 相机 | 远程 UR5e / Robotiq 2F-85 服务 | PC 显示场景，K3 运行抓取 pipeline |
+| 部署方式 | 设备及执行后端 | 部署位置 |
+| --- | --- | --- |
+| Linksee 真机 | `manipulation` 控制 SO101 与夹爪；`libchassis` 控制底盘 | K3 |
+| MuJoCo 同机部署 | UR5e + Robotiq 2F-85 仿真（`manipulation`） | 仿真服务与 pipeline 在同一台 PC 或 K3 |
+| MuJoCo 跨机部署 | UR5e + Robotiq 2F-85 仿真（`manipulation`） | 服务在 PC，pipeline 在 K3 |
+
+真机使用 `config/grasp_pipeline.yaml`，RGB-D 输入选择 RealSense D435i 或 `spacemit_las2`。
+
+本文的仿真部署采用独立的仿真服务和抓取 pipeline，分别读取以下配置：
+
+- **仿真服务**（`mujoco_grasp_sim_server`）：`config/grasp_pipeline_manipulation_mujoco.yaml`，配置仿真场景、模拟 RGB-D 相机和仿真设备。
+- **抓取 pipeline**（`perceptive_grasp`）：`config/grasp_pipeline_manipulation_remote.yaml`，配置服务连接、感知和任务参数。
+
+同机部署直接连接 `127.0.0.1:9090`；跨机部署通过 SSH 端口转发连接 PC 上的服务，K3 的 pipeline 仍使用该回环地址。
 
 ## 1. 功能范围
 
@@ -243,7 +252,7 @@ source ~/.venv-grasp/bin/activate
 
 示例使用 UR5e、Robotiq 2F-85 和固定式 RGB-D 相机，将绿色区域内的物体搬运到红色区域。
 
-- **部署方式**：PC 或 K3 本机运行，或由 PC 运行场景、K3 远程执行抓取。
+- **部署方式**：仿真服务与 pipeline 在同一台 PC 或 K3 运行；跨机时由 PC 运行仿真服务，K3 运行 pipeline。
 - **设备后端**：使用 `manipulation` 共享仿真，机械臂、夹爪和模拟 RGB-D 相机共用一个物理世界，不连接真实设备。
 
 ### 7.1 安装与构建
@@ -266,11 +275,13 @@ K3 使用 X11/gl4es，PC 使用 GLFW/OpenGL。示例启用仿真颜色分割，�
 
 ### 7.2 本机运行
 
+同机部署在一台 PC 或 K3 上分别启动服务和 pipeline。`serve` 读取服务配置 `config/grasp_pipeline_manipulation_mujoco.yaml`：
+
 ```bash
 python3 scripts/run_manipulation_simulation.py serve
 ```
 
-保持服务运行，在同一目录的另一终端执行：
+保持服务运行，在同一目录的另一终端执行。`grasp` 读取客户端配置 `config/grasp_pipeline_manipulation_remote.yaml`，通过 `127.0.0.1:9090` 连接服务：
 
 ```bash
 python3 scripts/run_manipulation_simulation.py grasp apple
@@ -283,7 +294,7 @@ python3 scripts/run_manipulation_simulation.py grasp apple
 
 ### 7.3 PC 显示、K3 远程抓取
 
-PC 按上述步骤启动服务。在 K3 的 SDK 根目录执行：
+跨机部署沿用同机部署的两份配置。PC 按第 7.2 节启动仿真服务；K3 运行 pipeline，通过 SSH 端口转发连接服务。在 K3 的 SDK 根目录执行：
 
 ```bash
 sudo apt update
@@ -301,7 +312,7 @@ ssh -N -L 9090:127.0.0.1:9090 "$SIM_PC"
 python3 scripts/run_manipulation_simulation.py grasp apple --client-only
 ```
 
-远程客户端不需要本机显示器或 MuJoCo。服务仅监听回环地址，通过 SSH 转发连接。
+K3 客户端不需要本机显示器或 MuJoCo。服务仅监听回环地址；SSH 转发将 K3 的 `127.0.0.1:9090` 接到 PC 的同一端口，客户端配置无需改为 PC 的 IP 地址。
 
 抓持在双指接触后建立约束，是仿真简化，不代表纯摩擦抓持或真机抓稳结果。
 
@@ -314,7 +325,7 @@ python3 scripts/run_manipulation_simulation.py grasp apple --client-only
 - [抓取配置](docs/grasp_config.md)（参考）：说明配置文件字段、默认值、单位和约束。
 - [手眼标定](docs/hand_eye_calibration.md)（操作指南）：生成标定板、采集数据、求解并写回标定结果。
 - [语音控制](docs/voice_control.md)（操作指南）：配置 ASR/TTS 并启动本地语音桥。
-- [仿真运行](docs/simulation.md)（操作指南）：在 PC 或 K3 本机运行共享仿真，或通过远程服务执行抓取。
+- [仿真运行](docs/simulation.md)（操作指南）：将仿真服务与 pipeline 部署在同一台 PC 或 K3，或分别部署在 PC 和 K3。
 - [故障诊断](docs/debugging.md)（操作指南）：定位感知、规划、执行、底盘和性能问题。
 - [pipeline 状态机](docs/pipeline_state_machine.md)（说明）：介绍状态转换、异步动作、输出事件和失败终态。
 - [抓取方案](docs/grasping_approaches.md)（说明）：介绍感知定位、抓取规划、底盘介入条件和方案边界。
