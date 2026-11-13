@@ -105,41 +105,62 @@ python3 scripts/calibrate_hand_eye.py --solve-only --installation-id linksee_sit
 
 标定板生成和质量要求见[手眼标定](docs/hand_eye_calibration.md)。
 
-## 5. 构建与检查
+## 5. 构建、安装与检查
 
-### 5.1 构建 K3 真机程序
+### 5.1 构建并安装 K3 程序
 
-以下命令用于 K3 上的 Linksee 真机抓取：
+先按[方案依赖](docs/sdk_dependencies.md#4-构建-sdk-组件)安装底盘、视觉和 `manipulation` 组件。以下配置包含 VisionService、真实硬件执行器、RealSense 后端以及本机和远程 MuJoCo：
 
 ```bash
 cd ~/spacemit_robot
 source build/envsetup.sh
-cd components/control/manipulation
-mm --with-deps -DMANIPULATION_ENABLE_KINEMATICS_PINOCCHIO=ON
-cd ../../../application/ros2/linksee/perceptive_grasp
-cmake -S . -B build
-cmake --build build -j"$(nproc)"
+cd application/ros2/linksee/perceptive_grasp
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+  -DCMAKE_PREFIX_PATH="$PREFIX" \
+  -DOpenCV_DIR=/usr/lib/riscv64-linux-gnu/cmake/opencv4 \
+  -DX86_STANDALONE=OFF \
+  -DUSE_OPENCV_DNN=OFF \
+  -DUSE_MOCK_EXECUTOR=OFF \
+  -DENABLE_MUJOCO_EXECUTOR=ON \
+  -DENABLE_REMOTE_MUJOCO=ON \
+  -DENABLE_LAS2_CAMERA=OFF \
+  -DENABLE_WEBRTC_AEC=OFF \
+  -DENABLE_ROS2_VOICE=OFF
+cmake --build build -j2
+cmake --install build
 ```
 
-构建目录中的 `perceptive_grasp` 是结构化日志启动器，`perceptive_grasp_core` 是实际运行抓取 pipeline 的 C++ 程序。正常运行应使用启动器。
+程序安装到 `$PREFIX/bin`，配置、URDF、场景和脚本安装到 `$PREFIX/share/perceptive_grasp`。`perceptive_grasp` 是结构化日志启动器，`perceptive_grasp_core` 是运行 pipeline 的 C++ 程序；正常运行使用启动器。`debug_grasp` 提供感知与规划诊断入口。
 
-### 5.2 检查 K3 真机运行环境
+LAS2、WebRTC 软件回声消除和 ROS 2 语音话题桥是可选功能。准备对应依赖后，重新配置相应的 `ENABLE_*` 选项并构建安装。本地语音桥不依赖 ROS 2 语音话题桥；上述构建使用语音时，将配置中的 `voice.echo_cancellation.mode` 设为 `half_duplex`，或使用音频设备提供的 `hardware_aec`。
 
-构建完成后先验证配置。该命令不初始化硬件：
+### 5.2 检查安装与配置
+
+以下命令只显示帮助或检查配置，不初始化相机、机械臂或底盘：
 
 ```bash
-./build/perceptive_grasp \
-  --config config/grasp_pipeline.yaml \
+"$PREFIX/bin/perceptive_grasp" --wrapper-help
+"$PREFIX/bin/perceptive_grasp" \
+  --config "$PREFIX/share/perceptive_grasp/config/grasp_pipeline.yaml" \
   --validate-config
+"$PREFIX/bin/debug_grasp" --help
 ```
 
-输出包含 `[Config] valid` 时，配置结构和字段取值通过检查。继续执行只读运行环境检查：
+输出包含 `[Config] valid` 时，配置结构和字段取值通过检查。该检查不确认模型文件、设备连接或现场标定结果。
+
+后续现场配置和运行示例使用源码目录中的 `config/`。安装程序也可通过 `--config` 使用该目录；修改后的配置需要重新安装，才会更新 `$PREFIX/share/perceptive_grasp/config/`。
+
+### 5.3 检查真机运行环境
+
+完成硬件部署、模型下载和设备配置后，执行只读运行环境检查：
 
 ```bash
 source ~/.venv-grasp/bin/activate
 python3 scripts/check_runtime_env.py \
   --config config/grasp_pipeline.yaml \
-  --build-dir build \
+  --build-dir "$PREFIX/bin" \
   --no-fix
 ```
 
@@ -168,7 +189,7 @@ manipulation hand-enable --plan config/devices/linksee_so101.yaml
 ```bash
 cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
 source ~/spacemit_robot/build/envsetup.sh
-./build/perceptive_grasp \
+"$PREFIX/bin/perceptive_grasp" \
   --config config/grasp_pipeline.yaml \
   --target banana
 ```
@@ -176,7 +197,7 @@ source ~/spacemit_robot/build/envsetup.sh
 连续抓取：
 
 ```bash
-./build/perceptive_grasp \
+"$PREFIX/bin/perceptive_grasp" \
   --config config/grasp_pipeline.yaml \
   --target banana \
   --loop
@@ -191,17 +212,17 @@ source ~/spacemit_robot/build/envsetup.sh
 排查 RGB-D 输入、OpenCL、机械臂、运动学或底盘驱动时增加 `--debug` 来查看更多日志：
 
 ```bash
-./build/perceptive_grasp \
+"$PREFIX/bin/perceptive_grasp" \
   --config config/grasp_pipeline.yaml \
   --target banana \
   --debug
 ```
 
-启动本地语音控制：
+启动本地语音控制前，按[语音控制](docs/voice_control.md)准备模型和音频设备，并选择与构建匹配的回声处理方式：
 
 ```bash
 source ~/.venv-grasp/bin/activate
-./build/perceptive_grasp \
+"$PREFIX/bin/perceptive_grasp" \
   --voice-control \
   --config config/grasp_pipeline.yaml
 ```
@@ -210,7 +231,7 @@ source ~/.venv-grasp/bin/activate
 
 ```bash
 source ~/.venv-grasp/bin/activate
-./build/perceptive_grasp \
+"$PREFIX/bin/perceptive_grasp" \
   --voice-control \
   --asr-backend qwen3_asr \
   --config config/grasp_pipeline.yaml
@@ -240,6 +261,8 @@ python3 scripts/run_manipulation_simulation.py build
 构建自动获取缺失的 MuJoCo 和场景资源，构建产物放在 `build_manipulation/`，不覆盖真机安装。
 
 K3 使用 X11/gl4es，PC 使用 GLFW/OpenGL。示例启用仿真颜色分割，未安装 YOLO 模型时也可运行；此设置不用于真机。
+
+已按第 5 节安装 K3 程序时，可直接使用安装的仿真服务与客户端，无需另建示例目录。启动命令见[安装目录运行](docs/simulation.md#安装目录运行)。该构建使用 VisionService，需按[方案依赖](docs/sdk_dependencies.md#5-准备检测模型)准备 YOLO 模型和标签。
 
 ### 7.2 本机运行
 

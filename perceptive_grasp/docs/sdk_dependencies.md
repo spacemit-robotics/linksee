@@ -50,8 +50,15 @@ sudo apt install -y \
   python3-venv \
   libyaml-cpp-dev \
   libeigen3-dev \
+  libopencv-dev \
+  libopenblas0-pthread \
+  openblas-spacemit \
+  spacemit-onnxruntime \
   libboost-all-dev \
-  liburdfdom-dev
+  liburdfdom-dev \
+  libglfw3-dev \
+  libgl1-mesa-dev \
+  libx11-dev
 ```
 
 ### 2.2 安装 Pinocchio
@@ -121,8 +128,12 @@ ls ~/spacemit_robot/output/staging/lib/libchassis.so
 
 ```bash
 cd ~/spacemit_robot/components/model_zoo/vision
-mm
+mm -- -C "$PWD/cmake/profiles/k3-system-cpp.cmake"
 ```
+
+`k3-system-cpp` 构建 C++ 视觉库和测试工具，使用系统 OpenCV、Eigen 和 OpenBLAS；Python 扩展、wheel 与示例程序不包含在此配置中。OpenBLAS 使用 `openblas-spacemit` 提供的同版本 LP64 头文件，配置阶段会检查头文件与系统运行库是否匹配。
+
+该配置会覆盖当前构建缓存中的依赖与功能开关，后续 `mm` 沿用该缓存。切换回全量构建时，使用新的构建目录或清理视觉组件的构建缓存。
 
 确认产物：
 
@@ -133,11 +144,14 @@ ls ~/spacemit_robot/output/staging/lib/libvision.so
 
 ### 4.3 构建机械臂与夹爪控制组件
 
-`manipulation` 提供设备控制、关节反馈、正逆运动学和公共标定工具。
+`manipulation` 提供设备控制、关节反馈、正逆运动学和公共标定工具。以下配置同时构建 MuJoCo 物理世界、窗口和 RGB-D 渲染，供应用的本机仿真服务使用：
 
 ```bash
 cd ~/spacemit_robot/components/control/manipulation
-mm --with-deps -DMANIPULATION_ENABLE_KINEMATICS_PINOCCHIO=ON
+mm --with-deps \
+  -DMANIPULATION_ENABLE_KINEMATICS_PINOCCHIO=ON \
+  -DMANIPULATION_ENABLE_MUJOCO=ON \
+  -DMANIPULATION_ENABLE_SIMULATION_RENDERER=ON
 ```
 
 确认产物：
@@ -145,7 +159,10 @@ mm --with-deps -DMANIPULATION_ENABLE_KINEMATICS_PINOCCHIO=ON
 ```bash
 manipulation drivers --roles
 manipulation-device --help
+manipulation-simulation --help
 ```
+
+组件安装完成后，按 [README](../README.md#51-构建并安装-k3-程序)构建并安装应用。MuJoCo 窗口与 RGB-D 渲染需要可用的 X11 图形环境；K3 使用系统提供的 EGL/GLES 驱动。
 
 ## 5. 准备检测模型
 
@@ -322,18 +339,11 @@ ls ~/.cache/models/tts/vocoder/vocos-22khz-univ.q.onnx
 ls ~/.cache/models/tts/text_norm/v1/zh
 ```
 
-## 8. 构建应用
+## 8. 构建并安装应用
 
-真实硬件默认构建不启用 MuJoCo 仿真后端：
+完成依赖与模型准备后，按 [README](../README.md#51-构建并安装-k3-程序)构建安装。该配置同时包含真实硬件执行器、VisionService、本机 MuJoCo 服务与远程客户端；程序安装到 `$PREFIX/bin`，配置和资源安装到 `$PREFIX/share/perceptive_grasp`。
 
-```bash
-cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
-source ~/spacemit_robot/build/envsetup.sh
-cmake -S . -B build
-cmake --build build -j"$(nproc)"
-```
-
-常用构建选项如下：
+常用构建选项如下，默认值指未显式传入选项时的 CMake 默认值：
 
 - `ENABLE_WEBRTC_AEC`：启用本地语音桥的软件回声消除，默认开启。
 - `ENABLE_LAS2_CAMERA`：编译 `spacemit_las2` 双目相机后端，默认开启；未找到运行库时构建继续，运行时选择该后端会报错。

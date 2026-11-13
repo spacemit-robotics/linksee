@@ -42,6 +42,8 @@ find_package(yaml-cpp REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME manipulation_simulation_launcher_test COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_manipulation_simulation_launcher.py)
+add_test(NAME perceptive_grasp_launcher_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_quiet_log_runner.py)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(URDFDOM REQUIRED IMPORTED_TARGET urdfdom)
 

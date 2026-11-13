@@ -50,6 +50,30 @@ python3 scripts/run_manipulation_simulation.py build --client-only
 
 该构建不需要客户端安装 MuJoCo 或图形库。PC/K3 跨机部署的 SSH 转发步骤见 [README](../README.md#73-pc-显示k3-远程抓取)。
 
+### 安装目录运行
+
+按 [README](../README.md#51-构建并安装-k3-程序)安装的 K3 程序同时包含仿真服务和客户端。配置及完整场景位于 `$PREFIX/share/perceptive_grasp`，可从任意工作目录启动。
+
+在有 X11 图形环境的终端启动服务：
+
+```bash
+source ~/spacemit_robot/build/envsetup.sh
+"$PREFIX/bin/mujoco_grasp_sim_server" \
+  --config "$PREFIX/share/perceptive_grasp/config/grasp_pipeline_manipulation_mujoco.yaml" \
+  --viewer
+```
+
+保持服务运行，在另一终端执行：
+
+```bash
+source ~/spacemit_robot/build/envsetup.sh
+"$PREFIX/bin/perceptive_grasp" \
+  --config "$PREFIX/share/perceptive_grasp/config/grasp_pipeline_manipulation_remote.yaml" \
+  --target apple
+```
+
+此构建使用 VisionService，需准备[检测模型与标签](sdk_dependencies.md#5-准备检测模型)。前述源码示例脚本使用 OpenCV DNN 构建，可在未安装 YOLO 模型时使用场景颜色分割。
+
 ### 图形环境
 
 | 平台 | 图形后端 |
@@ -78,7 +102,7 @@ python3 scripts/run_manipulation_simulation.py build --client-only
 
 场景的初始姿态、重力补偿和伺服参数由 MJCF 定义。设备映射设置 `synchronized_joint_point: true`，使关节点位按共同时间比例推进，保持规划路径的轴间关系。
 
-示例允许依据场景颜色生成目标掩码，未安装 YOLO 模型时仍可完成几何估计和抓取。颜色分割只适用于配套合成场景；真机使用检测模型输出。
+源码示例的 OpenCV DNN 构建允许依据场景颜色生成目标掩码，未安装 YOLO 模型时仍可完成几何估计和抓取。颜色分割只适用于配套合成场景；VisionService 构建和真机运行需要检测模型。
 
 - 夹爪双指接触目标后才建立抓持约束；空抓不会附着物体。约束释放后物体继续参与物理仿真。
 - 杯体放置时先将杯子扶正，再按实际几何降低释放高度；检查姿态与桌面净空后开夹，退离杯体并返回初始位。

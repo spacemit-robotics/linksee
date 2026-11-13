@@ -9,8 +9,10 @@
 开始前完成以下准备工作：
 
 - 按[方案依赖](sdk_dependencies.md#7-准备语音模型可选)准备 VAD、ASR、TTS 和文本规范化资源。
-- 完成 `perceptive_grasp` 构建，并确认 `build/perceptive_grasp` 存在。
+- 按 [README](../README.md#51-构建并安装-k3-程序)构建安装，并确认 `$PREFIX/bin/perceptive_grasp` 存在。
 - 连接麦克风和扬声器。
+
+按 README 的 K3 配置安装时，`ENABLE_WEBRTC_AEC=OFF`。使用本地语音桥前，将 `voice.echo_cancellation.mode` 设为 `half_duplex`，或在音频设备提供回声消除时选择 `hardware_aec`。使用本节的 `webrtc_aec` 配置需先启用 `ENABLE_WEBRTC_AEC=ON` 并重新构建安装。
 
 加载运行环境并检查语音模块：
 
@@ -101,7 +103,7 @@ voice:
 使用进程内运行的 sensevoice 时，可通过命令行选择后端：
 
 ```bash
-./build/perceptive_grasp \
+"$PREFIX/bin/perceptive_grasp" \
   --voice-control \
   --asr-backend sensevoice \
   --config config/grasp_pipeline.yaml
@@ -126,7 +128,7 @@ voice:
 cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
 source ~/spacemit_robot/build/envsetup.sh
 source ~/.venv-grasp/bin/activate
-./build/perceptive_grasp \
+"$PREFIX/bin/perceptive_grasp" \
   --voice-control \
   --config config/grasp_pipeline.yaml
 ```
@@ -165,7 +167,7 @@ source ~/.venv-grasp/bin/activate
 ```bash
 cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
 source ~/spacemit_robot/build/envsetup.sh
-./build/perceptive_grasp \
+"$PREFIX/bin/perceptive_grasp" \
   --config config/grasp_pipeline.yaml \
   --voice-stdin \
   --status-stdout
