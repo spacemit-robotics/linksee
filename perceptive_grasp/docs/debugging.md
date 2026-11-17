@@ -176,7 +176,7 @@ python3 scripts/check_runtime_env.py \
 ./build/debug_ik --config config/grasp_pipeline.yaml --check-model
 ```
 
-`unknown kinematics backend: pinocchio` 表示公共组件未包含求解器，重新构建 `manipulation` 时开启 `MANIPULATION_ENABLE_KINEMATICS_PINOCCHIO`，再重新构建应用。
+`unknown kinematics backend: <name>` 表示 `manipulation` 未注册配置中 `kinematics_solver` 指定的后端。默认的 `eigen` 后端随组件默认构建；若改用 `pinocchio`，需重新构建组件时开启 `MANIPULATION_ENABLE_KINEMATICS_PINOCCHIO`，再重新构建应用。
 `joint reference is uncalibrated` 表示设备没有匹配的舵机校准文件；不能通过跳过标定采集检查解决。
 
 ## 5. 排查机械臂执行

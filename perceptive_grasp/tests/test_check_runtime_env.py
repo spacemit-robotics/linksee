@@ -752,11 +752,11 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         check_provider.assert_called_once_with(config, "cfg.yaml")
         check_realsense.assert_not_called()
 
-    def test_kinematics_check_reports_missing_pinocchio_backend(self):
+    def test_kinematics_check_reports_missing_backend(self):
         with mock.patch.object(check_runtime_env.os.path, "isfile", return_value=True), \
                 mock.patch.object(check_runtime_env.os, "access", return_value=True), \
                 mock.patch.object(check_runtime_env.subprocess, "run", return_value=SimpleNamespace(
-                    returncode=1, stdout="", stderr="unknown kinematics backend: pinocchio")) as run:
+                    returncode=1, stdout="", stderr="unknown kinematics backend: eigen")) as run:
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 ok = check_runtime_env.check_kinematics_backend("/tmp/sdk", "cfg.yaml", "/tmp/app")

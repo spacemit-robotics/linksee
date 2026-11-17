@@ -294,7 +294,7 @@ manipulator:
   calibration_resources:
     - "devices/so101_calibration.json"
     - "devices/so101_gripper_calibration.json"
-  kinematics_solver: "pinocchio"
+  kinematics_solver: "eigen"
   urdf_path: "../urdf/so101.urdf"
   tip_link: "gripper_frame_link"
   legacy_top_ik: true
@@ -320,7 +320,7 @@ place:
 - `device_plan`：公共设备配置，定义机械臂与末端驱动、连接、反馈和限位；`steps` 必须为空。真机串口在该文件的 `options.port` 中设置。
 - `model`：公共模型描述，包含 URDF、基座、末端及关节顺序。关节顺序须与设备配置完全一致。
 - `calibration_resources`：本台设备的校准文件列表；标定采集用其内容摘要防止混用不同关节参考。
-- `kinematics_solver`：注册的求解器名称，默认 `pinocchio`。
+- `kinematics_solver`：注册的求解器名称，默认 `eigen`（内置，无需额外安装）；需要时可改为 `pinocchio`，但须在构建组件时开启对应开关。
 - `urdf_path`：机械臂 urdf 文件路径，相对主配置文件所在目录解析。
 - `tip_link`：逆运动学、路径安全检查和到位验证使用的 TCP 坐标系。Linksee 真机配置使用 `gripper_frame_link`；仿真执行器使用各自模型中的末端站点。
 - `legacy_top_ik`：选择 SO101 固定夹爪朝向的顶抓 IK 路径。Linksee 真机配置为 `true`；仿真配置为 `false`，由对应仿真执行器规划路径。

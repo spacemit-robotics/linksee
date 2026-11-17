@@ -126,7 +126,7 @@ struct ExecutorConfig {
     std::string manip_driver = "so101";
     std::string device_plan;
     std::string model;
-    std::string kinematics_solver = "pinocchio";
+    std::string kinematics_solver = "eigen";
     // 运动学
     std::string urdf_path = "../urdf/so101.urdf";
     std::string base_link = "base_link";

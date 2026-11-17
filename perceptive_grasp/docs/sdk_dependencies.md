@@ -61,32 +61,24 @@ sudo apt install -y \
   libx11-dev
 ```
 
-### 2.2 安装 Pinocchio
+### 2.2 运动学后端（无需额外安装）
 
-Linksee 机械臂使用 Pinocchio 完成正运动学和逆运动学计算。
-
-```bash
-cd ~
-git clone --recursive \
-  -b v3.9.0 \
-  https://github.com/stack-of-tasks/pinocchio.git
-
-cmake -S ~/pinocchio -B ~/pinocchio/build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX=/usr/local \
-  -DBUILD_PYTHON_INTERFACE=OFF \
-  -DBUILD_TESTING=OFF \
-  -DBUILD_WITH_COLLISION_SUPPORT=OFF
-cmake --build ~/pinocchio/build -j"$(nproc)"
-sudo cmake --install ~/pinocchio/build
-sudo ldconfig
-```
-
-确认 CMake 能找到 Pinocchio：
+`manipulation` 组件内置 `eigen` 运动学后端（`MANIPULATION_ENABLE_KINEMATICS_EIGEN` 默认开启），只依赖常见的 Eigen3 头文件，不需要单独下载和编译任何运动学库。构建组件时确认 `libeigen3-dev` 已安装即可：
 
 ```bash
-find /usr/local -path '*pinocchio*Config.cmake' -print
+sudo apt install -y libeigen3-dev
 ```
+
+应用配置中的 `kinematics_solver` 默认为 `eigen`，与旧的 `pinocchio` 后端在相同 URDF 和关节序列下结果一致。
+
+如确实需要切换到 Pinocchio 后端，可单独开启该开关；不开启不影响正常使用：
+
+```bash
+cd ~/spacemit_robot/components/control/manipulation
+mm -DMANIPULATION_ENABLE_KINEMATICS_PINOCCHIO=ON
+```
+
+开启后需自行编译安装 Pinocchio v3.9.0，并把配置改为 `kinematics_solver: "pinocchio"`。
 
 ## 3. 安装 Python 依赖
 
@@ -146,12 +138,11 @@ ls ~/spacemit_robot/output/staging/lib/libvision.so
 
 ### 4.3 构建机械臂与夹爪控制组件
 
-`manipulation` 提供设备控制、关节反馈、正逆运动学和公共标定工具。以下配置同时构建 MuJoCo 物理世界、窗口和 RGB-D 渲染，供应用的本机仿真服务使用：
+`manipulation` 提供设备控制、关节反馈、正逆运动学和公共标定工具。内置 `eigen` 运动学后端默认开启，无需额外参数。以下配置同时构建 MuJoCo 物理世界、窗口和 RGB-D 渲染，供应用的本机仿真服务使用：
 
 ```bash
 cd ~/spacemit_robot/components/control/manipulation
 mm --with-deps \
-  -DMANIPULATION_ENABLE_KINEMATICS_PINOCCHIO=ON \
   -DMANIPULATION_ENABLE_MUJOCO=ON \
   -DMANIPULATION_ENABLE_SIMULATION_RENDERER=ON
 ```

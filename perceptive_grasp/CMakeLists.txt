@@ -400,7 +400,8 @@ else()
     message(STATUS "[Executor] REAL (manipulation)")
     find_package(manipulation CONFIG REQUIRED)
     if(NOT TARGET spacemit::manipulation_kinematics)
-        message(FATAL_ERROR "Build manipulation with MANIPULATION_ENABLE_KINEMATICS_PINOCCHIO=ON")
+        message(FATAL_ERROR "Build manipulation with a kinematics backend enabled "
+            "(MANIPULATION_ENABLE_KINEMATICS_EIGEN=ON, the default)")
     endif()
 
     list(APPEND SOURCES

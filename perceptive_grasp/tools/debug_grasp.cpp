@@ -98,7 +98,7 @@ struct DebugGraspAppConfig {
 
 struct IKConfig {
     std::string model;
-    std::string solver = "pinocchio";
+    std::string solver = "eigen";
     std::string urdf_path;
     std::string base_link = "base_link";
     std::string tip_link = "gripper_frame_link";

@@ -107,7 +107,7 @@ manipulator:
   calibration_resources:
     - "devices/so101_calibration.json"
     - "devices/so101_gripper_calibration.json"
-  kinematics_solver: "pinocchio"
+  kinematics_solver: "eigen"
   urdf_path: "../urdf/so101.urdf"
   tip_link: "gripper_frame_link"
   legacy_top_ik: true

@@ -103,7 +103,7 @@ void CheckReference(ExecutorKinematics& solver, const Reference& reference) {
 }  // namespace
 
 int main() {
-    ExecutorKinematics solver(PERCEPTIVE_GRASP_TEST_MODEL, "pinocchio");
+    ExecutorKinematics solver(PERCEPTIVE_GRASP_TEST_MODEL, "eigen");
     assert(solver.Count() == 5);  // The moving jaw is outside the selected TCP chain.
     for (const auto& reference : kReferences) CheckReference(solver, reference);
 
@@ -123,7 +123,7 @@ int main() {
     zero.q[0] = std::numeric_limits<double>::quiet_NaN();
     assert(solver.Forward(zero, &target) != 0);
     bool rejected = false;
-    try { ExecutorKinematics invalid(PERCEPTIVE_GRASP_TEST_MODEL, "pinocchio", {"wrong_joint"}); }
+    try { ExecutorKinematics invalid(PERCEPTIVE_GRASP_TEST_MODEL, "eigen", {"wrong_joint"}); }
     catch (const std::exception&) { rejected = true; }
     assert(rejected);
     std::cout << "executor kinematics migration passed\n";
