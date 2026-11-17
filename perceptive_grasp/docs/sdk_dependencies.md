@@ -92,9 +92,19 @@ python3 -m pip install --upgrade pip
 python3 -m pip install -r requirements.txt
 ```
 
+该虚拟环境只用于运行应用侧的 Python 脚本。**编译 SDK 组件前必须先退出**，否则下一节的依赖检查会误判：
+
+```bash
+deactivate
+```
+
+`mm --with-deps` 通过 `python3 -c 'import can'` 这类命令检查系统包。激活虚拟环境后 `python3` 指向 venv 中的解释器，而 venv 默认不继承系统 site-packages，`apt` 安装的 `python3-can`、`python3-typing-extensions` 在其中不可见，检查会持续报 `still missing after installation`，即使 `apt` 已经装好。
+
 ## 4. 构建 SDK 组件
 
 `mm` 会构建当前组件并将公共头文件和动态库安装到 `~/spacemit_robot/output/staging`。按本节顺序准备底盘、视觉与统一机械臂组件及其依赖。
+
+编译 C++ 组件不需要 Python 虚拟环境。进入本节前确认当前终端已 `deactivate`；新开终端不会自动激活 venv，无需处理。
 
 ### 4.1 构建底盘控制组件
 
