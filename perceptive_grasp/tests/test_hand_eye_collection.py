@@ -214,6 +214,42 @@ class CollectionContracts(unittest.TestCase):
         self.assertFalse(accepted)
         self.assertTrue(any("reprojection error" in text for text in quality["reject_reasons"]))
 
+    def test_a_partially_seen_board_is_flagged_but_still_accepted(self):
+        """Fewer corners still solve a pose, so warn: the residual it adds is the issue.
+
+        Measured on one 15-pose set, 7-8 corner samples averaged 7 mm against 4 mm for a
+        fully seen board, which alone decides whether the default gate passes.
+        """
+        args = SimpleNamespace(
+            min_marker_size_px=40.0,
+            min_distance=0.10,
+            max_distance=0.60,
+            max_reproj_error=2.0,
+            min_relative_rotation_deg=0.0,
+            min_poses=1,
+            min_charuco_corners=9,
+            no_quality_gate=False,
+        )
+        base = {
+            "marker_size_px": 16.3,
+            "reprojection_error_px": 0.08,
+            "distance_m": 0.507,
+            "detected_frames": 3,
+            "num_frames": 3,
+        }
+        partial, quality = calibration.check_capture_quality(
+            np.eye(4), np.eye(4), dict(base, max_charuco_corners=8), [], args
+        )
+        self.assertTrue(partial)
+        self.assertEqual(quality["reject_reasons"], [])
+        self.assertTrue(any("charuco corners 8" in text for text in quality["warnings"]))
+
+        full, quality = calibration.check_capture_quality(
+            np.eye(4), np.eye(4), dict(base, max_charuco_corners=12), [], args
+        )
+        self.assertTrue(full)
+        self.assertFalse(any("charuco corners" in text for text in quality["warnings"]))
+
     def test_paths_are_relative_to_owner_and_joint_order_is_exact(self):
         plan, model, fk, _, _, files, _ = collection.load_resources(self.args)
         self.assertEqual(plan, self.root / "device.json")

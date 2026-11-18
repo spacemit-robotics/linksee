@@ -1209,6 +1209,16 @@ def check_capture_quality(T_bg, T_cm, info, accepted_T_bg, args):
     if reproj is not None and reproj > args.max_reproj_error:
         reject_reasons.append(
             f"reprojection error too high: {reproj:.2f}px > {args.max_reproj_error:.2f}px")
+    corners = info.get("max_charuco_corners", info.get("num_charuco_corners"))
+    min_corners = getattr(args, "min_charuco_corners", 9)
+    if corners is not None and corners < min_corners:
+        # A partial board still solves a pose, so this is a warning, not a rejection.
+        # Measured on one 15-pose set: 7-8 corner samples averaged 7 mm residual against
+        # 4 mm for a fully seen board, which is the whole distance between failing and
+        # passing the default gate. Far poses lose corners first.
+        warnings.append(
+            f"charuco corners {corners} < {min_corners}; "
+            "a full board estimates the pose more stably")
     if marker_size is not None and marker_size < args.min_marker_size_px:
         # Not a rejection: a small marker still corners precisely enough when the reprojection
         # error is low, and the samples far from the camera are the ones that constrain the
@@ -1382,6 +1392,9 @@ def main():
                     help="单次标定板平均重投影误差上限(px), 默认 2.0")
     ap.add_argument("--min-marker-size-px", type=float, default=40.0,
                     help="marker 图像平均边长参考下限(px), 默认 40；低于此值只提示不拒收")
+    ap.add_argument("--min-charuco-corners", type=int, default=9,
+                    help=("参考下限(个), 默认 9；低于此值只提示不拒收。"
+                          "角点越少位姿越不稳，远距姿态最容易缺角点"))
     ap.add_argument("--min-distance", type=float, default=0.10,
                     help="marker 距相机最小距离(m), 默认 0.10")
     ap.add_argument("--max-distance", type=float, default=0.40,
