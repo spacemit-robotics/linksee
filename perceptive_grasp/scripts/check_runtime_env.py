@@ -686,6 +686,22 @@ def check_application_binaries(build_dir: str = "") -> bool:
     return ok
 
 
+def _cmake_option_value(build_dir: str, option: str) -> str:
+    """Read one CMake cache entry without requiring a configured build tree."""
+    if not build_dir:
+        return ""
+    cache = os.path.join(
+        os.path.abspath(os.path.expanduser(build_dir)), "CMakeCache.txt")
+    try:
+        with open(cache, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith(option + ":"):
+                    return line.split("=", 1)[-1].strip()
+    except OSError:
+        return ""
+    return ""
+
+
 def check_voice_echo_cancellation(root: Dict[str, Any],
                                   build_dir: str = "") -> bool:
     voice = root.get("voice", {}) if isinstance(root, dict) else {}
@@ -722,6 +738,19 @@ def check_voice_echo_cancellation(root: Dict[str, Any],
             project_root, "build*", "libperceptive_voice_aec.so")))
     library = next((path for path in candidates if path and os.path.isfile(path)), "")
     if not library:
+        # The library only exists when the build enabled ENABLE_WEBRTC_AEC, so a
+        # missing file usually means the option is OFF rather than a broken
+        # environment. Report that state instead of asking for meson/ninja again.
+        enabled = _cmake_option_value(build_dir, "ENABLE_WEBRTC_AEC")
+        if enabled.upper() in ("OFF", "0", "FALSE", "NO"):
+            return status(
+                False,
+                "WebRTC AEC library",
+                f"mode=webrtc_aec but this build has "
+                f"ENABLE_WEBRTC_AEC={enabled}; rebuild with "
+                f"-DENABLE_WEBRTC_AEC=ON or set "
+                f"voice.echo_cancellation.mode=half_duplex",
+            )
         return status(
             False,
             "WebRTC AEC library",
@@ -1051,7 +1080,7 @@ def main() -> int:
     device = ""
     mobile_base = root.get("mobile_base", {}) if isinstance(root, dict) else {}
     mobile_base_enabled = bool(mobile_base.get("enabled", False))
-    mobile_base_driver = mobile_base.get("driver", "drv_uart_esp32")
+    mobile_base_driver = mobile_base.get("driver", "drv_rpmsg_esos")
     mobile_base_is_uart = mobile_base_enabled \
         and mobile_base_driver == "drv_uart_esp32"
     mobile_base_device = mobile_base.get("dev_path", "") \

@@ -274,6 +274,55 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("mode=webrtc_aec", output.getvalue())
 
+    def test_webrtc_aec_reports_disabled_build_option(self):
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "CMakeCache.txt"), "w",
+                      encoding="utf-8") as cache:
+                cache.write("# cache\nENABLE_WEBRTC_AEC:BOOL=OFF\n")
+            with mock.patch.object(check_runtime_env.os.path, "isfile",
+                                   return_value=False):
+                with contextlib.redirect_stdout(output):
+                    ok = check_runtime_env.check_voice_echo_cancellation(
+                        {
+                            "voice": {
+                                "echo_cancellation": {
+                                    "mode": "webrtc_aec",
+                                },
+                            },
+                        },
+                        build_dir=tmp,
+                    )
+
+        self.assertFalse(ok)
+        text = output.getvalue()
+        self.assertIn("ENABLE_WEBRTC_AEC=OFF", text)
+        self.assertIn("-DENABLE_WEBRTC_AEC=ON", text)
+        self.assertNotIn("install meson and", text)
+
+    def test_webrtc_aec_keeps_build_hint_when_option_enabled(self):
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "CMakeCache.txt"), "w",
+                      encoding="utf-8") as cache:
+                cache.write("ENABLE_WEBRTC_AEC:BOOL=ON\n")
+            with mock.patch.object(check_runtime_env.os.path, "isfile",
+                                   return_value=False):
+                with contextlib.redirect_stdout(output):
+                    ok = check_runtime_env.check_voice_echo_cancellation(
+                        {
+                            "voice": {
+                                "echo_cancellation": {
+                                    "mode": "webrtc_aec",
+                                },
+                            },
+                        },
+                        build_dir=tmp,
+                    )
+
+        self.assertFalse(ok)
+        self.assertIn("install meson and", output.getvalue())
+
     def test_config_path_expands_user_home(self):
         with mock.patch.dict(os.environ, {"HOME": "/home/annyi"}):
             resolved = check_runtime_env.expand_config_path(
@@ -898,6 +947,7 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
             "manipulator": {"uart_device": "/dev/ttyACM2"},
             "mobile_base": {
                 "enabled": True,
+                "driver": "drv_uart_esp32",
                 "dev_path": "/dev/ttyACM1",
             },
         }
