@@ -2,7 +2,7 @@
 
 本文说明如何在 SpaceMIT K3 上准备 `perceptive_grasp` 真机部署的软件依赖、SDK 组件和模型文件。仅运行仿真时，按 [README 的仿真运行](../README.md#7-仿真运行)准备，无需安装真机相机和机械臂依赖。
 
-检测模型、底盘、视觉和 `manipulation` 组件为必需项。`spacemit_las2` 运行时和语音模型仅在启用相应功能时安装。
+检测模型、视觉和 `manipulation` 组件为必需项。底盘驱动已内置于 `src/chassis/`，无需单独安装底盘组件。`spacemit_las2` 运行时和语音模型仅在启用相应功能时安装。
 
 ## 1. 准备 SDK
 

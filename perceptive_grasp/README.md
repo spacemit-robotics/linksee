@@ -14,7 +14,7 @@
 
 | 部署方式 | 设备及执行后端 | 部署位置 |
 | --- | --- | --- |
-| Linksee 真机 | `manipulation` 控制 SO101 与夹爪；`libchassis` 控制底盘 | K3 |
+| Linksee 真机 | `manipulation` 控制 SO101 与夹爪；内置底盘驱动控制底盘 | K3 |
 | MuJoCo 同机部署 | UR5e + Robotiq 2F-85 仿真（`manipulation`） | 仿真服务与 pipeline 在同一台 PC 或 K3 |
 | MuJoCo 跨机部署 | UR5e + Robotiq 2F-85 仿真（`manipulation`） | 服务在 PC，pipeline 在 K3 |
 
@@ -52,7 +52,7 @@
 | 抓取规划 | `grasp_planner` / `grasp_geometry` | 估计目标点云和桌面平面，生成并验证顶抓或侧抓候选 |
 | 机械臂执行 | `manipulation` | 统一控制 Linksee SO101 或仿真机械臂和夹爪 |
 | 手眼标定 | `manipulation` 标定会话 | 采集静止姿态与图像，求解和导出相机外参 |
-| 底盘辅助 | `libchassis` | 调整机器人与目标的相对位置 |
+| 底盘辅助 | `src/chassis/`（内置） | 调整机器人与目标的相对位置 |
 | 语音交互 | `spacemit_audio` / VAD / ASR / TTS | 接收语音命令并播报任务状态 |
 | MuJoCo 仿真 | UR5e / Robotiq 2F-85 场景 | 运行物理仿真、模拟 RGB-D 相机与抓取执行器 |
 

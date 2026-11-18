@@ -128,14 +128,16 @@ place:
   release_open: 0.5
 
 # 底盘辅助对齐
-# 当前底盘 SDK（components/control/base）只注册 drv_rpmsg_esos，
-# 底盘通过 RPMSG 与 ESOS 小核通信，不占用 USB 串口。
+# perceptive_grasp 内置了底盘核心与 drv_uart_esp32 驱动源码
+# （src/chassis/），不依赖 components/control/base 的预编译库。
+# Linksee 真实底盘经 UART 连接，不要与机械臂占用同一个串口。
 mobile_base:
   enabled: true
-  driver: "drv_rpmsg_esos"
-  ctrl_dev: "/dev/rpmsg_ctrl0"
-  data_dev: "/dev/rpmsg0"
-  service_name: "rpmsg:motor_ctrl"
+  driver: "drv_uart_esp32"
+  dev_path: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14113459-if00"
+  baud: 115200
+  # 左轮速度补偿系数，仅差速底盘使用。
+  left_wheel_gain: 1.0
   target_x: 0.275
   x_tolerance: 0.035
   y_tolerance: 0.15

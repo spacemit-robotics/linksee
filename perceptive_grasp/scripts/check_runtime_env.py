@@ -519,20 +519,35 @@ def check_rpmsg_device(ctrl_dev: str,
     return ok
 
 
-def check_chassis_driver_registered(sdk_root: str, driver: str) -> bool:
+def check_chassis_driver_registered(sdk_root: str, driver: str,
+                                    build_dir: str = "") -> bool:
     if not driver or driver == "none":
         return True
 
-    lib_path = os.path.join(sdk_root, "output", "staging", "lib",
-                            "libchassis.so")
+    # drv_uart_esp32 is compiled into perceptive_grasp from src/chassis/, so a
+    # staging libchassis.so no longer proves anything about it. Look in the
+    # application binary first, then fall back to the component library for
+    # drivers that still ship there.
+    candidates = []
+    if build_dir:
+        candidates.append(os.path.join(
+            os.path.abspath(os.path.expanduser(build_dir)),
+            "perceptive_grasp_core"))
+    candidates.append(os.path.join(sdk_root, "output", "staging", "lib",
+                                   "libchassis.so"))
+    lib_path = next((path for path in candidates if os.path.isfile(path)), "")
+    if not lib_path:
+        return status(False, "chassis driver " + driver,
+                      "neither perceptive_grasp_core nor libchassis.so found")
+
     try:
         with open(lib_path, "rb") as f:
             data = f.read()
     except OSError as exc:
-        return status(False, "libchassis.so", f"{lib_path}: {exc}")
+        return status(False, "chassis driver " + driver, f"{lib_path}: {exc}")
 
     registered = driver.encode("utf-8") in data
-    detail = "registered" if registered else "not registered in libchassis.so"
+    detail = "registered" if registered else f"not registered in {lib_path}"
     return status(registered, f"chassis driver {driver}", detail)
 
 
@@ -1080,7 +1095,7 @@ def main() -> int:
     device = ""
     mobile_base = root.get("mobile_base", {}) if isinstance(root, dict) else {}
     mobile_base_enabled = bool(mobile_base.get("enabled", False))
-    mobile_base_driver = mobile_base.get("driver", "drv_rpmsg_esos")
+    mobile_base_driver = mobile_base.get("driver", "drv_uart_esp32")
     mobile_base_is_uart = mobile_base_enabled \
         and mobile_base_driver == "drv_uart_esp32"
     mobile_base_device = mobile_base.get("dev_path", "") \
@@ -1119,7 +1134,7 @@ def main() -> int:
             ok &= check_tty(device, fixer, "manipulator.device_plan port")
         if mobile_base_enabled:
             ok &= check_chassis_driver_registered(
-                sdk_root, mobile_base_driver)
+                sdk_root, mobile_base_driver, args.build_dir)
         if mobile_base_is_uart:
             ok &= check_tty(
                 mobile_base_device, fixer, "mobile_base.dev_path")

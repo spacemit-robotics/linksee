@@ -20,8 +20,8 @@ enum class GraspResult;
 /** Configuration for chassis-assisted target alignment. */
 struct MobileBaseAlignmentConfig {
     bool enabled = false;
-    // components/control/base only registers drv_rpmsg_esos; there is no UART driver.
-    std::string driver = "drv_rpmsg_esos";
+    // drv_uart_esp32 is built into perceptive_grasp from src/chassis/.
+    std::string driver = "drv_uart_esp32";
     std::string dev_path = "/dev/ttyACM1";
     int baud = 115200;
     std::string ctrl_dev = "/dev/rpmsg_ctrl0";

@@ -426,7 +426,10 @@ pipeline 综合夹爪开度、负载和驱动状态判断是否持物。持续�
 ```yaml
 mobile_base:
   enabled: true
-  dev_path: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A99050376-if00"
+  driver: "drv_uart_esp32"
+  dev_path: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14113459-if00"
+  baud: 115200
+  left_wheel_gain: 1.0
   target_x: 0.275
   x_tolerance: 0.035
   y_tolerance: 0.15
@@ -439,7 +442,10 @@ mobile_base:
 ```
 
 - `enabled`：启用底盘辅助对齐。
-- `dev_path`：linksee 底盘的稳定串口路径。
+- `driver`：底盘驱动名。默认 `drv_uart_esp32`（UART 差速底盘）；对接 RPMsg 小核底盘时改为 `drv_rpmsg_esos`。两个驱动都由 `perceptive_grasp` 自身编译，不依赖 `components/control/base` 的预编译库。
+- `dev_path`：linksee 底盘的稳定串口路径。**必须与机械臂串口区分**，否则两个设备会争用同一个 tty；机械臂端口见 `config/devices/linksee_so101.yaml`。
+- `baud`：底盘串口波特率。
+- `left_wheel_gain`：左轮速度补偿系数，仅差速底盘使用，用于校正左右轮的实际差异。
 - `target_x`：目标在机械臂基座坐标系下的期望前向距离，单位米；Linksee 真机配置为 `0.275 m`。
 - `x_tolerance`：前后距离允许误差，单位米。Linksee 真机配置为 `0.035 m`。
 - `y_tolerance`：目标相对机械臂基座中心线的左右偏移容差，单位米。程序在边界处使用 0.025 m 的稳定余量，避免定位波动触发底盘无法稳定执行的小幅转向。

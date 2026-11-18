@@ -309,25 +309,24 @@ if(NOT HAVE_REALSENSE_CAMERA AND NOT HAVE_LAS2_CAMERA AND
         "place spacemit_las2 in ~/las2_runtime.")
 endif()
 
-find_path(CHASSIS_INCLUDE_DIR chassis.h
-    PATHS "${_STAGING_DIR}/include"
-    NO_DEFAULT_PATH
+# ============ 底盘驱动（内联源码，不依赖 components/control/base） ============
+# 早期版本从 staging 找 libchassis.so，但组件库只注册 drv_rpmsg_esos，且
+# chassis_config 没有 left_wheel_gain，无法驱动 UART 底盘。这里直接编译
+# 组件库新版（含 drv_uart_esp32 与 left_wheel_gain）的核心与驱动源码，
+# 部署时不再需要单独的底盘库。
+set(CHASSIS_SOURCES
+    src/chassis/chassis_core.c
+    src/chassis/drivers/drv_uart_esp32.c
 )
-find_library(CHASSIS_LIBRARY chassis
-    PATHS "${_STAGING_DIR}/lib"
-    NO_DEFAULT_PATH
+list(APPEND SOURCES ${CHASSIS_SOURCES})
+list(APPEND EXTRA_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/chassis
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/chassis
 )
-
-if(CHASSIS_INCLUDE_DIR AND CHASSIS_LIBRARY)
-    message(STATUS "[MobileBase] chassis SDK enabled")
-    list(APPEND EXTRA_INCLUDE_DIRS ${CHASSIS_INCLUDE_DIR})
-    list(APPEND EXTRA_LIBRARIES ${CHASSIS_LIBRARY})
-    add_definitions(-DHAVE_CHASSIS=1)
-else()
-    message(WARNING
-        "[MobileBase] chassis SDK not found; mobile_base.enabled=true "
-        "will fail at runtime")
-endif()
+find_package(Threads REQUIRED)
+list(APPEND EXTRA_LIBRARIES Threads::Threads)
+add_definitions(-DHAVE_CHASSIS=1)
+message(STATUS "[MobileBase] chassis drivers built in: drv_uart_esp32")
 
 # ============ 检测器选择 ============
 
@@ -530,20 +529,16 @@ enable_testing()
 add_executable(mobile_base_alignment_test
     tests/mobile_base_alignment_test.cpp
     src/mobile_base_controller.cpp
+    ${CHASSIS_SOURCES}
 )
 target_include_directories(mobile_base_alignment_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/chassis
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/chassis
     ${OpenCV_INCLUDE_DIRS}
 )
+target_compile_definitions(mobile_base_alignment_test PRIVATE HAVE_CHASSIS=1)
 target_link_libraries(mobile_base_alignment_test PRIVATE pthread)
-if(CHASSIS_INCLUDE_DIR AND CHASSIS_LIBRARY)
-    target_include_directories(mobile_base_alignment_test PRIVATE
-        ${CHASSIS_INCLUDE_DIR}
-    )
-    target_link_libraries(mobile_base_alignment_test PRIVATE
-        ${CHASSIS_LIBRARY}
-    )
-endif()
 add_test(NAME mobile_base_alignment_test
     COMMAND mobile_base_alignment_test)
 

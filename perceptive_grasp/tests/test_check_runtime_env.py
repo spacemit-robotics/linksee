@@ -989,7 +989,8 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
         checked_devices = [call.args[0] for call in check_tty.call_args_list]
         self.assertIn("/dev/ttyACM2", checked_devices)
         self.assertIn("/dev/ttyACM1", checked_devices)
-        check_driver.assert_called_once_with(mock.ANY, "drv_uart_esp32")
+        check_driver.assert_called_once_with(
+            mock.ANY, "drv_uart_esp32", "")
 
     def test_main_checks_rpmsg_base_without_serial_base_suggestion(self):
         config = {
@@ -1107,6 +1108,20 @@ class RuntimeEnvDiagnosticsTest(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertIn("chassis driver drv_uart_esp32", output.getvalue())
+
+    def test_chassis_driver_check_prefers_the_application_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp) / "build"
+            build.mkdir()
+            (build / "perceptive_grasp_core").write_bytes(b"drv_uart_esp32")
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                ok = check_runtime_env.check_chassis_driver_registered(
+                    str(Path(tmp) / "sdk"), "drv_uart_esp32", str(build))
+
+        self.assertTrue(ok)
+        self.assertIn("registered", output.getvalue())
 
     def test_serial_role_check_rejects_camera_as_manipulator(self):
         def fake_realpath(path):
