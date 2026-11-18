@@ -66,6 +66,7 @@ python3 scripts/calibrate_hand_eye.py \
   --charuco-squares-y 5 \
   --charuco-square-length 0.020 \
   --charuco-marker-length 0.014 \
+  --max-distance 0.60 \
   --num-poses 15 \
   --dataset-dir output/hand_eye
 ```
@@ -87,7 +88,8 @@ python3 scripts/calibrate_hand_eye.py \
 
 1. 采集姿态应覆盖工作空间的左、中、右、高、低位置以及不同腕部角度。相邻姿态至少改变两个关节，并保持标定板正面朝向相机。
 2. 标定板应完整位于画面内。marker 边长低于 40 px（`--min-marker-size-px`）只提示不拒收，尺寸读数仍记入样本；精度由重投影误差把关，标定板靠得近、成像清晰时容易通过。
-3. 只有通过质量检查的样本才会写入数据集，记录关节反馈、末端与标定板位姿、重投影误差和 marker 尺寸，并保存采集图像。被拒收时屏幕给出原因，调整姿态后重试即可。
+3. 标定板到相机的距离默认限制在 0.10~0.40 m（`--min-distance`、`--max-distance`），推荐 0.20~0.30 m，超出上界报 `marker too far` 并拒收。需要更远的样本时放宽上界，示例取 0.60 m。远距样本约束深度方向，单帧精度不如近距，因此 0.20~0.30 m 的样本应占多数，远距只补覆盖；求解输出的残差表明显变大就把上界收回。
+4. 只有通过质量检查的样本才会写入数据集，记录关节反馈、末端与标定板位姿、重投影误差和 marker 尺寸，并保存采集图像。被拒收时屏幕给出原因，调整姿态后重试即可。
 
 ## 5. 求解并写回配置
 

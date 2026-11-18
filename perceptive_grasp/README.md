@@ -106,7 +106,7 @@ python3 scripts/calibrate_hand_eye.py --solve-only --installation-id linksee_sit
   --dataset-dir output/hand_eye --apply-config config/grasp_pipeline.yaml
 ```
 
-示例使用 4 × 5 ChArUco 板，方格 20 mm、标记 14 mm；参数须与实测尺寸一致。
+示例使用 4 × 5 ChArUco 板，方格 20 mm、标记 14 mm；参数须与实测尺寸一致。标定板到相机的距离默认限制在 0.10~0.40 m，推荐 0.20~0.30 m；工作空间较深、需要更远样本时加 `--max-distance 0.60`，远距样本只补覆盖，近距仍应占多数。
 
 - **采集操作**：按现场规程调整姿态并停止，退出其他控制程序后按回车采集（输入 `CAPTURE` 等效）。采集只读取设备，不使能、不释放力矩、不运动。
 - **安装要求**：标定板须相对模型末端刚性固定，采集期间不得改变夹爪开度。
