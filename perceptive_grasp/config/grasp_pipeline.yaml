@@ -134,7 +134,7 @@ place:
 mobile_base:
   enabled: true
   driver: "drv_uart_esp32"
-  dev_path: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14113459-if00"
+  dev_path: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A99050376-if00"
   baud: 115200
   # 左轮速度补偿系数，仅差速底盘使用。
   left_wheel_gain: 1.0

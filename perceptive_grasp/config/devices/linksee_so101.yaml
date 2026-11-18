@@ -16,7 +16,9 @@ device:
             - {name: wrist_flex, minimum_rad: -1.790, maximum_rad: 1.670}
             - {name: wrist_roll, minimum_rad: -2.700, maximum_rad: 2.800}
         options:
-            port: /dev/ttyACM0
+            # Stable by-id path: the two USB-single-serial adapters enumerate in
+            # board-dependent order, so ttyACM0/ttyACM1 can swap across reboots.
+            port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14113459-if00
             arm_ids: "1,2,3,4,5"
             arm_calibration: so101_calibration.json
             max_velocity_rad_s: 1.0
@@ -30,7 +32,8 @@ device:
         timeout_s: 5
         maximum_age_s: 0.2
         options:
-            port: /dev/ttyACM0
+            # Same adapter as the arm: one serial bus carries all six servos.
+            port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14113459-if00
             gripper_id: 6
             gripper_calibration: so101_gripper_calibration.json
             max_velocity_rad_s: 1.0
