@@ -552,24 +552,24 @@ class CollectionContracts(unittest.TestCase):
         device["calibration_resources_sha256"] = sorted(
             collection.digest(path) for path in calibration_files
         )
-        device["pipeline_sha256"] = collection.config_identity(self.args.apply_config)
+        # A session captured before the input fingerprint existed recorded the whole file,
+        # which any write-back changes; that stale hash must not block publication.
+        device["pipeline_sha256"] = collection.digest(self.args.apply_config)
         report = {
             "camera": {"serial": "test-camera", "width": 8, "height": 8, "fps": 30},
             "session_identity": {"device": device},
         }
-        # A blank serial still resolves, because the frozen inputs are unchanged.
+        # A blank serial is reported, not refused: the image profile still pins the camera.
         collection.validate_apply_target(self.args, report, "realsense")
         calibration._apply_to_grasp_config(
             self.args.apply_config, "realsense", [0.1, 0.2, 0.3], [0, 0, 0]
         )
-        # The write-back touches only the calibration block, so the next solve still matches.
+        # The write-back only touches the calibration block, so the next solve still passes.
         collection.validate_apply_target(self.args, report, "realsense")
-        self.pipeline = calibration.yaml.safe_load(
-            Path(self.args.config).read_text()
-        )
+        self.pipeline = calibration.yaml.safe_load(Path(self.args.config).read_text())
         self.pipeline["camera"]["realsense"]["fps"] = 15
         self.save_pipeline()
-        with self.assertRaisesRegex(ValueError, "no serial"):
+        with self.assertRaisesRegex(ValueError, "image profile"):
             collection.validate_apply_target(self.args, report, "realsense")
 
     def test_abort_keeps_incomplete_marker_and_closes_camera(self):

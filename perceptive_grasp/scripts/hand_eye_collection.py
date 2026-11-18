@@ -416,11 +416,13 @@ def validate_apply_target(args, report, backend):
         serial = None
     if serial is not None and str(serial) != camera["serial"]:
         raise ValueError("destination camera serial differs from the calibration session")
-    if serial is None and config_identity(args.apply_config) != expected.get("pipeline_sha256"):
-        # Without a serial, matching inputs are the only proof that this is the same camera.
-        raise ValueError(
-            f"destination camera profile declares no serial: set camera.{backend}.serial "
-            f"to {camera['serial']} so that writing this file no longer counts as a new camera"
+    if serial is None:
+        # Without a serial the image profile and intrinsics below still pin the camera. Say so
+        # instead of refusing: a write-back rewrites this file, so a file hash could never be
+        # the evidence here, and older datasets recorded exactly that unusable hash.
+        print(
+            f"提示：camera.{backend}.serial 未填写，改按图像参数与内参确认相机，"
+            f"填写 {camera['serial']} 可更明确地固定相机身份"
         )
     if backend == "realsense":
         if any(
