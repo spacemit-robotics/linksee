@@ -5,6 +5,7 @@
 
 from contextlib import ExitStack
 import copy
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -40,6 +41,37 @@ def resolve_file(value, directory, *, preserve_reference=False):
     if not path.is_file():
         raise FileNotFoundError(str(path))
     return path
+
+
+def digest_value(value):
+    """Stable digest independent of YAML whitespace, comments and key ordering."""
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def config_identity(path):
+    """Fingerprint the pipeline inputs, excluding the extrinsic this tool writes back.
+
+    The calibration block is this tool's own output. Hashing the whole file would make every
+    successful run invalidate the next one, so only the inputs are bound here.
+    """
+    root = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(root, dict):
+        raise ValueError("pipeline must be a mapping")
+    root.pop("calibration", None)
+    return digest_value(root)
+
+
+def fingerprint(path, pipeline=None):
+    """Hash a resource by content, but a pipeline by its inputs only.
+
+    The calibration block inside the pipeline is this tool's own output, so including it
+    would let one successful write-back look like a different camera or a mid-run edit.
+    """
+    if pipeline is not None and Path(path).resolve() == Path(pipeline).resolve():
+        return config_identity(path)
+    return digest(path)
 
 
 def load_resources(args):
@@ -170,9 +202,9 @@ def camera_identity(camera, camera_config, backend):
     return metadata
 
 
-def check_resources(expected):
+def check_resources(expected, pipeline=None):
     """Refuse mixed configuration/calibration sessions, including changes between handoffs."""
-    if any(digest(path) != fingerprint for path, fingerprint in expected.items()):
+    if any(fingerprint(path, pipeline) != value for path, value in expected.items()):
         raise ValueError("calibration resource changed during collection; start a new session")
 
 
@@ -264,7 +296,7 @@ def collect(args):
         raise FileExistsError(str(output))
     if args.output and Path(args.output).exists():
         raise FileExistsError(str(args.output))
-    fingerprints = {path: digest(path) for path in files}
+    fingerprints = {path: fingerprint(path, args.config) for path in files}
     with ExitStack() as resources:
         camera = application._create_pipeline_camera(config, backend, args.las2_video_device, None)
         resources.callback(camera.stop)
@@ -275,14 +307,14 @@ def collect(args):
             "resource_sha256": list(fingerprints.values()),
         }
         device = device_identity(plan_path, model_path, installation_id=args.installation_id)
-        device["pipeline_sha256"] = fingerprints[Path(args.config).resolve()]
+        device["pipeline_sha256"] = config_identity(args.config)
         device["calibration_resources_sha256"] = [fingerprints[path] for path in calibration_files]
         device["joint_reference_operator_confirmation"] = bool(args.confirm_joint_reference)
         session = CalibrationSession(output, session_identity(device, provenance), provenance)
         accepted_poses = []
         tool_position = None
         while len(session.samples) < args.num_poses:
-            check_resources(fingerprints)
+            check_resources(fingerprints, args.config)
             answer = input(
                 f"样本 {len(session.samples) + 1}/{args.num_poses}："
                 "按现场规程调整并静止，退出其他控制程序后按回车采集；输入 q 结束："
@@ -293,7 +325,7 @@ def collect(args):
             if action is None:
                 print("未采集：按回车采集，或输入 q 结束")
                 continue
-            check_resources(fingerprints)
+            check_resources(fingerprints, args.config)
             # DeviceClient owns the same public resource lease while all frame brackets are read.
             # No enable/disable, target, recovery or direct serial operation is requested.
             with DeviceClient(executable, plan_path, allow_motion=False) as client:
@@ -311,7 +343,7 @@ def collect(args):
                 except ValueError as error:
                     print(f"样本未收录：{error}")
                     continue
-                check_resources(fingerprints)
+                check_resources(fingerprints, args.config)
                 read_tool_position(client, sample_tool_position)
                 if camera_identity(camera, config, backend) != identity:
                     raise ValueError("camera identity or intrinsics changed during collection")
@@ -343,7 +375,7 @@ def collect(args):
                 tool_position = sample_tool_position
                 accepted_poses.append(pose)
                 print(f"已采集 {len(session.samples)}/{args.num_poses}")
-        check_resources(fingerprints)
+        check_resources(fingerprints, args.config)
         session.finish()
     print(f"采集数据集：{output}")
 
@@ -379,11 +411,16 @@ def validate_apply_target(args, report, backend):
         raise ValueError("destination has no matching camera profile")
     camera = report["camera"]
     serial = settings.get("serial")
+    if serial is not None and not str(serial).strip():
+        # A blank template placeholder means "not configured", not "a different camera".
+        serial = None
     if serial is not None and str(serial) != camera["serial"]:
         raise ValueError("destination camera serial differs from the calibration session")
-    if serial is None and digest(args.apply_config) != expected.get("pipeline_sha256"):
+    if serial is None and config_identity(args.apply_config) != expected.get("pipeline_sha256"):
+        # Without a serial, matching inputs are the only proof that this is the same camera.
         raise ValueError(
-            "changed destination must explicitly identify the calibrated camera serial"
+            f"destination camera profile declares no serial: set camera.{backend}.serial "
+            f"to {camera['serial']} so that writing this file no longer counts as a new camera"
         )
     if backend == "realsense":
         if any(

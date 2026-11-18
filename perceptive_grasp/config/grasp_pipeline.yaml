@@ -6,6 +6,9 @@ camera:
   type: "realsense"  # realsense 或 spacemit_las2
 
   realsense:
+    # 写回外参时建议填写本机相机序列号（rs-enumerate-devices 可查），
+    # 用于确认写回目标与采集会话是同一台相机；留空则改为比对配置输入是否一致
+    serial: ""
     width: 640
     height: 480
     fps: 30

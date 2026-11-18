@@ -539,6 +539,39 @@ class CollectionContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "joint calibration"):
             collection.validate_apply_target(self.args, report, "realsense")
 
+    def test_writing_back_an_extrinsic_does_not_invalidate_the_next_run(self):
+        self.args.apply_config = self.args.config
+        self.pipeline["camera"]["realsense"].update(width=8, height=8, fps=30, serial="")
+        self.save_pipeline()
+        plan_path, model_path, _, _, _, _, calibration_files = collection.load_resources(
+            self.args
+        )
+        device = collection.device_identity(
+            plan_path, model_path, installation_id=self.args.installation_id
+        )
+        device["calibration_resources_sha256"] = sorted(
+            collection.digest(path) for path in calibration_files
+        )
+        device["pipeline_sha256"] = collection.config_identity(self.args.apply_config)
+        report = {
+            "camera": {"serial": "test-camera", "width": 8, "height": 8, "fps": 30},
+            "session_identity": {"device": device},
+        }
+        # A blank serial still resolves, because the frozen inputs are unchanged.
+        collection.validate_apply_target(self.args, report, "realsense")
+        calibration._apply_to_grasp_config(
+            self.args.apply_config, "realsense", [0.1, 0.2, 0.3], [0, 0, 0]
+        )
+        # The write-back touches only the calibration block, so the next solve still matches.
+        collection.validate_apply_target(self.args, report, "realsense")
+        self.pipeline = calibration.yaml.safe_load(
+            Path(self.args.config).read_text()
+        )
+        self.pipeline["camera"]["realsense"]["fps"] = 15
+        self.save_pipeline()
+        with self.assertRaisesRegex(ValueError, "no serial"):
+            collection.validate_apply_target(self.args, report, "realsense")
+
     def test_abort_keeps_incomplete_marker_and_closes_camera(self):
         camera = Mock(
             metadata={"serial": "test-camera"}, camera_matrix=np.eye(3), dist_coeffs=np.zeros(5)

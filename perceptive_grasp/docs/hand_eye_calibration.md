@@ -115,6 +115,8 @@ calibration:
 
 脚本仅导出通过质量要求的结果，根据会话中的相机后端更新对应配置块，并备份原文件。
 
+写回前会核对目标配置与采集会话是同一台相机。`camera.<type>.serial` 建议填上本机相机序列号（`rs-enumerate-devices` 可查）；留空时改为比对相机参数、图像分辨率等配置输入是否与采集时一致，这个比对不受外参写回影响，反复求解不会因此失败。若留空且相机参数确实被改过，会报 `destination camera profile declares no serial`，按提示补上序列号即可。
+
 - `translation`：单位为米。
 - `rotation`：单位为弧度。
 
