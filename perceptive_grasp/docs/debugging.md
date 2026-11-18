@@ -181,7 +181,75 @@ python3 scripts/check_runtime_env.py \
 
 ## 5. 排查机械臂执行
 
-### 5.1 读取当前关节角
+### 5.1 确认机械臂已使能
+
+管线只连接设备、只读状态，**不使能、不只清零位、不发送目标**。机械臂或夹爪没使能时，
+第一个需要运动的阶段就会失败，报 `arm is not enabled; enable the arm before moving the
+end effector`。
+
+```
+[03] OBSERVING elapsed_ms=102 result=FAILED
+message=Observe move failed: motion or device error (action=gripper_command,
+        detail=arm is not enabled; enable the arm before moving the end effector)
+```
+
+用 operator CLI 查看与设置使能状态：
+
+```bash
+manipulation inspect       # 只读;看 enabled / fault / latched
+manipulation enable        # 使能机械臂扭矩
+manipulation hand-enable   # 使能夹爪扭矩
+```
+
+使能会锁住扭矩，机械臂保持当前姿态并抗外力。执行前清理工作空间，确认周围无人且可随时
+切断驱动电源。使能状态由舵机保持，一次使能后反复运行管线不必重新使能。
+
+**`grasp device latched; reconnect required` 通常不是独立故障。** 执行器里任一读失败都会置位
+内部 `failed_`，之后所有操作返回这条错误。它只在当前进程内有效，重跑一次就是干净的，
+不需要重启系统或重新插拔。真正的原因要看第一次失败的那条 detail。
+
+### 5.2 串口设备名错位
+
+同一台机器上接多个 USB 串口设备时，`/dev/ttyACM0` 和 `ttyACM1` 谁是谁由枚举顺序决定，
+**每次插拔都可能互换**。设备配置写死 `port: "/dev/ttyACM0"` 的话，某天就会指向别的设备，
+表现为读不到电机：
+
+```
+[Feetech] Read paras failed! ID: 1, Addr: 0
+read SO101 motor 1: Input/output error
+```
+
+按 USB 序列号固定路径可以避免。`/dev/serial/by-id/` 由系统自动维护，不插拔就不会变：
+
+```bash
+ls -l /dev/serial/by-id/
+# usb-1a86_USB_Single_Serial_5B14113459-if00 -> ../../ttyACM1
+```
+
+把 `device.yaml` 的 `port` 改成这个完整路径即可。写成 `by-id` 路径后，硬件序列号换了
+（换线、换舵机板）要同步改配置。
+
+判断某个口上到底是不是电机总线，可以直接发 Feetech PING 看有没有标准应答包：
+
+```bash
+python3 - <<'PY'
+import serial
+def pkt(i):
+    body = bytes([i, 2, 0x01])
+    return b"\xff\xff" + body + bytes([(~sum(body)) & 0xFF])
+for port in ("/dev/ttyACM0", "/dev/ttyACM1"):
+    with serial.Serial(port, 1000000, timeout=0.2) as bus:
+        bus.reset_input_buffer()
+        bus.write(pkt(1))
+        print(port, bus.read(8).hex() or "no reply")
+PY
+```
+
+应答以 `ffff` 开头（例如 `ffff010200fc`）才是电机总线。读到一串 ASCII 文本说明那个口是
+别的设备，不是总线。注意：读参数失败但 PING 有应答，说明总线通、只是该 ID 的舵机没上电
+或不在这个总线上。
+
+### 5.3 读取当前关节角
 
 通过设备配置只读获取机械臂关节角：
 
@@ -195,7 +263,7 @@ python3 scripts/check_runtime_env.py \
 执行中出现反馈故障或超时后，程序请求保持并锁存，后续目标被拒绝。先排除故障、确认现场安全，再重新启动应用；不自动清错或恢复运动。
 真机执行器的 `EmergencyStop()` 请求保持并锁存，不释放力矩，也不替代实体急停。
 
-### 5.2 验证小范围运动
+### 5.4 验证小范围运动
 
 **该步骤会驱动真实机械臂。清理工作空间，并确保可以立即切断驱动电源。**
 
