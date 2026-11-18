@@ -1210,8 +1210,11 @@ def check_capture_quality(T_bg, T_cm, info, accepted_T_bg, args):
         reject_reasons.append(
             f"reprojection error too high: {reproj:.2f}px > {args.max_reproj_error:.2f}px")
     if marker_size is not None and marker_size < args.min_marker_size_px:
-        reject_reasons.append(
-            f"marker too small: {marker_size:.1f}px < {args.min_marker_size_px:.1f}px")
+        # Not a rejection: a small marker still corners precisely enough when the reprojection
+        # error is low, and the samples far from the camera are the ones that constrain the
+        # depth direction. Keep the reading visible so the distribution stays inspectable.
+        warnings.append(
+            f"marker small: {marker_size:.1f}px < {args.min_marker_size_px:.1f}px")
     if num_frames and detected_frames < max(3, num_frames // 2):
         reject_reasons.append(
             f"unstable detection: {detected_frames}/{num_frames} frames")
@@ -1378,7 +1381,7 @@ def main():
     ap.add_argument("--max-reproj-error", type=float, default=2.0,
                     help="单次标定板平均重投影误差上限(px), 默认 2.0")
     ap.add_argument("--min-marker-size-px", type=float, default=40.0,
-                    help="marker 图像平均边长下限(px), 默认 40")
+                    help="marker 图像平均边长参考下限(px), 默认 40；低于此值只提示不拒收")
     ap.add_argument("--min-distance", type=float, default=0.10,
                     help="marker 距相机最小距离(m), 默认 0.10")
     ap.add_argument("--max-distance", type=float, default=0.40,

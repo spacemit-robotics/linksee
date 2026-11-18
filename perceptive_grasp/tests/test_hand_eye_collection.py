@@ -159,6 +159,61 @@ class CollectionContracts(unittest.TestCase):
     def save_pipeline(self):
         (self.root / "pipeline.json").write_text(json.dumps(self.pipeline))
 
+    def test_capture_answer_accepts_enter_and_keeps_quit(self):
+        self.assertEqual(collection.parse_capture_answer(""), "capture")  # Enter alone.
+        self.assertEqual(collection.parse_capture_answer("   "), "capture")
+        self.assertEqual(collection.parse_capture_answer("CAPTURE"), "capture")
+        self.assertEqual(collection.parse_capture_answer("capture"), "capture")
+        self.assertEqual(collection.parse_capture_answer(" q "), "quit")
+        self.assertEqual(collection.parse_capture_answer("Q"), "quit")
+        self.assertIsNone(collection.parse_capture_answer("x"))  # Still not a capture.
+
+    def test_small_marker_is_a_warning_not_a_rejection(self):
+        """A small but precise board still contributes: the far poses constrain depth."""
+        args = SimpleNamespace(
+            min_marker_size_px=40.0,
+            min_distance=0.10,
+            max_distance=0.40,
+            max_reproj_error=2.0,
+            min_relative_rotation_deg=0.0,
+            min_poses=1,
+            no_quality_gate=False,
+        )
+        info = {
+            "marker_size_px": 20.2,
+            "reprojection_error_px": 0.4,
+            "distance_m": 0.28,
+            "detected_frames": 3,
+            "num_frames": 3,
+        }
+        accepted, quality = calibration.check_capture_quality(np.eye(4), np.eye(4), info, [], args)
+        self.assertTrue(accepted)
+        self.assertEqual(quality["reject_reasons"], [])
+        self.assertTrue(any("marker small" in text for text in quality["warnings"]))
+        # The size reading stays in the record, so the distribution is still inspectable.
+        self.assertEqual(quality["marker_size_px"], 20.2)
+
+    def test_reprojection_error_still_rejects_a_small_marker(self):
+        args = SimpleNamespace(
+            min_marker_size_px=40.0,
+            min_distance=0.10,
+            max_distance=0.40,
+            max_reproj_error=2.0,
+            min_relative_rotation_deg=0.0,
+            min_poses=1,
+            no_quality_gate=False,
+        )
+        info = {
+            "marker_size_px": 20.2,
+            "reprojection_error_px": 3.5,
+            "distance_m": 0.28,
+            "detected_frames": 3,
+            "num_frames": 3,
+        }
+        accepted, quality = calibration.check_capture_quality(np.eye(4), np.eye(4), info, [], args)
+        self.assertFalse(accepted)
+        self.assertTrue(any("reprojection error" in text for text in quality["reject_reasons"]))
+
     def test_paths_are_relative_to_owner_and_joint_order_is_exact(self):
         plan, model, fk, _, _, files, _ = collection.load_resources(self.args)
         self.assertEqual(plan, self.root / "device.json")

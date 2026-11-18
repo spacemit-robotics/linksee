@@ -218,6 +218,22 @@ def read_tool_position(client, expected=None):
     return list(positions)
 
 
+def parse_capture_answer(answer):
+    """Map one prompt answer to what to do: "capture", "quit", or None for an unrecognised entry.
+
+    Enter alone captures, since the operator has already posed the arm and the prompt is the only
+    remaining step; typing CAPTURE still works for scripts and old habits.
+    """
+    text = answer.strip()
+    if not text:
+        return "capture"
+    if text.lower() == "q":
+        return "quit"
+    if text.upper() == "CAPTURE":
+        return "capture"
+    return None
+
+
 def collect(args):
     """Collect stationary samples with one read-only device owner per explicit handoff.
 
@@ -269,11 +285,13 @@ def collect(args):
             check_resources(fingerprints)
             answer = input(
                 f"样本 {len(session.samples) + 1}/{args.num_poses}："
-                "按现场规程调整并静止，退出其他控制程序后输入 CAPTURE；输入 q 结束："
-            ).strip()
-            if answer.lower() == "q":
+                "按现场规程调整并静止，退出其他控制程序后按回车采集；输入 q 结束："
+            )
+            action = parse_capture_answer(answer)
+            if action == "quit":
                 raise RuntimeError("collection incomplete; accepted samples retained")
-            if answer != "CAPTURE":
+            if action is None:
+                print("未采集：按回车采集，或输入 q 结束")
                 continue
             check_resources(fingerprints)
             # DeviceClient owns the same public resource lease while all frame brackets are read.
