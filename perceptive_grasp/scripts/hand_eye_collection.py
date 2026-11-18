@@ -401,7 +401,11 @@ def solve_collection(args, directory):
     """Use the common solver and export only a quality-approved matching installation."""
     if not args.installation_id:
         raise ValueError("shared session export requires --installation-id")
-    report = solve_session(directory)
+    report = solve_session(
+        directory,
+        getattr(args, "solve_max_position_m", 0.005),
+        getattr(args, "solve_max_angle_deg", 2.0),
+    )
     manifest = json.loads((Path(directory) / "manifest.json").read_text())
     installation = report["session_identity"]["device"]["installation_id"]
     if installation != args.installation_id:

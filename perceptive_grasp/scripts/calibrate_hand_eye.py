@@ -1386,6 +1386,12 @@ def main():
                     help="marker 距相机最小距离(m), 默认 0.10")
     ap.add_argument("--max-distance", type=float, default=0.40,
                     help="marker 距相机最大距离(m), 默认 0.40")
+    ap.add_argument("--solve-max-position-m", type=float, default=0.005,
+                    help=("求解后允许的最大位置残差(m), 默认 0.005；"
+                          "上限 0.015，超过上限的残差仍判为不达标"))
+    ap.add_argument("--solve-max-angle-deg", type=float, default=2.0,
+                    help=("求解后允许的最大角度残差(°), 默认 2.0；"
+                          "上限 5.0，超过上限的残差仍判为不达标"))
     ap.add_argument("--no-quality-gate", action="store_true",
                     help=argparse.SUPPRESS)
     args = ap.parse_args()

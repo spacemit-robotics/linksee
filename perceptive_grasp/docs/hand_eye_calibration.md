@@ -118,6 +118,20 @@ calibration:
 - `translation`：单位为米。
 - `rotation`：单位为弧度。
 
+默认质量门槛为最大位置残差 5 mm、最大角度残差 2°，留出样本与全量样本都要满足。未达标时报 `Report quality failed`，并列出实际最差残差与所用门槛。此时先看样本分布：个别样本明显偏离，删掉重采比放宽门槛更划算。若整体散布均匀、只是略超门槛，可用 `--solve-max-position-m`、`--solve-max-angle-deg` 放宽后重解，上限为 15 mm / 5°，超过上限的残差仍判为不达标：
+
+```bash
+python3 scripts/calibrate_hand_eye.py \
+  --solve-only \
+  --installation-id linksee_site \
+  --dataset-dir output/hand_eye \
+  --solve-max-position-m 0.010 \
+  --solve-max-angle-deg 4.0 \
+  --apply-config config/grasp_pipeline.yaml
+```
+
+放宽后 `result.json` 的 `thresholds` 记录实际使用的门槛，`quality_passed` 只表示残差落在该门槛内，不表示精度等同默认门槛。抓取精度要求高时，仍应以 5 mm / 2° 为准重新采集。
+
 旧数据集仍支持离线重算，不补造设备身份或校准来源。
 
 ## 6. 验证标定结果
