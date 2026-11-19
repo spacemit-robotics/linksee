@@ -7,11 +7,9 @@
  */
 
 #include "grasp_executor.h"
-
-extern "C" {
-#include "grasp.h"
-#include "manipulator.h"
-}
+#include "executor_device.h"
+#include "executor_kinematics.h"
+#include "manipulation/arm.h"
 
 #include <algorithm>
 #include <chrono>
@@ -26,23 +24,22 @@ extern "C" {
 namespace perceptive_grasp {
 
 void GraspExecutor::EmergencyStop() {
-    if (arm_) manip_stop(arm_);
-    if (gripper_) grasp_stop(gripper_);
-    RecordResult(
-        GraspResult::MOVE_FAILED, "emergency_stop",
-        "emergency stop requested");
+    const bool stopped = device_ && device_->Stop();
+    // The stop may run beside an action. Only the execution owner writes diagnostics_.
+    std::cerr << "[GraspExecutor] " <<
+        (stopped ? "device hold confirmed; torque retained" : "device stop remains unconfirmed") <<
+        std::endl;
 }
 
 bool GraspExecutor::GetCurrentPose(Pose3D& pose) {
-    if (!arm_) return false;
-
-    manip_joint_t joints;
-    std::memset(&joints, 0, sizeof(joints));
-    manip_pose_t manipulator_pose;
-    std::memset(&manipulator_pose, 0, sizeof(manipulator_pose));
-    const int result =
-        manip_get_state(arm_, &joints, &manipulator_pose);
-    if (result != MANIP_OK) return false;
+    if (!device_ || !kin_) return false;
+    std::vector<float> current;
+    if (!GetCurrentJoints(current)) return false;
+    PlanningJoints joints{};
+    joints.count = static_cast<std::uint8_t>(current.size());
+    std::copy(current.begin(), current.end(), joints.q);
+    PlanningPose manipulator_pose{};
+    if (kin_->Forward(joints, &manipulator_pose) != kKinematicsOk) return false;
 
     pose.x = manipulator_pose.x;
     pose.y = manipulator_pose.y;
@@ -55,32 +52,21 @@ bool GraspExecutor::GetCurrentPose(Pose3D& pose) {
 }
 
 void GraspExecutor::Tick(float dt_s) {
-    if (arm_) manip_tick(arm_, dt_s);
-    if (gripper_) grasp_tick(gripper_, dt_s);
+    (void)dt_s;  // DeviceSession owns feedback; no driver-specific polling or target replay.
 }
 
 bool GraspExecutor::GetCurrentJoints(std::vector<float>& joints) {
-    if (!arm_) return false;
-
-    constexpr int kMaximumReadAttempts = 5;
-    int last_result = MANIP_ERR_CONNECT;
-    for (int attempt = 0; attempt < kMaximumReadAttempts; ++attempt) {
-        manip_joint_t current = {};
-        last_result = manip_get_state(arm_, &current, nullptr);
-        if (last_result == MANIP_OK && current.count > 0) {
-            joints.clear();
-            joints.reserve(current.count);
-            for (uint8_t index = 0; index < current.count; ++index) {
-                joints.push_back(current.joints[index]);
-            }
-            return true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    if (!device_) return false;
+    try {
+        const auto state = device_->ReadArm();
+        arm_feedback_moving_ = state.moving || state.command_active;
+        joints.assign(state.joints_rad.begin(), state.joints_rad.end());
+        return !joints.empty();
+    } catch (const std::exception& error) {
+        std::cerr << "[GraspExecutor] feedback failed: " << error.what() << std::endl;
+        RecordResult(GraspResult::MOVE_FAILED, "read_joints", error.what());
+        return false;
     }
-    std::cerr << "[GraspExecutor] Failed to read current joints after "
-            << kMaximumReadAttempts << " attempts, result="
-            << last_result << std::endl;
-    return false;
 }
 
 GraspResult GraspExecutor::ExecuteContinuousJointPath(
@@ -178,7 +164,7 @@ GraspResult GraspExecutor::WaitMotionDone(
     float target_tolerance_rad,
     std::function<bool()> settled_acceptance) {
     last_motion_wait_detail_.clear();
-    if (!arm_) {
+    if (!device_) {
         last_motion_wait_detail_ =
             "motion_state=COMMUNICATION_FAILED: manipulator is unavailable";
         return GraspResult::MOVE_FAILED;
@@ -197,22 +183,24 @@ GraspResult GraspExecutor::WaitMotionDone(
     const float effective_target_tolerance_rad =
         EffectiveMotionTargetToleranceRad(target_tolerance_rad);
 
-    manip_joint_t previous_joints = {};
-    const int initial_read_result =
-        manip_get_state(arm_, &previous_joints, nullptr);
+    std::vector<float> previous_joints;
+    const bool initial_read_success = GetCurrentJoints(previous_joints);
+    if (!initial_read_success) {
+        last_motion_wait_detail_ = "motion_state=COMMUNICATION_FAILED";
+        return GraspResult::MOVE_FAILED;
+    }
 
     int stable_counter = 0;
-    manip_joint_t current_joints = previous_joints;
+    std::vector<float> current_joints = previous_joints;
     float current_target_error = 0.0f;
     MotionCompletionEvidence evidence;
     evidence.has_target =
         !active_target_joints_.empty() &&
-        initial_read_result == MANIP_OK &&
-        active_target_joints_.size() == previous_joints.count;
+        active_target_joints_.size() == previous_joints.size();
     evidence.successful_reads =
-        initial_read_result == MANIP_OK ? 1 : 0;
+        initial_read_success ? 1 : 0;
     evidence.consecutive_read_failures =
-        initial_read_result == MANIP_OK ? 0 : 1;
+        initial_read_success ? 0 : 1;
     bool has_initial_target_error = false;
     std::deque<float> recent_joint_deltas;
     const auto start = std::chrono::steady_clock::now();
@@ -266,13 +254,14 @@ GraspResult GraspExecutor::WaitMotionDone(
                 }
                 std::cerr << "] actual=[";
                 for (int index = 0;
-                    index < current_joints.count; ++index) {
+                    index < static_cast<int>(current_joints.size()); ++index) {
                     if (index > 0) std::cerr << ",";
-                    std::cerr << current_joints.joints[index];
+                    std::cerr << current_joints[index];
                 }
                 std::cerr << "]";
             }
             std::cerr << std::endl;
+            device_->Fail();
             return state == MotionCompletionState::COMMUNICATION_FAILED
                 ? GraspResult::MOVE_FAILED
                 : GraspResult::TIMEOUT;
@@ -282,25 +271,21 @@ GraspResult GraspExecutor::WaitMotionDone(
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kPollIntervalMs));
 
-        std::memset(&current_joints, 0, sizeof(current_joints));
-        const int read_result =
-            manip_get_state(arm_, &current_joints, nullptr);
-        if (read_result != MANIP_OK || current_joints.count == 0) {
+        if (!GetCurrentJoints(current_joints)) {
             ++evidence.consecutive_read_failures;
-            stable_counter = 0;
-            continue;
+            last_motion_wait_detail_ = "motion_state=COMMUNICATION_FAILED";
+            return GraspResult::MOVE_FAILED;
         }
         ++evidence.successful_reads;
         evidence.consecutive_read_failures = 0;
 
         float maximum_delta = 0.0f;
         for (int index = 0;
-            index < current_joints.count &&
-                index < previous_joints.count;
+            index < static_cast<int>(current_joints.size()) &&
+                index < static_cast<int>(previous_joints.size());
             ++index) {
             const float delta = std::fabs(
-                current_joints.joints[index] -
-                previous_joints.joints[index]);
+                current_joints[index] - previous_joints[index]);
             maximum_delta = std::max(maximum_delta, delta);
         }
         recent_joint_deltas.push_back(maximum_delta);
@@ -312,12 +297,12 @@ GraspResult GraspExecutor::WaitMotionDone(
         float maximum_target_error = 0.0f;
         const bool has_joint_target =
             !active_target_joints_.empty() &&
-            active_target_joints_.size() == current_joints.count;
+            active_target_joints_.size() == current_joints.size();
         if (has_joint_target) {
             for (size_t index = 0;
                 index < active_target_joints_.size(); ++index) {
                 float error = std::fabs(
-                    current_joints.joints[index] -
+                    current_joints[index] -
                     active_target_joints_[index]);
                 if (error > static_cast<float>(M_PI)) {
                     error =
@@ -343,7 +328,7 @@ GraspResult GraspExecutor::WaitMotionDone(
             }
         }
 
-        if (maximum_delta < kStableThreshold) {
+        if (maximum_delta < kStableThreshold && !arm_feedback_moving_) {
             stable_counter++;
             if (stable_counter == kStableCount &&
                 has_joint_target &&

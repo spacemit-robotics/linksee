@@ -15,10 +15,12 @@
 
 #include <yaml-cpp/yaml.h>
 
-extern "C" {
-#include "kinematics_interface.h"
-#include "manipulator.h"
-}
+#include "executor_kinematics.h"
+using perceptive_grasp::ExecutorKinematics;
+using perceptive_grasp::PlanningPose;
+using perceptive_grasp::PlanningJoints;
+using perceptive_grasp::PlanningInverse;
+using perceptive_grasp::kKinematicsOk;
 
 namespace fs = std::filesystem;
 
@@ -29,6 +31,7 @@ struct Pose3D {
 
 struct DebugIkAppConfig {
     std::string config_path;
+    bool check_model = false;
     Pose3D pose{0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
 };
 
@@ -39,6 +42,8 @@ struct JointConstraint {
 };
 
 struct ExecutorConfig {
+    std::string model;
+    std::string solver = "eigen";
     std::string urdf_path;
     std::string base_link = "base_link";
     std::string tip_link = "gripper_frame_link";
@@ -51,10 +56,13 @@ static DebugIkAppConfig ParseArgs(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if ((arg == "--help") || (arg == "-h")) {
-            std::cout << "Usage: " << argv[0] << " --config <yaml> --pose x y z qw qx qy qz\n";
+            std::cout << "Usage: " << argv[0]
+                        << " --config <yaml> [--check-model | --pose x y z qw qx qy qz]\n";
             std::exit(0);
         } else if (arg == "--config" && i + 1 < argc) {
             cfg.config_path = argv[++i];
+        } else if (arg == "--check-model") {
+            cfg.check_model = true;
         } else if (arg == "--pose" && i + 7 < argc) {
             cfg.pose.x = std::stof(argv[++i]);
             cfg.pose.y = std::stof(argv[++i]);
@@ -74,6 +82,10 @@ static ExecutorConfig LoadExecutorConfig(const std::string& pipeline_config) {
 
     auto m = root["manipulator"];
     if (m) {
+        cfg.model = m["model"].as<std::string>("");
+        if (!cfg.model.empty()) cfg.model =
+            fs::absolute(fs::path(pipeline_config).parent_path() / cfg.model).string();
+        cfg.solver = m["kinematics_solver"].as<std::string>(cfg.solver);
         cfg.urdf_path = m["urdf_path"].as<std::string>(cfg.urdf_path);
         cfg.base_link = m["base_link"].as<std::string>(cfg.base_link);
         cfg.tip_link = m["tip_link"].as<std::string>(cfg.tip_link);
@@ -113,27 +125,30 @@ int main(int argc, char* argv[]) {
     }
 
     ExecutorConfig cfg = LoadExecutorConfig(app.config_path);
-    if (cfg.urdf_path.empty()) {
-        std::cerr << "[debug_ik] Error: urdf_path is empty" << std::endl;
+    if (cfg.model.empty()) {
+        std::cerr << "[debug_ik] Error: manipulator.model is empty" << std::endl;
         return 1;
     }
 
-    std::cout << "[debug_ik] urdf: " << cfg.urdf_path << std::endl;
+    std::unique_ptr<ExecutorKinematics> kin;
+    try {
+        kin = std::make_unique<ExecutorKinematics>(cfg.model, cfg.solver);
+    } catch (const std::exception& error) {
+        std::cerr << "[debug_ik] " << error.what() << std::endl;
+        return 1;
+    }
+    if (app.check_model) {
+        std::cout << "model valid: " << kin->Count() << " joints\n";
+        return 0;
+    }
+
+    std::cout << "[debug_ik] urdf: " << kin->UrdfPath() << std::endl;
     std::cout << "[debug_ik] pose: ["
                 << app.pose.x << ", " << app.pose.y << ", " << app.pose.z << "]"
                 << " quat=[" << app.pose.qw << ", " << app.pose.qx << ", "
                 << app.pose.qy << ", " << app.pose.qz << "]" << std::endl;
 
-    kin_solver_t* kin = kin_create(nullptr,
-                                    cfg.urdf_path.c_str(),
-                                    cfg.base_link.c_str(),
-                                    cfg.tip_link.c_str());
-    if (!kin) {
-        std::cerr << "[debug_ik] kin_create failed" << std::endl;
-        return 1;
-    }
-
-    kin_pose_t target{};
+    PlanningPose target{};
     target.x = app.pose.x;
     target.y = app.pose.y;
     target.z = app.pose.z;
@@ -142,16 +157,15 @@ int main(int argc, char* argv[]) {
     target.qy = app.pose.qy;
     target.qz = app.pose.qz;
 
-    kin_joints_t out{};
-    int ret = kin_inverse(kin, &target, nullptr, nullptr, &out);
-    if (ret != KIN_OK) {
+    PlanningJoints out{};
+    int ret = PlanningInverse(kin.get(), &target, nullptr, nullptr, &out);
+    if (ret != kKinematicsOk) {
         std::cerr << "[debug_ik] kin_inverse failed: " << ret << std::endl;
-        kin_destroy(kin);
         return 1;
     }
 
     std::cout << std::fixed << std::setprecision(3);
-    int arm_joint_count = std::min<int>(5, out.count);
+    const int arm_joint_count = out.count;
     std::cout << "[debug_ik] IK success, arm joints(rad): [";
     for (int i = 0; i < arm_joint_count; ++i) {
         if (i) std::cout << ", ";
@@ -159,15 +173,5 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "]" << std::endl;
 
-    if (out.count > arm_joint_count) {
-        std::cout << "[debug_ik] extra joints(rad): [";
-        for (int i = arm_joint_count; i < out.count; ++i) {
-            if (i > arm_joint_count) std::cout << ", ";
-            std::cout << out.q[i];
-        }
-        std::cout << "]  (includes gripper/non-arm joints)" << std::endl;
-    }
-
-    kin_destroy(kin);
     return 0;
 }

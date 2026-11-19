@@ -8,6 +8,7 @@
 
 from pathlib import Path
 import unittest
+import xml.etree.ElementTree as ET
 
 import yaml
 
@@ -21,7 +22,7 @@ def _load(name):
 
 
 class BackendProfilesTest(unittest.TestCase):
-    def test_default_profile_keeps_validated_hardware_backends(self):
+    def test_default_profile_keeps_hardware_backends(self):
         config = _load("grasp_pipeline.yaml")
         self.assertEqual(config["camera"]["type"], "realsense")
         self.assertEqual(
@@ -35,7 +36,7 @@ class BackendProfilesTest(unittest.TestCase):
         self.assertEqual(config["grasp"]["top"]["verification_lift_m"], 0.0)
         self.assertEqual(config["grasp"]["top"]["minimum_grasp_height"], 0.0)
 
-    def test_default_profile_matches_k3_validated_grasp_behavior(self):
+    def test_default_profile_keeps_grasp_behavior(self):
         config = _load("grasp_pipeline.yaml")
         top = config["grasp"]["top"]
         self.assertEqual(top["approach_height"], 0.10)
@@ -57,10 +58,10 @@ class BackendProfilesTest(unittest.TestCase):
             {"joint": 3, "min": -1.790, "max": 1.670},
         )
 
-    def test_simulation_profiles_explicitly_opt_into_new_planning(self):
+    def test_simulation_profiles_enable_geometry_filters(self):
         for name in (
-            "grasp_pipeline_mujoco_ur5e.yaml",
-            "grasp_pipeline_remote_mujoco_ur5e.yaml",
+            "grasp_pipeline_manipulation_mujoco.yaml",
+            "grasp_pipeline_manipulation_remote.yaml",
         ):
             config = _load(name)
             top = config["grasp"]["top"]
@@ -70,14 +71,14 @@ class BackendProfilesTest(unittest.TestCase):
             self.assertFalse(config["manipulator"]["legacy_top_ik"], name)
 
     def test_local_mujoco_profile_is_explicit_and_hardware_independent(self):
-        config = _load("grasp_pipeline_mujoco_ur5e.yaml")
+        config = _load("grasp_pipeline_manipulation_mujoco.yaml")
         self.assertEqual(config["camera"]["type"], "mujoco")
         self.assertEqual(config["manipulator"]["driver"], "mujoco_ur5e")
         self.assertFalse(config["mobile_base"]["enabled"])
         self.assertNotIn("uart_device", config["manipulator"])
 
     def test_remote_mujoco_profile_uses_one_shared_endpoint(self):
-        config = _load("grasp_pipeline_remote_mujoco_ur5e.yaml")
+        config = _load("grasp_pipeline_manipulation_remote.yaml")
         self.assertEqual(config["camera"]["type"], "remote_mujoco")
         self.assertEqual(config["manipulator"]["driver"], "remote_mujoco")
         self.assertIn("host", config["remote_mujoco"])
@@ -90,6 +91,28 @@ class BackendProfilesTest(unittest.TestCase):
         self.assertIn("qwen3_asr", config)
         self.assertIn("model_dir", config["sensevoice"])
         self.assertIn("endpoint", config["qwen3_asr"])
+
+    def test_shared_world_profile_keeps_physical_tuning_in_scene(self):
+        config = _load("grasp_pipeline_manipulation_mujoco.yaml")
+        settings = config["manipulator"]["mujoco"]
+        self.assertFalse(settings["gravity_compensation"])
+        self.assertEqual(settings["arm_stiffness_scale"], 1.0)
+        plan = (CONFIG / settings["device_plan"]).resolve()
+        definition = yaml.safe_load(plan.read_text(encoding="utf-8"))["device"]
+        self.assertEqual(definition["arm"]["driver"], "mujoco_ur5e")
+        self.assertEqual(definition["effector"]["driver"], "mujoco_robotiq_2f85")
+        self.assertEqual(definition["arm"]["options"], definition["effector"]["options"])
+        self.assertFalse(config["mobile_base"]["enabled"])
+        self.assertNotIn("xml_path", settings)
+        self.assertNotIn("xml_path", config["camera"]["mujoco"])
+        scene = ET.parse(ROOT / "simulation/mujoco/manipulation_scene.xml").getroot()
+        self.assertEqual(scene.find("option/flag").get("multiccd"), "enable")
+
+    def test_shared_world_remote_profile_defaults_to_loopback(self):
+        config = _load("grasp_pipeline_manipulation_remote.yaml")
+        self.assertEqual(config["remote_mujoco"]["host"], "127.0.0.1")
+        self.assertEqual(config["camera"]["type"], "remote_mujoco")
+        self.assertEqual(config["manipulator"]["driver"], "remote_mujoco")
 
 
 if __name__ == "__main__":

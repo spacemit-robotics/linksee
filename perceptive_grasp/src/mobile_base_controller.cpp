@@ -55,6 +55,8 @@ void FillCommonChassisConfig(chassis_config& chassis_config,
     chassis_config.wheel_diameter = config.wheel_diameter;
     chassis_config.wheel_base = config.wheel_base;
     chassis_config.wheel_track = config.wheel_track;
+    // The UART differential driver scales the left wheel by this gain, which
+    // compensates the measured asymmetry of the linksee chassis.
     chassis_config.left_wheel_gain = config.left_wheel_gain;
     chassis_config.max_speed = config.max_speed;
     chassis_config.max_angular = config.max_angular;

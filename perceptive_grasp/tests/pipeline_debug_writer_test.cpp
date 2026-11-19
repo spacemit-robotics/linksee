@@ -56,6 +56,16 @@ int main() {
         return 1;
     }
 
+    // Existing directories at output filenames make OpenCV return false without throwing.
+    for (const auto& phase : {std::string("color_failure"), std::string("depth_failure")}) {
+        const std::string suffix = phase == "color_failure" ? ".png" : "_depth.png";
+        fs::create_directory(output_dir / ("grasp_" + task_id + "_" + phase + suffix));
+        if (SavePipelineStepCameraDebug(output_dir.string(), phase, color, depth, task_id)) {
+            std::cerr << "failed step image write reported success" << std::endl;
+            return 1;
+        }
+    }
+
     PipelinePlanDebugData plan;
     plan.color = color;
     plan.target_mask = cv::Mat(12, 12, CV_8UC1, cv::Scalar(255));

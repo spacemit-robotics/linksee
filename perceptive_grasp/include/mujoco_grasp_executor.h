@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file mujoco_grasp_executor.h
- * @brief MuJoCo-backed grasp executor for PC simulation.
+ * @brief MuJoCo-backed grasp executor for shared simulation.
  */
 
 #ifndef MUJOCO_GRASP_EXECUTOR_H
@@ -16,6 +16,10 @@
 
 #include "grasp_executor.h"
 
+namespace spacemit::manipulation {
+class MujocoRuntime;
+}
+
 namespace perceptive_grasp {
 
 class MujocoGraspExecutor : public GraspExecutor {
@@ -24,7 +28,9 @@ public:
     ~MujocoGraspExecutor() override;
 
     void SetVisualStepCallback(std::function<void()> callback);
-    /** Reset the world and randomize the pickup layout explicitly. */
+    /** The shared live world; null before successful initialization. */
+    std::shared_ptr<spacemit::manipulation::MujocoRuntime> SimulationRuntime() const;
+    /** Reset the scene; the shared-world backend restores its configured keyframe. */
     void ResetScene();
     void SetTargetLabel(const std::string& target_label) override;
     bool Init() override;
@@ -72,6 +78,7 @@ private:
 
     void RecordResult(GraspResult result, const std::string& action,
                         const std::string& detail = "");
+    GraspResult RetreatFromOpenGrasp();
     GraspResult MoveToJointsSim(const std::vector<float>& joints,
                                 const char* action,
                                 bool allow_target_contact = false);
@@ -80,6 +87,8 @@ private:
                             bool constrain_orientation = true,
                             bool allow_target_contact = false);
     GraspResult SetGripperCtrl(float ctrl, const char* action);
+    GraspResult PrepareCupRelease();
+    GraspResult RetreatFromCup();
 };
 
 }  // namespace perceptive_grasp

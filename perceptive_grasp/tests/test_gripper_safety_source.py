@@ -30,8 +30,9 @@ CONFIG_YAML = ROOT / "config" / "grasp_pipeline.yaml"
 SO101_URDF = ROOT / "urdf" / "so101.urdf"
 SO101_GRIPPER_DRIVER = (
     ROOT.parents[3]
-    / "components/control/grasp/src/drivers/drv_uart_so101_gripper.c"
+    / "components/control/manipulation/drivers/effectors/so101_gripper/so101_gripper.cpp"
 )
+EXECUTOR_DEVICE_CPP = ROOT / "src" / "executor_device.cpp"
 
 
 def _function_body(source: str, signature: str) -> str:
@@ -78,12 +79,24 @@ class GripperSafetySourceTest(unittest.TestCase):
         cls.so101_gripper_driver = SO101_GRIPPER_DRIVER.read_text(
             encoding="utf-8"
         )
+        cls.device = EXECUTOR_DEVICE_CPP.read_text(encoding="utf-8")
 
     def test_linksee_hardware_uses_physical_gripper_tcp(self):
         manipulator = self.config["manipulator"]
-        self.assertTrue(
-            manipulator["uart_device"].endswith("5B14113459-if00")
+        device = yaml.safe_load(
+            (CONFIG_YAML.parent / manipulator["device_plan"]).read_text()
+        )["device"]
+        model = yaml.safe_load(
+            (CONFIG_YAML.parent / manipulator["model"]).read_text()
         )
+        self.assertEqual(device["arm"]["driver"], "so101")
+        self.assertEqual(device["effector"]["driver"], "so101_gripper")
+        self.assertEqual(device["arm"]["resource_id"], device["effector"]["resource_id"])
+        self.assertEqual(device["arm"]["options"]["port"], device["effector"]["options"]["port"])
+        self.assertIn("arm_calibration", device["arm"]["options"])
+        self.assertIn("gripper_calibration", device["effector"]["options"])
+        self.assertEqual(model["tip"], "gripper_frame_link")
+        self.assertEqual(model["joints"], [item["name"] for item in device["arm"]["joints"]])
         self.assertTrue(
             self.config["mobile_base"]["dev_path"].endswith(
                 "5A99050376-if00"
@@ -107,14 +120,40 @@ class GripperSafetySourceTest(unittest.TestCase):
             "linksee_gripper_tcp_link",
         )
         self.assertTrue(self.config["orientation"]["enabled"])
-        self.assertEqual(
-            self.config["calibration"]["realsense"]
-            ["T_base_camera"]["rotation"],
-            [-2.2174, 0.0245, -1.6811],
-        )
+        # Calibration legitimately rewrites this block, so only its shape and plausibility hold.
+        transform = self.config["calibration"]["realsense"]["T_base_camera"]
+        translation, rotation = transform["translation"], transform["rotation"]
+        self.assertEqual(len(translation), 3)
+        self.assertEqual(len(rotation), 3)
+        self.assertAlmostEqual(translation[2], 0.30, delta=0.10)
+        self.assertLess(abs(translation[0]), 0.10)
+        self.assertLess(abs(translation[1]), 0.10)
 
     def test_empty_closed_baseline_is_used(self):
         self.assertIn("CaptureEmptyClosedPosition()", self.executor)
+
+    def test_feedback_failure_does_not_become_observation_success(self):
+        for name in ("MoveToObserve", "MoveToSideObserve"):
+            body = _function_body(self.executor, f"GraspResult GraspExecutor::{name}")
+            capture = body.index("CaptureEmptyClosedPosition();")
+            gate = body.index("if (device_->Failed()) return GraspResult::MOVE_FAILED;", capture)
+            success = body.index("RecordResult(GraspResult::SUCCESS", capture)
+            self.assertLess(gate, success)
+
+    def test_emergency_stop_latches_the_device_without_racing_diagnostics(self):
+        stop = _function_body(self.executor, "void GraspExecutor::EmergencyStop")
+        self.assertIn("device_->Stop()", stop)
+        self.assertNotIn("RecordResult(", stop)
+        self.assertNotIn("device_->Hold()", stop)
+
+    def test_public_feedback_retains_measured_empty_and_load_evidence(self):
+        self.assertIn("gripper.loads.size() != 1", self.device)
+        self.assertIn("!gripper.holding.has_value()", self.device)
+        self.assertIn("state.sample_id <= gripper_sample_", self.device)
+        failure = _function_body(self.device, "void ExecutorDevice::Fail")
+        self.assertIn("if (active_commands_) Hold();", failure)
+        self.assertIn("sample_.load / 1000.0", self.so101_gripper_driver)
+        self.assertIn("state.holding = holding_", self.so101_gripper_driver)
 
     def test_arm_lift_waits_for_stable_gripper_holding_state(self):
         check = _function_body(
@@ -128,9 +167,9 @@ class GripperSafetySourceTest(unittest.TestCase):
             2,
         )
         self.assertNotIn(
-            "after_lift || state == GRASP_STATE_HOLDING", check)
+            "after_lift || state == GripperState::HOLDING", check)
         self.assertIn("driver_empty_at_calibrated_position", check)
-        self.assertIn("state == GRASP_STATE_EMPTY ||", check)
+        self.assertIn("state == GripperState::EMPTY ||", check)
         self.assertIn(
             "evidence.position <= evidence.minimum_object_position", check
         )
@@ -144,12 +183,22 @@ class GripperSafetySourceTest(unittest.TestCase):
         )
         self.assertLess(confirmed_index, success_index)
 
-    def test_gripper_effort_scales_delicate_object_close_speed(self):
-        self.assertNotIn("(void)effort", self.so101_gripper_driver)
+    def test_position_control_keeps_duration_and_driver_speed_limits(self):
+        # The previous SO101 backend ignored effort. Migration must not silently
+        # introduce a force-control promise or a different default closing policy.
+        command = _function_body(self.executor, "bool GraspExecutor::SetGripperPosition")
+        self.assertIn("config_.gripper_command_duration_s", command)
+        self.assertNotIn("gripper_effort", command)
         self.assertIn(
-            "fmaxf(0.2f, fminf(effort, 1.0f))",
+            "std::min(settings.maximum_velocity, std::max(0.01, distance / point.duration_s))",
             self.so101_gripper_driver,
         )
+        self.assertIn("!std::isfinite(point.duration_s)", self.so101_gripper_driver)
+        self.assertIn("point.duration_s <= 0", self.so101_gripper_driver)
+        self.assertIn('m["gripper_command_duration_s"]', self.main)
+        self.assertIn('m["gripper_command_duration_s"]', self.debug_execute_safe)
+
+    def test_empty_baseline_uses_position_and_load_statistics(self):
         self.assertIn("gripper_baseline_", self.executor)
         self.assertIn("gripper_empty_position_margin", self.executor)
         baseline = _function_body(
@@ -175,10 +224,11 @@ class GripperSafetySourceTest(unittest.TestCase):
         self.assertIn("GripperHoldingConfig holding_config", self.executor)
         self.assertIn(
             "GripperHoldingResult::HOLDING", self.executor)
-        self.assertIn(
-            "state == GRASP_STATE_HOLDING",
-            self.executor,
-        )
+        feedback = _function_body(self.executor, "bool GraspExecutor::ReadGripperFeedback")
+        self.assertIn("!moving && feedback.holding == true", feedback)
+        self.assertIn("feedback.moving || feedback.command_active", feedback)
+        self.assertIn("std::abs(feedback.loads[0])", feedback)
+        self.assertIn("sample.load = NAN", self.executor)
         self.assertIn("maximum_checks", self.executor)
         self.assertIn("kAfterLiftOpeningHysteresis", self.executor)
         self.assertIn(
@@ -217,7 +267,8 @@ class GripperSafetySourceTest(unittest.TestCase):
     def test_release_opening_uses_position_control(self):
         release = _function_body(
             self.executor, "GraspResult GraspExecutor::ReleaseObject")
-        self.assertIn("grasp_set_position(", release)
+        self.assertIn("SetGripperPosition(", release)
+        self.assertIn("WaitGripperOpening(", release)
         self.assertIn("config_.place_release_open", release)
 
     def test_gripper_controls_are_in_release_config(self):
@@ -412,7 +463,7 @@ class GripperSafetySourceTest(unittest.TestCase):
             self.pipeline, "void GraspPipeline::HandleGrasping")
         open_index = grasping.find("OpenGripperForGrasp")
         move_index = grasping.find("MoveToGrasp")
-        close_index = grasping.find("CloseGripperAndCheck")
+        close_index = grasping.find("CloseGripperAndCheck", move_index)
         self.assertGreaterEqual(open_index, 0)
         self.assertLess(open_index, move_index)
         self.assertLess(move_index, close_index)
@@ -503,7 +554,7 @@ class GripperSafetySourceTest(unittest.TestCase):
             self.executor,
             "GraspResult GraspExecutor::SolveTopIKWithWristYaw",
         )
-        self.assertIn("kin_forward(", oriented_top_ik)
+        self.assertIn("PlanningForward(", oriented_top_ik)
         self.assertIn("kMaximumTcpPositionErrorM = 0.020", oriented_top_ik)
         self.assertIn("kMaximumTcpVerticalErrorM = 0.008", oriented_top_ik)
         self.assertIn("kVerticalResidualWeight", oriented_top_ik)

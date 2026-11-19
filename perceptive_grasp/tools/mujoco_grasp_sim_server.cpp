@@ -27,14 +27,16 @@
 #include <string>
 #include <vector>
 
-#include <GLFW/glfw3.h>
 #include <opencv2/core.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include "mujoco_grasp_executor.h"
-#include "mujoco_simulation.h"
-#include "mujoco_stereo_camera.h"
 #include "remote_mujoco_protocol.h"
+#include "stereo_camera.h"
+#include "manipulation_mujoco_camera.h"
+#include "manipulation/mujoco_runtime.h"
+#include "mujoco_render.h"
+#include "mujoco_world.h"
 
 namespace fs = std::filesystem;
 
@@ -44,7 +46,7 @@ namespace {
 static std::atomic<bool> g_stop{false};
 
 struct ServerConfig {
-    std::string config_path = "../config/grasp_pipeline_mujoco_ur5e.yaml";
+    std::string config_path = "../config/grasp_pipeline_manipulation_mujoco.yaml";
     std::string listen_host = "127.0.0.1";
     int port = 9090;
     bool viewer = false;
@@ -116,8 +118,6 @@ static ServerConfig LoadConfig(const std::string& path) {
     }
     config.camera.type = "mujoco";
     auto& camera_settings = config.camera.mujoco;
-    camera_settings.xml_path = mujoco_camera["xml_path"].as<std::string>(
-        camera_settings.xml_path);
     camera_settings.camera_name =
         mujoco_camera["camera_name"].as<std::string>(
             camera_settings.camera_name);
@@ -131,7 +131,6 @@ static ServerConfig LoadConfig(const std::string& path) {
         camera_settings.max_depth_m = depth["max_m"].as<float>(
             camera_settings.max_depth_m);
     }
-    ResolveConfigPath(config_dir, &camera_settings.xml_path);
 
     const YAML::Node manipulator = root["manipulator"];
     const YAML::Node mujoco_executor = manipulator["mujoco"];
@@ -149,9 +148,11 @@ static ServerConfig LoadConfig(const std::string& path) {
                     &config.executor.place_joints);
     }
     auto& executor_settings = config.executor.mujoco;
-    executor_settings.xml_path =
-        mujoco_executor["xml_path"].as<std::string>(
-            executor_settings.xml_path);
+    executor_settings.device_plan = mujoco_executor["device_plan"].as<std::string>("");
+    if (!executor_settings.device_plan.empty()) {
+        config.executor.move_speed = manipulator["move_speed"].as<float>(config.executor.move_speed);
+        config.executor.line_speed = manipulator["line_speed"].as<float>(config.executor.line_speed);
+    }
     executor_settings.end_effector_site =
         mujoco_executor["end_effector_site"].as<std::string>(
             executor_settings.end_effector_site);
@@ -181,9 +182,6 @@ static ServerConfig LoadConfig(const std::string& path) {
         throw std::runtime_error(
             "manipulator.mujoco.arm_stiffness_scale must be positive");
     }
-    executor_settings.joint_tolerance_rad =
-        mujoco_executor["joint_tolerance_rad"].as<float>(
-            executor_settings.joint_tolerance_rad);
     executor_settings.ik_position_tolerance_m =
         mujoco_executor["ik_position_tolerance_m"].as<float>(
             executor_settings.ik_position_tolerance_m);
@@ -202,14 +200,11 @@ static ServerConfig LoadConfig(const std::string& path) {
     executor_settings.settle_steps =
         mujoco_executor["settle_steps"].as<int>(
             executor_settings.settle_steps);
-    executor_settings.max_motion_steps =
-        mujoco_executor["max_motion_steps"].as<int>(
-            executor_settings.max_motion_steps);
     ParseStringList(mujoco_executor["joint_names"],
                     &executor_settings.joint_names);
     ParseStringList(mujoco_executor["actuator_names"],
                     &executor_settings.actuator_names);
-    ResolveConfigPath(config_dir, &executor_settings.xml_path);
+    ResolveConfigPath(config_dir, &executor_settings.device_plan);
     return config;
 }
 
@@ -485,209 +480,6 @@ private:
     std::unique_ptr<MujocoGraspExecutor> executor_;
 };
 
-class MujocoViewer {
-public:
-    ~MujocoViewer() {
-        if (context_ready_) {
-            mjr_freeContext(&context_);
-            mjv_freeScene(&scene_);
-        }
-        if (window_ != nullptr) {
-            glfwDestroyWindow(window_);
-        }
-    }
-
-    bool Init(const std::string& xml_path,
-            const std::string& camera_name,
-            std::string* error) {
-        simulation_ = MujocoSimulation::Get(xml_path, error);
-        if (!simulation_) return false;
-
-        fixed_camera_id_ = mj_name2id(
-            simulation_->model(), mjOBJ_CAMERA, camera_name.c_str());
-        if (fixed_camera_id_ < 0) {
-            if (error) *error = "viewer inset camera not found: " + camera_name;
-            return false;
-        }
-
-        if (!glfwInit()) {
-            if (error) *error = "glfwInit failed";
-            return false;
-        }
-        glfwDefaultWindowHints();
-        glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
-        window_ = glfwCreateWindow(
-            1280, 720, "perceptive_grasp mujoco simulation",
-            nullptr, nullptr);
-        if (window_ == nullptr) {
-            if (error) *error = "viewer window creation failed";
-            return false;
-        }
-        glfwSetWindowUserPointer(window_, this);
-        glfwSetCursorPosCallback(window_, &MujocoViewer::CursorPositionCallback);
-        glfwSetScrollCallback(window_, &MujocoViewer::ScrollCallback);
-        glfwShowWindow(window_);
-        glfwFocusWindow(window_);
-
-        glfwMakeContextCurrent(window_);
-        glfwSwapInterval(1);
-        mjv_defaultCamera(&camera_);
-        mjv_defaultOption(&option_);
-        mjv_defaultScene(&scene_);
-        mjr_defaultContext(&context_);
-        {
-            std::lock_guard<std::mutex> lock(simulation_->mutex());
-            mjv_makeScene(simulation_->model(), &scene_, 4000);
-            mjr_makeContext(
-                simulation_->model(), &context_, mjFONTSCALE_100);
-            camera_.type = mjCAMERA_FREE;
-            camera_.azimuth = 135.0;
-            camera_.elevation = -32.0;
-            camera_.distance = 1.7;
-            camera_.lookat[0] = 0.8;
-            camera_.lookat[1] = 0.6;
-            camera_.lookat[2] = 0.9;
-            fixed_camera_.type = mjCAMERA_FIXED;
-            fixed_camera_.fixedcamid = fixed_camera_id_;
-        }
-        context_ready_ = true;
-        return true;
-    }
-
-    bool ShouldClose() const {
-        return window_ == nullptr || glfwWindowShouldClose(window_);
-    }
-
-    void Render() {
-        if (!context_ready_ || window_ == nullptr) return;
-        glfwMakeContextCurrent(window_);
-        glfwPollEvents();
-        int width = 0;
-        int height = 0;
-        glfwGetFramebufferSize(window_, &width, &height);
-        if (width <= 0 || height <= 0) return;
-        mjrRect viewport = {0, 0, width, height};
-        {
-            std::lock_guard<std::mutex> lock(simulation_->mutex());
-            mjv_updateScene(
-                simulation_->model(), simulation_->data(), &option_, nullptr,
-                &camera_, mjCAT_ALL, &scene_);
-            mjr_render(viewport, &scene_, &context_);
-            RenderCameraInset(width, height);
-        }
-        glfwSwapBuffers(window_);
-    }
-
-private:
-    static void CursorPositionCallback(GLFWwindow* window,
-            double xpos,
-            double ypos) {
-        auto* self = static_cast<MujocoViewer*>(
-            glfwGetWindowUserPointer(window));
-        if (self) self->OnMouseMove(xpos, ypos);
-    }
-
-    static void ScrollCallback(GLFWwindow* window,
-            double,
-            double yoffset) {
-        auto* self = static_cast<MujocoViewer*>(
-            glfwGetWindowUserPointer(window));
-        if (self) self->OnScroll(yoffset);
-    }
-
-    void OnMouseMove(double xpos, double ypos) {
-        if (!context_ready_ || window_ == nullptr || !simulation_) return;
-        if (!has_last_mouse_) {
-            last_mouse_x_ = xpos;
-            last_mouse_y_ = ypos;
-            has_last_mouse_ = true;
-            return;
-        }
-
-        const double dx = xpos - last_mouse_x_;
-        const double dy = ypos - last_mouse_y_;
-        last_mouse_x_ = xpos;
-        last_mouse_y_ = ypos;
-
-        int width = 0;
-        int height = 0;
-        glfwGetFramebufferSize(window_, &width, &height);
-        if (height <= 0) return;
-
-        const bool left =
-            glfwGetMouseButton(window_, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-        const bool right =
-            glfwGetMouseButton(window_, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
-        const bool middle =
-            glfwGetMouseButton(window_, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
-        if (!left && !right && !middle) return;
-
-        int action = mjMOUSE_ROTATE_H;
-        if (right) {
-            action = mjMOUSE_MOVE_H;
-        } else if (middle) {
-            action = mjMOUSE_ZOOM;
-        } else if (glfwGetKey(window_, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
-                glfwGetKey(window_, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
-            action = mjMOUSE_ROTATE_V;
-        }
-
-        std::lock_guard<std::mutex> lock(simulation_->mutex());
-        mjv_moveCamera(
-            simulation_->model(), action,
-            static_cast<mjtNum>(dx / height),
-            static_cast<mjtNum>(dy / height),
-            &scene_, &camera_);
-    }
-
-    void OnScroll(double yoffset) {
-        if (!context_ready_ || !simulation_) return;
-        std::lock_guard<std::mutex> lock(simulation_->mutex());
-        mjv_moveCamera(
-            simulation_->model(), mjMOUSE_ZOOM,
-            0.0, static_cast<mjtNum>(-0.05 * yoffset),
-            &scene_, &camera_);
-    }
-
-    void RenderCameraInset(int width, int height) {
-        const int inset_width = std::max(220, width / 4);
-        const int inset_height = std::max(160, height / 4);
-        const int margin = 18;
-        const mjrRect inset = {
-            width - inset_width - margin,
-            height - inset_height - margin,
-            inset_width,
-            inset_height,
-        };
-        const mjrRect border = {
-            inset.left - 2,
-            inset.bottom - 2,
-            inset.width + 4,
-            inset.height + 4,
-        };
-        mjr_rectangle(border, 0.05f, 0.08f, 0.10f, 0.90f);
-        mjv_updateScene(
-            simulation_->model(), simulation_->data(), &option_, nullptr,
-            &fixed_camera_, mjCAT_ALL, &scene_);
-        mjr_render(inset, &scene_, &context_);
-        mjr_overlay(
-            mjFONT_NORMAL, mjGRID_TOPLEFT, inset,
-            "camera", "", &context_);
-    }
-
-    std::shared_ptr<MujocoSimulation> simulation_;
-    GLFWwindow* window_ = nullptr;
-    bool context_ready_ = false;
-    bool has_last_mouse_ = false;
-    double last_mouse_x_ = 0.0;
-    double last_mouse_y_ = 0.0;
-    int fixed_camera_id_ = -1;
-    mjvCamera camera_;
-    mjvCamera fixed_camera_;
-    mjvOption option_;
-    mjvScene scene_;
-    mjrContext context_;
-};
 
 static int CreateListenSocket(const std::string& host, int port) {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -726,7 +518,11 @@ static void PrintUsage(const char* argv0) {
 }  // namespace
 }  // namespace perceptive_grasp
 
-int main(int argc, char* argv[]) {
+static int RunServer(int argc, char* argv[]) {
+#if MUJOCO_RENDER_USES_GL4ES
+    setenv("LIBGL_GL", "21", 0);
+    setenv("LIBGL_ES", "2", 0);
+#endif
     using perceptive_grasp::ServerConfig;
     ServerConfig config;
     bool listen_overridden = false;
@@ -771,47 +567,36 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::unique_ptr<perceptive_grasp::StereoCamera> camera =
-        perceptive_grasp::CreateMujocoStereoCamera(config.camera);
-    if (!camera || !camera->Init()) {
-        std::cerr << "[MujocoSimServer] failed to initialize camera"
-                << std::endl;
-        return 1;
-    }
+    std::unique_ptr<perceptive_grasp::StereoCamera> camera;
     auto executor =
         std::make_unique<perceptive_grasp::MujocoGraspExecutor>(
             config.executor);
-    if (!executor->Init()) {
-        std::cerr << "[MujocoSimServer] failed to initialize executor"
-                << std::endl;
+    if (!executor->Init()) return 1;
+    camera = perceptive_grasp::CreateManipulationMujocoCamera(
+        executor->SimulationRuntime(), config.camera);
+    if (!camera || !camera->Init()) {
+        std::cerr << "[MujocoSimServer] failed to initialize simulation" << std::endl;
         return 1;
     }
 
-    std::unique_ptr<perceptive_grasp::MujocoViewer> viewer;
-    if (config.viewer) {
-        viewer = std::make_unique<perceptive_grasp::MujocoViewer>();
-        std::string error;
-        if (!viewer->Init(
-                config.executor.mujoco.xml_path,
-                config.camera.mujoco.camera_name,
-                &error)) {
-            std::cerr << "[MujocoSimServer] viewer init failed: "
-                    << error << std::endl;
-            return 1;
-        }
-        std::cout << "[MujocoSimServer] Viewer enabled: "
-                << "perceptive_grasp mujoco simulation" << std::endl;
-        std::cout << "[MujocoSimServer] Viewer controls: "
-                << "left-drag rotate, shift+left-drag pitch, "
-                << "right-drag pan, middle-drag/scroll zoom; "
-                << "inset camera=" << config.camera.mujoco.camera_name
-                << std::endl;
-        auto* viewer_ptr = viewer.get();
-        executor->SetVisualStepCallback([viewer_ptr]() {
-            if (viewer_ptr && !viewer_ptr->ShouldClose()) {
-                viewer_ptr->Render();
+    std::unique_ptr<mujoco_sim::Viewer> shared_viewer;
+    std::function<void()> draw_shared_viewer;
+    const auto shared_runtime = executor->SimulationRuntime();
+    if (config.viewer && shared_runtime) {
+        shared_viewer = std::make_unique<mujoco_sim::Viewer>();
+        auto next_frame = std::chrono::steady_clock::now();
+        draw_shared_viewer = [&, next_frame]() mutable {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < next_frame) return;
+            // UI refresh is independent of control polling and the owner's physics timestep.
+            next_frame = now + std::chrono::milliseconds(33);
+            if (shared_viewer->ShouldClose()) {
+                perceptive_grasp::g_stop.store(true);
+            } else {
+                shared_viewer->Draw(shared_runtime->Snapshot());
             }
-        });
+        };
+        executor->SetVisualStepCallback([&]() { draw_shared_viewer(); });
     }
     perceptive_grasp::SimServer server(std::move(camera), std::move(executor));
 
@@ -833,12 +618,9 @@ int main(int argc, char* argv[]) {
             now - last_tick).count();
         last_tick = now;
         server.Tick(std::clamp(elapsed_s, 0.0f, 0.05f));
-        if (viewer) {
-            if (viewer->ShouldClose()) {
-                perceptive_grasp::g_stop.store(true);
-                break;
-            }
-            viewer->Render();
+        if (shared_viewer) {
+            if (shared_viewer->ShouldClose()) break;
+            draw_shared_viewer();
         }
         pollfd pfd{};
         pfd.fd = listen_fd;
@@ -871,7 +653,14 @@ int main(int argc, char* argv[]) {
         std::vector<std::uint8_t> payload;
         if (perceptive_grasp::remote_mujoco::ReadRequest(
                 client_fd, &command, &request, &error)) {
-            server.Handle(command, request, &ok, &result, &detail, &payload);
+            try {
+                server.Handle(command, request, &ok, &result, &detail, &payload);
+            } catch (const std::exception& failure) {
+                ok = false;
+                result = static_cast<std::int32_t>(perceptive_grasp::GraspResult::MOVE_FAILED);
+                detail = failure.what();
+                payload.clear();
+            }
         } else {
             detail = error;
             result = static_cast<std::int32_t>(
@@ -884,4 +673,13 @@ int main(int argc, char* argv[]) {
     close(listen_fd);
     std::cout << "[MujocoSimServer] Stopped" << std::endl;
     return 0;
+}
+
+int main(int argc, char* argv[]) {
+    try {
+        return RunServer(argc, argv);
+    } catch (const std::exception& failure) {
+        std::cerr << "[MujocoSimServer] " << failure.what() << std::endl;
+        return 1;
+    }
 }

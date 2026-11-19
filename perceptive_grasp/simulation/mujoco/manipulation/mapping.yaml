@@ -1,0 +1,24 @@
+# Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+# SPDX-License-Identifier: Apache-2.0
+schema_version: 1
+scene: ../manipulation_scene.xml
+initial_keyframe: robot_home
+synchronized_joint_point: true
+arm:
+    - {joint: robot_shoulder_pan_joint, actuator: robot_shoulder_pan, max_velocity_rad_s: 1.0}
+    - {joint: robot_shoulder_lift_joint, actuator: robot_shoulder_lift, max_velocity_rad_s: 1.0}
+    - {joint: robot_elbow_joint, actuator: robot_elbow, max_velocity_rad_s: 1.0}
+    - {joint: robot_wrist_1_joint, actuator: robot_wrist_1, max_velocity_rad_s: 1.0}
+    - {joint: robot_wrist_2_joint, actuator: robot_wrist_2, max_velocity_rad_s: 1.0}
+    - {joint: robot_wrist_3_joint, actuator: robot_wrist_3, max_velocity_rad_s: 1.0}
+effector:
+    - channel: gripper
+      joint: robot_gripper_right_driver_joint
+      actuator: robot_gripper_fingers_actuator
+      joint_closed: 0.8
+      joint_open: 0.0
+      control_closed: 255.0
+      control_open: 0.0
+arm_moving_threshold_rad_s: 0.002
+effector_moving_threshold: 0.002
+hold_timeout_s: 2.0

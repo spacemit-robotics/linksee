@@ -185,6 +185,7 @@ static void PrintUsage(const char* prog) {
                 << "  --loop            Auto-loop; Ctrl+C returns home and exits\n"
                 << "  --step            Step mode: pause before each stage\n"
                 << "  --plan-only       Validate perception and arm path without motion\n"
+                << "  --no-enable       Connect the arm read-only instead of enabling it\n"
                 << "  --validate-config Validate configuration without initializing hardware\n"
                 << "  --remote-host <host>  Override remote_mujoco server host\n"
                 << "  --remote-port <port>  Override remote_mujoco server port\n"
@@ -330,8 +331,6 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
                     "camera.mujoco configuration is required");
             }
             auto& settings = cfg.camera.mujoco;
-            settings.xml_path = mujoco["xml_path"].as<std::string>(
-                settings.xml_path);
             settings.camera_name = mujoco["camera_name"].as<std::string>(
                 settings.camera_name);
             settings.width = mujoco["width"].as<int>(settings.width);
@@ -671,14 +670,23 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
     if (auto m = root["manipulator"]) {
         cfg.executor.manip_driver = m["driver"].as<std::string>(
             cfg.executor.manip_driver);
-        cfg.executor.uart_device = m["uart_device"].as<std::string>(
-            cfg.executor.uart_device);
-        cfg.executor.baudrate = m["baudrate"].as<int>(
-            cfg.executor.baudrate);
+        const auto resolve_manipulation_path = [&](const char* key) {
+            const std::string value = m[key].as<std::string>("");
+            return value.empty() ? value :
+                fs::absolute(fs::path(config_path).parent_path() / value).lexically_normal().string();
+        };
+        cfg.executor.device_plan = resolve_manipulation_path("device_plan");
+        cfg.executor.model = resolve_manipulation_path("model");
+        cfg.executor.kinematics_solver = m["kinematics_solver"].as<std::string>(
+            cfg.executor.kinematics_solver);
+        cfg.executor.gripper_command_duration_s = m["gripper_command_duration_s"].as<float>(
+            cfg.executor.gripper_command_duration_s);
         cfg.executor.urdf_path = m["urdf_path"].as<std::string>(
             cfg.executor.urdf_path);
         cfg.executor.legacy_top_ik = m["legacy_top_ik"].as<bool>(
             cfg.executor.legacy_top_ik);
+        cfg.executor.enable_on_start = m["enable_on_start"].as<bool>(
+            cfg.executor.enable_on_start);
 
         // 解析 URDF 相对路径: 相对于配置文件所在目录
         if (!cfg.executor.urdf_path.empty() &&
@@ -721,8 +729,8 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
 
         if (auto mj = m["mujoco"]) {
             auto& mujoco = cfg.executor.mujoco;
-            mujoco.xml_path = mj["xml_path"].as<std::string>(
-                mujoco.xml_path);
+            mujoco.device_plan = mj["device_plan"].as<std::string>(
+                mujoco.device_plan);
             mujoco.end_effector_site =
                 mj["end_effector_site"].as<std::string>(
                     mujoco.end_effector_site);
@@ -752,9 +760,6 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
                 throw std::runtime_error(
                     "manipulator.mujoco.arm_stiffness_scale must be positive");
             }
-            mujoco.joint_tolerance_rad =
-                mj["joint_tolerance_rad"].as<float>(
-                    mujoco.joint_tolerance_rad);
             mujoco.ik_position_tolerance_m =
                 mj["ik_position_tolerance_m"].as<float>(
                     mujoco.ik_position_tolerance_m);
@@ -769,9 +774,6 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
                 mj["ik_iterations"].as<int>(mujoco.ik_iterations);
             mujoco.settle_steps =
                 mj["settle_steps"].as<int>(mujoco.settle_steps);
-            mujoco.max_motion_steps =
-                mj["max_motion_steps"].as<int>(
-                    mujoco.max_motion_steps);
             if (auto names = mj["joint_names"]) {
                 mujoco.joint_names.clear();
                 for (size_t i = 0; i < names.size(); ++i) {
@@ -1150,6 +1152,20 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
         throw std::runtime_error(
             "grasp.gripper_empty_position_margin must be non-negative");
     }
+    if (cfg.executor.manip_driver == "mujoco") {
+        throw std::runtime_error("unsupported manipulator.driver: mujoco; use mujoco_ur5e");
+    }
+    if (cfg.camera.type == "mujoco" && cfg.executor.manip_driver != "mujoco_ur5e") {
+        throw std::runtime_error("local simulation camera requires manipulator.driver=mujoco_ur5e");
+    }
+    if (cfg.executor.manip_driver == "mujoco_ur5e") {
+        if (cfg.executor.mujoco.device_plan.empty()) {
+            throw std::runtime_error("manipulator.mujoco.device_plan is required");
+        }
+        if (cfg.executor.mujoco.gravity_compensation || cfg.executor.mujoco.arm_stiffness_scale != 1.0f) {
+            throw std::runtime_error("simulation physical parameters must be set in the device-plan MJCF scene");
+        }
+    }
     if (cfg.camera.type == "remote_mujoco" &&
         cfg.executor.manip_driver == "remote_mujoco" &&
         (cfg.camera.remote_mujoco.host !=
@@ -1179,6 +1195,7 @@ int main(int argc, char* argv[]) {
     bool auto_loop = false;
     bool step_mode = false;
     bool plan_only = false;
+    bool no_enable = false;
     bool voice_mode = false;
     bool tts_mode = false;
     bool voice_stdin = false;
@@ -1216,6 +1233,8 @@ int main(int argc, char* argv[]) {
             step_mode = true;
         } else if (arg == "--plan-only") {
             plan_only = true;
+        } else if (arg == "--no-enable") {
+            no_enable = true;
         } else if (arg == "--validate-config") {
             validate_config_only = true;
         } else if (arg == "--remote-host" && i + 1 < argc) {
@@ -1270,6 +1289,7 @@ int main(int argc, char* argv[]) {
     }
     if (step_mode) std::cout << "Mode: step (pause before each stage)" << std::endl;
     if (plan_only) std::cout << "Mode: plan-only (no motion commands)" << std::endl;
+    if (no_enable) std::cout << "Mode: torque untouched (arm stays as found)" << std::endl;
     std::cout << std::endl;
 
     // 加载配置
@@ -1283,6 +1303,8 @@ int main(int argc, char* argv[]) {
     cfg.auto_loop = auto_loop;
     cfg.step_mode = step_mode;
     cfg.plan_only = plan_only;
+    // A planning-only run never moves, so it must not take torque either.
+    if (no_enable || plan_only) cfg.executor.enable_on_start = false;
     if (plan_only) cfg.mobile_base.enabled = false;
     cfg.voice.enabled = voice_mode || voice_stdin;
     if (tts_mode || status_stdout) cfg.voice.tts_enabled = true;
@@ -1311,8 +1333,8 @@ int main(int argc, char* argv[]) {
     ResolveConfigPath(config_dir, &cfg.debug_output_dir);
     ResolveConfigPath(config_dir, &cfg.camera.spacemit_las2.model_path);
     ResolveConfigPath(config_dir, &cfg.camera.spacemit_las2.calib_path);
-    ResolveConfigPath(config_dir, &cfg.camera.mujoco.xml_path);
-    ResolveConfigPath(config_dir, &cfg.executor.mujoco.xml_path);
+    ResolveConfigPath(config_dir, &cfg.executor.mujoco.device_plan);
+    cfg.camera.mujoco.device_plan = cfg.executor.mujoco.device_plan;
 
     if (validate_config_only) {
         std::cout << "[Config] valid" << std::endl;

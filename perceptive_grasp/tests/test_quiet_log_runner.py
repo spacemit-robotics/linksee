@@ -9,6 +9,9 @@
 import importlib.util
 import inspect
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -73,6 +76,10 @@ class QuietLogRunnerTest(unittest.TestCase):
             "Error loading config: unsupported camera.type: remote_mujoco\n"))
         self.assertTrue(MODULE.should_keep_line(
             "Failed to start ./perceptive_grasp_core: permission denied\n"))
+        self.assertTrue(MODULE.should_keep_line(
+            "Mode: torque untouched (arm stays as found)\n"))
+        self.assertTrue(MODULE.should_keep_line(
+            "Mode: plan-only (no motion commands)\n"))
 
     def test_extracts_status_event_from_interleaved_module_log(self):
         line = (
@@ -148,6 +155,52 @@ class QuietLogRunnerTest(unittest.TestCase):
         self.assertIsNone(MODULE._parse_voice_control_command([
             "--config", "config/hardware.yaml",
         ]))
+
+    def test_installed_launcher_finds_voice_bridge_from_any_directory(self):
+        with tempfile.TemporaryDirectory(prefix="grasp install ") as directory:
+            root = Path(directory)
+            launcher = root / "prefix/bin/perceptive_grasp"
+            bridge = root / "prefix/share/perceptive_grasp/scripts/local_voice_bridge.py"
+            launcher.parent.mkdir(parents=True)
+            bridge.parent.mkdir(parents=True)
+            shutil.copyfile(SCRIPT, launcher)
+            bridge.write_text("print('installed voice bridge')\n", encoding="utf-8")
+            # A stale script in the caller's directory must not replace the
+            # bridge shipped with this installation.
+            stale = root / "scripts/local_voice_bridge.py"
+            stale.parent.mkdir()
+            stale.write_text("print('stale voice bridge')\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(launcher), "--voice-control", "--help"],
+                cwd=root, capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "installed voice bridge")
+
+    def test_source_launcher_preserves_sibling_voice_bridge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / "scripts/run_perceptive_grasp.py"
+            launcher.parent.mkdir()
+            shutil.copyfile(SCRIPT, launcher)
+            (launcher.parent / "local_voice_bridge.py").write_text(
+                "print('source voice bridge')\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(launcher), "--voice-control", "--help"],
+                cwd=root, capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "source voice bridge")
+
+    def test_config_validation_result_reaches_launcher_stdout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory) / "validation_output.py"
+            fixture.write_text(
+                "print('[SDK] internal setup')\nprint('[Config] valid')\n",
+                encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--binary", sys.executable, str(fixture)],
+                cwd=directory, capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "[Config] valid")
 
     def test_normal_mode_filters_stdout_and_stderr_together(self):
         source = inspect.getsource(MODULE.main)

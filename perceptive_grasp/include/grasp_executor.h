@@ -21,15 +21,10 @@
 #include "grasp_planner.h"
 #include "motion_completion.h"
 
-// Forward declarations for C API (avoid pulling full headers into this header)
-extern "C" {
-struct manip_dev;
-struct grasp_dev;
-struct kin_solver;
-typedef struct kin_solver kin_solver_t;
-}
-
 namespace perceptive_grasp {
+
+class ExecutorDevice;
+class ExecutorKinematics;
 
 /** 执行结果 */
 enum class GraspResult {
@@ -129,9 +124,12 @@ struct TimingConfig {
 struct ExecutorConfig {
     // 机械臂
     std::string manip_driver = "so101";
-    std::string uart_device = "/dev/ttyACM0";
-    int baudrate = 1000000;
-
+    std::string device_plan;
+    std::string model;
+    std::string kinematics_solver = "eigen";
+    // Startup takes torque on the arm and jaws so the first motion gate passes. Turn it off to
+    // connect read-only, for example to inspect a rig that must stay limp.
+    bool enable_on_start = true;
     // 运动学
     std::string urdf_path = "../urdf/so101.urdf";
     std::string base_link = "base_link";
@@ -153,11 +151,12 @@ struct ExecutorConfig {
 
     // 夹爪
     float gripper_open = 0.5f;
-    float gripper_effort = 0.8f;
+    float gripper_effort = 0.8f;  // Retained configuration field; position control does not set force.
     float place_release_open = 0.5f;
-    float gripper_hold_load_threshold = 100.0f;  // Feetech load units
+    float gripper_hold_load_threshold = 100.0f;  // Per-mille rated output for holding evidence.
     float gripper_empty_position_margin = 0.03f;
     int gripper_timeout_ms = 3000;
+    float gripper_command_duration_s = 0.5f;
 
     // 预定义姿态
     std::vector<float> home_joints = {
@@ -200,7 +199,8 @@ struct ExecutorConfig {
     bool performance_log_enabled = false;
 
     struct MujocoConfig {
-        std::string xml_path;
+        // Required public plan; its mapping owns the scene and physical parameters.
+        std::string device_plan;
         std::string end_effector_site = "pinch";
         std::string gripper_actuator = "fingers_actuator";
         std::string robot_root_body = "ur5e_base";
@@ -223,16 +223,14 @@ struct ExecutorConfig {
         };
         float gripper_open_ctrl = 0.0f;
         float gripper_close_ctrl = 255.0f;
-        bool gravity_compensation = true;
+        bool gravity_compensation = false;
         float arm_stiffness_scale = 1.0f;
-        float joint_tolerance_rad = 0.015f;
         float ik_position_tolerance_m = 0.006f;
         float cartesian_tracking_tolerance_m = 0.002f;
         float ik_step_scale = 0.65f;
         float ik_damping = 0.035f;
         int ik_iterations = 120;
         int settle_steps = 250;
-        int max_motion_steps = 2500;
     } mujoco;
 
     struct RemoteMujocoConfig {
@@ -257,10 +255,14 @@ struct ExecutorConfig {
     */
 class GraspExecutor {
 public:
-    explicit GraspExecutor(const ExecutorConfig& config) : config_(config) {}
+    // The owner serializes initialization, execution, diagnostics and destruction.
+    // For the physical executor only, EmergencyStop may interrupt an already-started
+    // action from another thread. It must not race initialization or destruction.
 #ifdef MOCK_EXECUTOR
+    explicit GraspExecutor(const ExecutorConfig& config) : config_(config) {}
     virtual ~GraspExecutor() = default;
 #else
+    explicit GraspExecutor(const ExecutorConfig& config);
     virtual ~GraspExecutor();
 #endif
 
@@ -351,6 +353,7 @@ public:
                                     const Pose3D& pre_grasp_pose,
                                     float grasp_yaw_rad = NAN);
     virtual GraspResult ExecutePlace();
+    /// Latching hold; rejects following targets until the device is explicitly re-created.
     virtual void EmergencyStop();
     virtual bool GetCurrentPose(Pose3D& pose);
     virtual void Tick(float dt_s);
@@ -366,9 +369,9 @@ public:
     GraspResult SolveIK(const Pose3D& pose, std::vector<float>& joints);
 
     /**
-    * @brief 获取运动学求解器句柄 (供外部直接调用 kin_inverse 等)
+    * @brief Read-only access to the public-capability planning adapter.
     */
-    kin_solver_t* GetKinSolver() const { return kin_; }
+    ExecutorKinematics* GetKinSolver() const { return kin_.get(); }
 #endif
 
 protected:
@@ -376,9 +379,8 @@ protected:
 
 #ifndef MOCK_EXECUTOR
 private:
-    struct manip_dev* arm_ = nullptr;
-    struct grasp_dev* gripper_ = nullptr;
-    kin_solver_t* kin_ = nullptr;
+    std::unique_ptr<ExecutorDevice> device_;
+    std::unique_ptr<ExecutorKinematics> kin_;
     std::unique_ptr<ArmPathSafety> arm_path_safety_;
     SupportPlane support_plane_;
     std::vector<float> validated_side_staging_joints_;
@@ -396,6 +398,7 @@ private:
     std::vector<float> active_target_joints_;
     int active_motion_timeout_ms_ = 3000;
     int wait_motion_timeout_ms_ = 15000;
+    bool arm_feedback_moving_ = false;
     std::string last_motion_wait_detail_;
     GripperBaseline gripper_baseline_;
     ExecutorDiagnostics diagnostics_;
@@ -404,6 +407,8 @@ private:
                         const std::string& detail = "");
     GraspResult CheckGripperHolding(const char* phase, bool after_lift);
     void CaptureEmptyClosedPosition();
+    bool SetGripperPosition(float position);
+    bool ReadGripperFeedback(GripperFeedbackSample& sample, bool& moving);
     bool WaitGripperOpening(float target_position);
     GraspResult MoveToJoints(const std::vector<float>& joints);
     GraspResult MoveToJointsCoordinated(

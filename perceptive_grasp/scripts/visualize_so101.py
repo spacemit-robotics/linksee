@@ -13,7 +13,12 @@ SO-101 机械臂 Pinocchio + Meshcat 可视化
 
 依赖：
   pip3 install meshcat
-  需要系统已安装 pinocchio (本项目已有)
+  需要系统已安装 pinocchio 及其 Python 绑定
+
+说明：
+  这是可选的离线调试脚本，不参与抓取主链路，也不在 requirements.txt 中。
+  抓取流程的运动学由 manipulation 的内置 eigen 后端完成，无需 pinocchio。
+  仅当想用 Meshcat 观察 3D 模型时才需要安装 pinocchio 与 meshcat。
 """
 
 import argparse

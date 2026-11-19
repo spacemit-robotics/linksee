@@ -2,6 +2,8 @@
 
 The ur5e and robotiq 2f-85 mjcf descriptions are derived from the pinned mujoco menagerie revision recorded in `scripts/prepare_mujoco_assets.py`. Their visual meshes are downloaded during simulation setup and are not stored in this repository. The upstream license and notice files are retained beside each model description.
 
+`models/universal_robots_ur5e/ur5e_grasp.xml` and `models/robotiq_2f85/2f85_grasp.xml` are application-specific derivatives with explicit gravity compensation and servo settings. They use the same upstream licenses and visual assets; the original model descriptions remain separate.
+
 The apple and banana visual meshes and textures are downloaded from the pinned [`Piper_Mujoco_Sim`](https://github.com/SkyLineHXY/Piper_Mujoco_Sim) revision recorded in `scripts/prepare_mujoco_assets.py`. The upstream MIT license is retained in `assets/fruit/LICENSE`. Simplified invisible primitives are used only for stable collision and contact simulation.
 
 ## Apple and banana asset license

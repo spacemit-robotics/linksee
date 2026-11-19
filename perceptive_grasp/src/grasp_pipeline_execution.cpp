@@ -67,13 +67,24 @@ void GraspPipeline::HandleApproaching() {
 }
 
 void GraspPipeline::HandleGrasping() {
+    if (!action_.active && simulation_grasp_close_pending_) {
+        simulation_grasp_close_pending_ = false;
+        StartAction(PipelineState::GRASPING, "close_gripper_after_capture", [this]() {
+            object_may_be_held_.store(true);
+            std::cout << "[GraspExecutor] grasp phase=close_gripper" << std::endl;
+            return executor_->CloseGripperAndCheck();
+        });
+        return;
+    }
     if (!action_.active) {
         if (!WaitForConfirm(
                 "即将张开夹爪、下降、水平进给并闭合抓取")) {
             return;
         }
-        StartAction(
-            PipelineState::GRASPING, "open_move_close_gripper", [this]() {
+        const bool capture_on_main = config_.step_mode && config_.camera.type == "mujoco";
+        StartAction(PipelineState::GRASPING,
+            capture_on_main ? "open_move_for_capture" : "open_move_close_gripper",
+            [this, capture_on_main]() {
                 std::cout << "[GraspExecutor] grasp phase=open_gripper"
                         << std::endl;
                 auto result = executor_->OpenGripperForGrasp(grasp_opening_);
@@ -85,6 +96,7 @@ void GraspPipeline::HandleGrasping() {
                     grasp_pose_, grasp_yaw_rad_,
                     grasp_strategy_ == GraspStrategy::TOP);
                 if (result != GraspResult::SUCCESS) return result;
+                if (capture_on_main) return GraspResult::SUCCESS;
                 if (config_.step_mode &&
                     (!FlushCameraAfterMotion("grasp motion") ||
                     !SaveStepCameraDebug("grasp_pose"))) {
@@ -100,8 +112,19 @@ void GraspPipeline::HandleGrasping() {
         return;
     }
 
+    const bool capture_on_main = action_.name == "open_move_for_capture";
     auto result = PollAction(PipelineState::GRASPING);
     if (!result.has_value()) return;
+    if (capture_on_main && *result == GraspResult::SUCCESS) {
+        // The local renderer owns a main-thread graphics context. Complete the frame
+        // before closing, then let the next event-loop tick process cancellation first.
+        if (!FlushCameraAfterMotion("grasp motion") || !SaveStepCameraDebug("grasp_pose")) {
+            SetState(PipelineState::ERROR, "Failed to capture grasp camera verification");
+            return;
+        }
+        simulation_grasp_close_pending_ = true;
+        return;
+    }
 
     switch (*result) {
         case GraspResult::SUCCESS:

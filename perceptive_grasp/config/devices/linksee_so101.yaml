@@ -1,0 +1,41 @@
+# Supply this installation's calibrated motor files; never substitute guessed offsets or travel.
+schema_version: 3
+device:
+    model: so101
+    arm:
+        driver: so101
+        device_id: linksee_arm
+        resource_id: linksee_so101_serial
+        tolerance_rad: 0.01
+        timeout_s: 30
+        maximum_age_s: 0.2
+        joints:
+            - {name: shoulder_pan, minimum_rad: -1.540, maximum_rad: 1.630}
+            - {name: shoulder_lift, minimum_rad: -1.770, maximum_rad: 1.680}
+            - {name: elbow_flex, minimum_rad: -1.840, maximum_rad: 1.430}
+            - {name: wrist_flex, minimum_rad: -1.790, maximum_rad: 1.670}
+            - {name: wrist_roll, minimum_rad: -2.700, maximum_rad: 2.800}
+        options:
+            # Stable by-id path: the two USB-single-serial adapters enumerate in
+            # board-dependent order, so ttyACM0/ttyACM1 can swap across reboots.
+            port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14113459-if00
+            arm_ids: "1,2,3,4,5"
+            arm_calibration: so101_calibration.json
+            max_velocity_rad_s: 1.0
+    effector:
+        driver: so101_gripper
+        device_id: linksee_gripper
+        resource_id: linksee_so101_serial
+        channels: [gripper]
+        feedback: position
+        tolerance: 0.02
+        timeout_s: 5
+        maximum_age_s: 0.2
+        options:
+            # Same adapter as the arm: one serial bus carries all six servos.
+            port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14113459-if00
+            gripper_id: 6
+            gripper_calibration: so101_gripper_calibration.json
+            max_velocity_rad_s: 1.0
+            grip_load_threshold: 100
+steps: []

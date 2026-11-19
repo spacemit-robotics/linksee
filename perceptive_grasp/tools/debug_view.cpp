@@ -140,8 +140,7 @@ static DebugViewConfig LoadDebugViewConfig(const std::string& config_path) {
             throw std::runtime_error("camera.mujoco configuration is required");
         }
         auto& settings = config.camera.mujoco;
-        settings.xml_path = mujoco["xml_path"].as<std::string>(
-            settings.xml_path);
+        settings.device_plan = root["manipulator"]["mujoco"]["device_plan"].as<std::string>();
         settings.camera_name = mujoco["camera_name"].as<std::string>(
             settings.camera_name);
         settings.width = mujoco["width"].as<int>(settings.width);
@@ -180,7 +179,7 @@ static DebugViewConfig LoadDebugViewConfig(const std::string& config_path) {
                     &config.camera.spacemit_las2.model_path);
     ResolveConfigPath(config_dir,
                     &config.camera.spacemit_las2.calib_path);
-    ResolveConfigPath(config_dir, &config.camera.mujoco.xml_path);
+    ResolveConfigPath(config_dir, &config.camera.mujoco.device_plan);
     ResolveConfigPath(config_dir, &config.detection_config_path);
     return config;
 }

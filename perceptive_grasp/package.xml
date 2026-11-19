@@ -10,6 +10,7 @@
 
   <depend>opencv</depend>
   <depend>yaml-cpp</depend>
+  <depend>manipulation</depend>
 
   <exec_depend>python3</exec_depend>
 

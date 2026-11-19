@@ -3,18 +3,18 @@
     * SPDX-License-Identifier: Apache-2.0
     *
     * @file debug_grasp.cpp
-    * @brief 单独测试抓取规划与执行流程
+    * @brief 单独运行目标感知与抓取规划
     *
     * 功能:
     *   1. 打开 RealSense + VisionService
     *   2. 检测目标并完成定位/规划
     *   3. 打印预抓取位、抓取位和 IK 结果
-    *   4. 默认只做 dry-run，不移动机械臂
-    *   5. 使用 --execute 时才真正执行抓取
-    *   6. 使用 --step 时每步暂停确认，便于安全测试
+    *   4. 只进行规划，不执行机械臂动作；不支持 --execute
+    *   5. 使用 --step 时在规划完成后暂停，等待确认退出
     */
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>  // NOLINT(build/c++17)
@@ -24,6 +24,7 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -41,9 +42,14 @@
 #include "vision_service.h"
 #include "vision_result_adapter.h"
 
-extern "C" {
-#include "kinematics_interface.h"
-}
+#include "executor_kinematics.h"
+using perceptive_grasp::ExecutorKinematics;
+using perceptive_grasp::PlanningPose;
+using perceptive_grasp::PlanningJoints;
+using perceptive_grasp::PlanningJointCount;
+using perceptive_grasp::PlanningJointLimits;
+using perceptive_grasp::PlanningInverse;
+using perceptive_grasp::kKinematicsOk;
 
 namespace fs = std::filesystem;
 using perceptive_grasp::ComputeGraspPixel;
@@ -85,12 +91,14 @@ struct DebugGraspAppConfig {
     std::string output_dir = "./debug_grasp_output";
     int warmup_frames = 30;
     int detect_frames = 1;
-    bool execute = false;
+    bool help = false;
     bool step = false;
     bool save_images = true;
 };
 
 struct IKConfig {
+    std::string model;
+    std::string solver = "eigen";
     std::string urdf_path;
     std::string base_link = "base_link";
     std::string tip_link = "gripper_frame_link";
@@ -154,39 +162,65 @@ static std::optional<std::pair<cv::Point, uint16_t>> FindValidDepthInBox(
     return best;
 }
 
+static void PrintUsage(const char* program) {
+    std::cout << "Usage: " << program << " [options]\n"
+                << "Perception and planning only; never commands the arm.\n"
+                << "Normal operation opens a RealSense camera.\n"
+                << "Options:\n"
+                << "  --config <yaml>     Pipeline config (default: ../config/grasp_pipeline.yaml)\n"
+                << "  --target <name>     Target label (empty: any label)\n"
+                << "  --output <dir>      Output directory\n"
+                << "  --warmup <N>        Warmup frames, N >= 0 (default: 30)\n"
+                << "  --frames <N>        Capture frames, N >= 1 (default: 1)\n"
+                << "  --step              Wait for Enter after planning\n"
+                << "  --no-save           Do not save images\n"
+                << "  --help, -h          Show this help without opening devices\n"
+                << "  --execute           Unsupported; rejected before opening devices\n";
+}
+
+static int ParseFrameCount(const std::string& option, const std::string& value,
+                            int minimum) {
+    const char* first = value.data();
+    const char* last = first + value.size();
+    if (first != last && *first == '+') ++first;
+    int count = 0;
+    const auto result = std::from_chars(first, last, count);
+    if (first == last || (value.front() == '+' && (*first < '0' || *first > '9')) ||
+        result.ec != std::errc() || result.ptr != last || count < minimum) {
+        throw std::invalid_argument(option + " requires a decimal integer >= " +
+                                    std::to_string(minimum));
+    }
+    return count;
+}
+
 static DebugGraspAppConfig ParseArgs(int argc, char* argv[]) {
     DebugGraspAppConfig cfg;
     cfg.config_path = kDefaultConfigPath;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: " << argv[0] << " [options]\n"
-                        << "Options:\n"
-                        << "  --config <yaml>     Pipeline config (default: ../config/grasp_pipeline.yaml)\n"
-                        << "  --target <name>     Target label (e.g. apple)\n"
-                        << "  --output <dir>      Output directory\n"
-                        << "  --warmup <N>        Warmup frames (default: 30)\n"
-                        << "  --frames <N>        Number of frames to capture (default: 1)\n"
-                        << "  --execute           Actually move arm and grasp\n"
-                        << "  --step              Pause before execute\n"
-                        << "  --no-save           Do not save images\n";
-            std::exit(0);
-        } else if (arg == "--config" && i + 1 < argc) {
-            cfg.config_path = argv[++i];
-        } else if (arg == "--target" && i + 1 < argc) {
-            cfg.target_name = argv[++i];
-        } else if (arg == "--output" && i + 1 < argc) {
-            cfg.output_dir = argv[++i];
-        } else if (arg == "--warmup" && i + 1 < argc) {
-            cfg.warmup_frames = std::atoi(argv[++i]);
-        } else if (arg == "--frames" && i + 1 < argc) {
-            cfg.detect_frames = std::atoi(argv[++i]);
-        } else if (arg == "--execute") {
-            cfg.execute = true;
+            cfg.help = true;
         } else if (arg == "--step") {
             cfg.step = true;
         } else if (arg == "--no-save") {
             cfg.save_images = false;
+        } else if (arg == "--config" || arg == "--target" || arg == "--output" ||
+                    arg == "--warmup" || arg == "--frames") {
+            if (i + 1 >= argc || std::string(argv[i + 1]).rfind("--", 0) == 0 ||
+                std::string(argv[i + 1]) == "-h") {
+                throw std::invalid_argument("missing value for " + arg);
+            }
+            const std::string value = argv[++i];
+            if (value.empty() && arg != "--target") {
+                throw std::invalid_argument("empty value for " + arg);
+            }
+            if (arg == "--config") cfg.config_path = value;
+            if (arg == "--target") cfg.target_name = value;
+            if (arg == "--output") cfg.output_dir = value;
+            if (arg == "--warmup") cfg.warmup_frames = ParseFrameCount(arg, value, 0);
+            if (arg == "--frames") cfg.detect_frames = ParseFrameCount(arg, value, 1);
+        } else {
+            throw std::invalid_argument("unknown argument: " + arg);
         }
     }
     return cfg;
@@ -240,6 +274,10 @@ static IKConfig LoadIkConfig(const std::string& pipeline_config) {
 
     auto m = root["manipulator"];
     if (m) {
+        cfg.model = m["model"].as<std::string>("");
+        if (!cfg.model.empty()) cfg.model =
+            fs::absolute(fs::path(pipeline_config).parent_path() / cfg.model).string();
+        cfg.solver = m["kinematics_solver"].as<std::string>(cfg.solver);
         cfg.urdf_path = m["urdf_path"].as<std::string>(cfg.urdf_path);
         cfg.base_link = m["base_link"].as<std::string>(cfg.base_link);
         cfg.tip_link = m["tip_link"].as<std::string>(cfg.tip_link);
@@ -263,16 +301,15 @@ static std::optional<std::vector<double>> SolveArmIk(const IKConfig& cfg,
         return std::nullopt;
     }
 
-    kin_solver_t* kin = kin_create(nullptr,
-                                    cfg.urdf_path.c_str(),
-                                    cfg.base_link.c_str(),
-                                    cfg.tip_link.c_str());
-    if (!kin) {
-        extra_info = "kin_create failed";
+    std::unique_ptr<ExecutorKinematics> kin;
+    try {
+        kin = std::make_unique<ExecutorKinematics>(cfg.model, cfg.solver);
+    } catch (const std::exception& error) {
+        extra_info = error.what();
         return std::nullopt;
     }
 
-    kin_pose_t target{};
+    PlanningPose target{};
     target.x = pose.x;
     target.y = pose.y;
     target.z = pose.z;
@@ -281,11 +318,10 @@ static std::optional<std::vector<double>> SolveArmIk(const IKConfig& cfg,
     target.qy = pose.qy;
     target.qz = pose.qz;
 
-    kin_joints_t out{};
-    int ret = kin_inverse(kin, &target, nullptr, nullptr, &out);
-    if (ret != KIN_OK) {
+    PlanningJoints out{};
+    int ret = PlanningInverse(kin.get(), &target, nullptr, nullptr, &out);
+    if (ret != kKinematicsOk) {
         extra_info = "kin_inverse failed: " + std::to_string(ret);
-        kin_destroy(kin);
         return std::nullopt;
     }
 
@@ -307,7 +343,6 @@ static std::optional<std::vector<double>> SolveArmIk(const IKConfig& cfg,
         extra_info.clear();
     }
 
-    kin_destroy(kin);
     return arm_joints;
 }
 
@@ -315,23 +350,20 @@ static bool GetJointLimit(const IKConfig& cfg, int joint_index,
                             double& lower, double& upper) {
     if (cfg.urdf_path.empty()) return false;
 
-    kin_solver_t* kin = kin_create(nullptr,
-                                    cfg.urdf_path.c_str(),
-                                    cfg.base_link.c_str(),
-                                    cfg.tip_link.c_str());
-    if (!kin) return false;
+    std::unique_ptr<ExecutorKinematics> kin;
+    try {
+        kin = std::make_unique<ExecutorKinematics>(cfg.model, cfg.solver);
+    } catch (...) { return false; }
 
-    int n_joints = kin_get_num_joints(kin);
+    int n_joints = PlanningJointCount(kin.get());
     if (joint_index < 0 || joint_index >= n_joints) {
-        kin_destroy(kin);
         return false;
     }
 
     std::vector<double> lowers(n_joints), uppers(n_joints);
-    kin_get_joint_limits(kin, lowers.data(), uppers.data());
+    PlanningJointLimits(kin.get(), lowers.data(), uppers.data());
     lower = lowers[joint_index];
     upper = uppers[joint_index];
-    kin_destroy(kin);
     return true;
 }
 
@@ -367,8 +399,21 @@ static bool WaitEnter(const std::string& msg) {
 }
 
 int main(int argc, char* argv[]) {
+    // Reject motion requests before config, filesystem or camera initialization,
+    // including when combined with help or malformed options.
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--execute") {
+            std::cerr << "[debug_grasp] --execute is not supported; "
+                        << "this tool performs perception and planning only." << std::endl;
+            return 2;
+        }
+    }
     try {
         DebugGraspAppConfig app = ParseArgs(argc, argv);
+        if (app.help) {
+            PrintUsage(argv[0]);
+            return 0;
+        }
         if (app.config_path.empty()) {
             std::cerr << "[debug_grasp] Error: --config is required" << std::endl;
             return 1;
@@ -675,14 +720,6 @@ int main(int argc, char* argv[]) {
             prefix << app.output_dir << "/debug_grasp";
             cv::imwrite(prefix.str() + "_color.png", color);
             cv::imwrite(prefix.str() + "_annotated.png", annotated);
-        }
-
-        if (app.execute) {
-            std::cerr
-                << "[debug_grasp] --execute is temporarily disabled on K3 "
-                << "for stability; use this tool for dry-run "
-                << "planning/localization only." << std::endl;
-            return 2;
         }
 
         if (app.step) {

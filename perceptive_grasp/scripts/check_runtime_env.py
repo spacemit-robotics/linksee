@@ -102,7 +102,7 @@ def _find_simulation_server(build_dir: str = "") -> str:
 
 def check_mujoco_simulation(root: Dict[str, Any], config_path: str,
                             build_dir: str = "") -> bool:
-    """Check the local MuJoCo service and scene paths."""
+    """Check the local simulation service and public device plan."""
     server = _find_simulation_server(build_dir)
     ok = status(
         bool(server),
@@ -111,27 +111,17 @@ def check_mujoco_simulation(root: Dict[str, Any], config_path: str,
     )
 
     config_dir = os.path.dirname(os.path.abspath(config_path))
-    configured_paths = []
-    camera = root.get("camera", {}) if isinstance(root, dict) else {}
-    manipulator = root.get("manipulator", {}) \
-        if isinstance(root, dict) else {}
-    for field, profile in (
-            ("camera.mujoco.xml_path", camera.get("mujoco", {})),
-            ("manipulator.mujoco.xml_path",
-             manipulator.get("mujoco", {}))):
-        value = profile.get("xml_path", "") \
-            if isinstance(profile, dict) else ""
-        resolved = expand_config_path(str(value))
-        if resolved and not os.path.isabs(resolved):
-            resolved = os.path.normpath(os.path.join(config_dir, resolved))
-        configured_paths.append((field, resolved))
-
-    for field, scene_path in configured_paths:
-        ok &= status(
-            bool(scene_path) and os.path.isfile(scene_path),
-            field,
-            scene_path or "not configured",
-        )
+    manipulator = root.get("manipulator", {}) if isinstance(root, dict) else {}
+    profile = manipulator.get("mujoco", {}) if isinstance(manipulator, dict) else {}
+    value = profile.get("device_plan", "") if isinstance(profile, dict) else ""
+    resolved = expand_config_path(str(value))
+    if resolved and not os.path.isabs(resolved):
+        resolved = os.path.normpath(os.path.join(config_dir, resolved))
+    ok &= status(
+        bool(resolved) and os.path.isfile(resolved),
+        "manipulator.mujoco.device_plan",
+        resolved or "not configured",
+    )
     return ok
 
 
@@ -363,62 +353,13 @@ def _same_device(configured: str, detected: str) -> bool:
     return configured == detected or os.path.realpath(configured) == os.path.realpath(detected)
 
 
-def _probe_so101_device(device: str, sdk_root: str,
-                        build_dir: str = "") -> bool:
-    project_root = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), os.pardir))
-    tool_candidates = []
-    if build_dir:
-        tool_candidates.append(os.path.join(
-            os.path.abspath(os.path.expanduser(build_dir)), "read_joints"))
-    installed_bin = os.path.abspath(os.path.join(
-        os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, "bin"))
-    tool_candidates.extend([
-        os.path.join(installed_bin, "read_joints"),
-        os.path.join(project_root, "build", "read_joints"),
-    ])
-    tool_candidates.extend(sorted(glob.glob(
-        os.path.join(project_root, "build*", "read_joints"))))
-    path_tool = shutil.which("read_joints")
-    if path_tool:
-        tool_candidates.append(path_tool)
-    tool = next((path for path in tool_candidates
-                 if os.path.isfile(path) and os.access(path, os.X_OK)), "")
-    if not tool:
-        return False
-
-    try:
-        result = subprocess.run(
-            [tool, "--device", device, "--baudrate", "1000000"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=8,
-            cwd=project_root,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-    output = (result.stdout or "") + (result.stderr or "")
-    if "read failed" in output.lower():
-        return False
-    match = re.search(r"Current joints \(rad\): \[([^\]]+)\]", output)
-    if not match:
-        return False
-    try:
-        joints = [float(part.strip()) for part in match.group(1).split(",")]
-    except ValueError:
-        return False
-    if len(joints) < 5:
-        return False
-    return not all(value < -3.0 for value in joints[:5])
-
-
 def check_serial_role_configuration(manipulator_device: str,
                                     mobile_base_device: str,
                                     mobile_base_enabled: bool,
                                     sdk_root: str,
                                     build_dir: str = "") -> bool:
+    # Device discovery must not probe unconfigured ports or bypass DeviceSession leases.
+    del sdk_root, build_dir
     devices = sorted(glob.glob("/dev/ttyACM*"))
     links_by_target = _serial_by_id_links()
     properties_by_device = {
@@ -434,11 +375,8 @@ def check_serial_role_configuration(manipulator_device: str,
         if _is_usb_single_serial(properties) and device not in camera_devices
     ]
 
-    detected_arm = ""
-    for device in serial_candidates:
-        if _probe_so101_device(device, sdk_root, build_dir):
-            detected_arm = device
-            break
+    detected_arm = next((device for device in serial_candidates
+                         if _same_device(manipulator_device, device)), "")
 
     inferred_base = ""
     if detected_arm:
@@ -451,21 +389,17 @@ def check_serial_role_configuration(manipulator_device: str,
     manip_is_camera = any(_same_device(manipulator_device, device)
                           for device in camera_devices)
     if manip_is_camera:
-        ok &= status(False, "manipulator.uart_device role",
+        ok &= status(False, "manipulator.device_plan port",
                      f"{manipulator_device} is a camera serial")
-    elif detected_arm and not _same_device(manipulator_device, detected_arm):
-        ok &= status(False, "manipulator.uart_device role",
-                     f"SO101 responds on {detected_arm}")
     elif detected_arm:
-        ok &= status(True, "manipulator.uart_device role",
-                     f"SO101 responds on {detected_arm}")
+        ok &= status(True, "manipulator.device_plan port",
+                     f"configured serial {detected_arm}; not opened")
     elif serial_candidates:
-        ok &= status(False, "manipulator.uart_device role",
-                     "SO101 did not respond on USB serial candidates; "
-                     "check arm power, cable, and uart_device")
+        ok &= status(False, "manipulator.device_plan port",
+                     "configured port not among USB serial devices")
 
     if detected_arm:
-        print("[SUGGEST] manipulator.uart_device: "
+        print("[SUGGEST] device.arm.options.port and device.effector.options.port: "
               f"\"{_preferred_device_path(detected_arm, links_by_target)}\"")
 
     if mobile_base_enabled:
@@ -476,7 +410,7 @@ def check_serial_role_configuration(manipulator_device: str,
                          f"{mobile_base_device} is a camera serial")
         elif detected_arm and _same_device(mobile_base_device, detected_arm):
             ok &= status(False, "mobile_base.dev_path role",
-                         f"{mobile_base_device} is the SO101 manipulator port")
+                         f"{mobile_base_device} is the configured arm port")
         elif inferred_base and not _same_device(mobile_base_device, inferred_base):
             ok &= status(False, "mobile_base.dev_path role",
                          f"expected chassis candidate {inferred_base}")
@@ -510,7 +444,7 @@ def report_serial_devices(manipulator_device: str = "",
         real_device = os.path.realpath(device)
         if manipulator_device and (
                 device == manipulator_device or real_device == manipulator_target):
-            roles.append("manipulator.uart_device")
+            roles.append("manipulator.device_plan port")
         if mobile_base_device and (
                 device == mobile_base_device or real_device == mobile_base_target):
             roles.append("mobile_base.dev_path")
@@ -528,7 +462,7 @@ def report_serial_devices(manipulator_device: str = "",
 
 
 def check_tty(device: str, fixer: RuntimeFixer | None = None,
-              label: str = "manipulator.uart_device") -> bool:
+              label: str = "manipulator.device_plan port") -> bool:
     ok = True
     devices = sorted(glob.glob("/dev/ttyACM*"))
     ok &= status(bool(devices), "/dev/ttyACM*", " ".join(devices) or "not found")
@@ -585,20 +519,35 @@ def check_rpmsg_device(ctrl_dev: str,
     return ok
 
 
-def check_chassis_driver_registered(sdk_root: str, driver: str) -> bool:
+def check_chassis_driver_registered(sdk_root: str, driver: str,
+                                    build_dir: str = "") -> bool:
     if not driver or driver == "none":
         return True
 
-    lib_path = os.path.join(sdk_root, "output", "staging", "lib",
-                            "libchassis.so")
+    # drv_uart_esp32 is compiled into perceptive_grasp from src/chassis/, so a
+    # staging libchassis.so no longer proves anything about it. Look in the
+    # application binary first, then fall back to the component library for
+    # drivers that still ship there.
+    candidates = []
+    if build_dir:
+        candidates.append(os.path.join(
+            os.path.abspath(os.path.expanduser(build_dir)),
+            "perceptive_grasp_core"))
+    candidates.append(os.path.join(sdk_root, "output", "staging", "lib",
+                                   "libchassis.so"))
+    lib_path = next((path for path in candidates if os.path.isfile(path)), "")
+    if not lib_path:
+        return status(False, "chassis driver " + driver,
+                      "neither perceptive_grasp_core nor libchassis.so found")
+
     try:
         with open(lib_path, "rb") as f:
             data = f.read()
     except OSError as exc:
-        return status(False, "libchassis.so", f"{lib_path}: {exc}")
+        return status(False, "chassis driver " + driver, f"{lib_path}: {exc}")
 
     registered = driver.encode("utf-8") in data
-    detail = "registered" if registered else "not registered in libchassis.so"
+    detail = "registered" if registered else f"not registered in {lib_path}"
     return status(registered, f"chassis driver {driver}", detail)
 
 
@@ -752,6 +701,22 @@ def check_application_binaries(build_dir: str = "") -> bool:
     return ok
 
 
+def _cmake_option_value(build_dir: str, option: str) -> str:
+    """Read one CMake cache entry without requiring a configured build tree."""
+    if not build_dir:
+        return ""
+    cache = os.path.join(
+        os.path.abspath(os.path.expanduser(build_dir)), "CMakeCache.txt")
+    try:
+        with open(cache, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith(option + ":"):
+                    return line.split("=", 1)[-1].strip()
+    except OSError:
+        return ""
+    return ""
+
+
 def check_voice_echo_cancellation(root: Dict[str, Any],
                                   build_dir: str = "") -> bool:
     voice = root.get("voice", {}) if isinstance(root, dict) else {}
@@ -788,6 +753,19 @@ def check_voice_echo_cancellation(root: Dict[str, Any],
             project_root, "build*", "libperceptive_voice_aec.so")))
     library = next((path for path in candidates if path and os.path.isfile(path)), "")
     if not library:
+        # The library only exists when the build enabled ENABLE_WEBRTC_AEC, so a
+        # missing file usually means the option is OFF rather than a broken
+        # environment. Report that state instead of asking for meson/ninja again.
+        enabled = _cmake_option_value(build_dir, "ENABLE_WEBRTC_AEC")
+        if enabled.upper() in ("OFF", "0", "FALSE", "NO"):
+            return status(
+                False,
+                "WebRTC AEC library",
+                f"mode=webrtc_aec but this build has "
+                f"ENABLE_WEBRTC_AEC={enabled}; rebuild with "
+                f"-DENABLE_WEBRTC_AEC=ON or set "
+                f"voice.echo_cancellation.mode=half_duplex",
+            )
         return status(
             False,
             "WebRTC AEC library",
@@ -1033,48 +1011,41 @@ def infer_sdk_root(start_path: str) -> str:
     return ""
 
 
-def check_kinematics_backend(sdk_root: str) -> bool:
-    if not sdk_root:
-        return status(False, "SDK_ROOT", "source build/envsetup.sh first")
+def configured_arm_port(root: Dict[str, Any], config_path: str) -> str:
+    """Resolve the device plan's transport without opening or changing the device."""
+    manipulator = root.get("manipulator", {})
+    plan_path = expand_config_path(manipulator.get("device_plan", ""))
+    if not plan_path:
+        # Show legacy configuration in diagnostics; the model check still requires a new plan.
+        return expand_config_path(manipulator.get("uart_device", ""))
+    if not os.path.isabs(plan_path):
+        plan_path = os.path.join(os.path.dirname(os.path.abspath(config_path)), plan_path)
+    device = load_yaml(plan_path).get("device", {})
+    arm = device.get("arm", {})
+    options = arm.get("options", device.get("options", {}))
+    port = expand_config_path(options.get("port", ""))
+    if port and not os.path.isabs(port):
+        port = os.path.normpath(os.path.join(os.path.dirname(plan_path), port))
+    return port
 
-    lib_path = os.path.join(sdk_root, "output", "staging", "lib",
-                            "libmanipulator.so")
-    if not os.path.exists(lib_path):
-        return status(False, "libmanipulator.so",
-                      f"{lib_path} not found; build "
-                      "components/control/manipulator")
 
-    nm = subprocess.run(["nm", "-D", lib_path],
-                        check=False, capture_output=True, text=True)
-    symbols = (nm.stdout or "") + (nm.stderr or "")
-    has_pinocchio_symbol = "pinocchio" in symbols.lower()
-    ok = status(has_pinocchio_symbol, "pinocchio backend in libmanipulator",
-                "" if has_pinocchio_symbol
-                else "rebuild manipulator after installing pinocchio")
-
-    ldd = subprocess.run(["ldd", lib_path],
-                         check=False, capture_output=True, text=True)
-    linked_libraries = (ldd.stdout or "") + (ldd.stderr or "")
-    missing_libraries = [
-        line.strip()
-        for line in linked_libraries.splitlines()
-        if "not found" in line
-    ]
-    ok &= status(not missing_libraries, "libmanipulator runtime libraries",
-                 "; ".join(missing_libraries))
-
-    cache_path = os.path.join(sdk_root, "output", "build", "cmake", "pkgs",
-                              "components_control_manipulator", "CMakeCache.txt")
-    cache = _read_text_file(cache_path)
-    if "pinocchio_DIR:PATH=pinocchio_DIR-NOTFOUND" in cache:
-        ok &= status(False, "pinocchio CMake package",
-                     "pinocchio_DIR-NOTFOUND")
-    elif cache:
-        ok &= status(True, "pinocchio CMake package")
-    else:
-        status(False, "pinocchio CMake package",
-               f"{cache_path} not found")
-    return ok
+def check_kinematics_backend(sdk_root: str, config_path: str = "config/grasp_pipeline.yaml",
+                             build_dir: str = "") -> bool:
+    """Load the public model/backend through the offline application probe, without a device."""
+    del sdk_root  # Installation layout and dynamic linking are owned by the executable.
+    directory = os.path.abspath(os.path.expanduser(build_dir or "build"))
+    binary = os.path.join(directory, "debug_ik")
+    if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+        return status(False, "manipulation kinematics", f"{binary} missing or not executable")
+    try:
+        result = subprocess.run(
+            [binary, "--config", os.path.abspath(config_path), "--check-model"],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return status(False, "manipulation kinematics", str(error))
+    return status(result.returncode == 0, "manipulation kinematics",
+                  ((result.stdout or "") + (result.stderr or "")).strip())
 
 
 def list_audio_devices() -> bool:
@@ -1121,8 +1092,7 @@ def main() -> int:
     camera = root.get("camera", {}) if isinstance(root, dict) else {}
     camera_type = str(camera.get("type", "realsense"))
     camera_type = {"d435i": "realsense"}.get(camera_type, camera_type)
-    manip = root.get("manipulator", {}) if isinstance(root, dict) else {}
-    device = manip.get("uart_device", "/dev/ttyACM0")
+    device = ""
     mobile_base = root.get("mobile_base", {}) if isinstance(root, dict) else {}
     mobile_base_enabled = bool(mobile_base.get("enabled", False))
     mobile_base_driver = mobile_base.get("driver", "drv_uart_esp32")
@@ -1152,14 +1122,19 @@ def main() -> int:
     elif camera_type == "mujoco":
         ok &= check_mujoco_simulation(root, args.config, args.build_dir)
     else:
+        try:
+            device = configured_arm_port(root, args.config)
+        except (OSError, ValueError, AttributeError) as error:
+            ok &= status(False, "manipulator.device_plan", str(error))
         report_serial_devices(device, mobile_base_device)
         ok &= check_serial_role_configuration(
             device, mobile_base_device, mobile_base_is_uart, sdk_root,
             args.build_dir)
-        ok &= check_tty(device, fixer, "manipulator.uart_device")
+        if device:
+            ok &= check_tty(device, fixer, "manipulator.device_plan port")
         if mobile_base_enabled:
             ok &= check_chassis_driver_registered(
-                sdk_root, mobile_base_driver)
+                sdk_root, mobile_base_driver, args.build_dir)
         if mobile_base_is_uart:
             ok &= check_tty(
                 mobile_base_device, fixer, "mobile_base.dev_path")
@@ -1175,7 +1150,7 @@ def main() -> int:
     elif camera_type == "realsense":
         ok &= check_realsense_camera()
     if camera_type not in ("mujoco", "remote_mujoco"):
-        ok &= check_kinematics_backend(sdk_root)
+        ok &= check_kinematics_backend(sdk_root, args.config, args.build_dir)
 
     if not args.skip_voice:
         required_modules = [

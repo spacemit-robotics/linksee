@@ -168,24 +168,86 @@ python3 scripts/check_runtime_env.py \
 
 单步模式会在每次真实动作前等待确认。程序完成规划并提示“即将移动到预抓取位”时输入 `n`，可在不执行接近和抓取动作的情况下结束检查，机械臂随后返回 home 位。输入流意外关闭时，程序同样中止任务并执行安全归位。
 
-出现 `out of workspace` 时，先检查手眼标定和目标深度，再核对 `grasp.workspace`。出现 `IK failed` 时，检查 `manipulator.urdf_path`、机械臂当前姿态和目标位姿；不要通过扩大工作空间绕过机械结构限制。
+出现 `out of workspace` 时，先检查手眼标定和目标深度，再核对 `grasp.workspace`。出现 `IK failed` 时，检查 `manipulator.model` 引用的关节链、机械臂当前姿态和目标位姿；不要通过扩大工作空间绕过机械结构限制。
+
+只加载模型和求解器，不连接设备：
+
+```bash
+./build/debug_ik --config config/grasp_pipeline.yaml --check-model
+```
+
+`unknown kinematics backend: <name>` 表示 `manipulation` 未注册配置中 `kinematics_solver` 指定的后端。默认的 `eigen` 后端随组件默认构建；若改用 `pinocchio`，需重新构建组件时开启 `MANIPULATION_ENABLE_KINEMATICS_PINOCCHIO`，再重新构建应用。
+`joint reference is uncalibrated` 表示设备没有匹配的舵机校准文件；不能通过跳过标定采集检查解决。
 
 ## 5. 排查机械臂执行
 
-### 5.1 读取当前关节角
+### 5.1 连接、使能与报错含义
 
-使用配置文件中的稳定串口路径读取机械臂状态：
+管线启动时连接设备，随后**默认给机械臂和夹爪上扭矩**，所以直接运行不需要先手动使能。用
+`--no-enable` 或 `--plan-only` 可关闭，此时只连接、只读状态。
 
 ```bash
-./build/read_joints \
-  --device /dev/serial/by-id/usb-1a86_USB_Single_Serial_5A7A057974-if00
+manipulation inspect       # 只读；看 enabled / fault / latched
 ```
 
-工具输出弧度、角度和可写入 yaml 的关节数组。读取失败时，检查串口是否被其他进程占用，并重新运行环境检查确认机械臂能够响应。
+使能会锁住扭矩，机械臂保持当前姿态并抗外力。执行前清理工作空间，确认可随时切断驱动电源。
+扭矩状态由舵机保持，一次使能后反复运行管线不必重新使能。
 
-### 5.2 验证小范围运动
+三条报错的含义和下一步：
 
-**该步骤会驱动真实机械臂。清理工作空间，并确保可以立即切断驱动电源。**
+| 报错 | 含义 | 下一步 |
+| --- | --- | --- |
+| `arm is not enabled; run ...` | 本次没有使能（用了 `--no-enable`，或使能被驱动拒绝） | 去掉 `--no-enable` 重跑；或先 `manipulation enable <plan>` |
+| `grasp device latched ... rerun the command` | 本进程内已因更早的错误锁存，后续调用全被拒 | 看**第一条**失败的 detail；重跑命令即干净重连，无需重启或重插 |
+| `cannot open <port>: serial port does not exist` | 配置的串口不存在 | `ls -l /dev/serial/by-id/`，把完整路径写进 `device.yaml` |
+
+`manipulation enable <plan>` 和 `manipulation hand-enable <plan>` 分别给机械臂和夹爪上扭矩。
+
+### 5.2 串口设备名错位
+
+同机接多个 USB 串口时，`/dev/ttyACM0` 和 `ttyACM1` 谁是谁由枚举顺序决定，**每次插拔都可能
+互换**。配置写死 `ttyACM0` 的话，某天就会指向别的设备：
+
+```
+[Feetech] Read paras failed! ID: 1, Addr: 0
+read SO101 motor 1 failed: no reply on /dev/ttyACM0 — ...
+```
+
+按 USB 序列号固定路径即可避免。`/dev/serial/by-id/` 由系统自动维护，不插拔就不会变：
+
+```bash
+ls -l /dev/serial/by-id/
+# usb-1a86_USB_Single_Serial_5B14113459-if00 -> ../../ttyACM1
+```
+
+把 `device.yaml` 的 `port` 改成这个完整路径。换线或换舵机板后序列号变了，要同步改配置。
+
+要判断某个口上是不是电机总线，直接发 Feetech PING 看有没有标准应答：
+
+```bash
+python3 - <<'PY'
+import serial
+def pkt(i):
+    body = bytes([i, 2, 0x01])
+    return b"\xff\xff" + body + bytes([(~sum(body)) & 0xFF])
+for port in ("/dev/ttyACM0", "/dev/ttyACM1"):
+    with serial.Serial(port, 1000000, timeout=0.2) as bus:
+        bus.reset_input_buffer()
+        bus.write(pkt(1))
+        print(port, bus.read(8).hex() or "no reply")
+PY
+```
+
+应答以 `ffff` 开头（例如 `ffff010200fc`）才是电机总线；读到一串 ASCII 文本说明那个口是别的
+设备。读参数失败但 PING 有应答，说明总线通、只是该 ID 的舵机没上电或不在这个总线上。
+
+### 5.3 只读查看关节角与验证小范围运动
+
+```bash
+./build/read_joints --plan config/devices/linksee_so101.yaml   # 只读，弧度为单位的关节数组
+```
+
+**下一步会驱动真实机械臂。清理工作空间，确保可立即切断驱动电源。**
 
 ```bash
 ./build/debug_execute_safe \
@@ -194,9 +256,11 @@ python3 scripts/check_runtime_env.py \
   --yaw 90
 ```
 
-首次测试使用交互确认，不要增加 `--yes`。工具先移动到观察姿态，再移动到指定位置；不会下探，也不会闭合夹爪。
+首次测试用交互确认，不要加 `--yes`。工具先到观察姿态再到指定位置，不下探、不闭合夹爪。
 
-如果 IK 成功但机械臂不动，使用主程序 `--debug` 日志检查串口、舵机响应和动作超时。机械臂运动方向或关节姿态异常时，停止运行并重新核对 URDF、关节零位和预定义姿态。
+机械臂不动或姿态异常时，停止运行，核对 URDF、关节零位和预定义姿态。执行中出现反馈故障或
+超时后，程序请求保持并锁存，后续目标被拒绝：先排除故障、确认现场安全，再重新启动。真机
+执行器的 `EmergencyStop()` 只请求保持并锁存，不释放力矩，也不替代实体急停。
 
 ## 6. 排查底盘辅助对齐
 

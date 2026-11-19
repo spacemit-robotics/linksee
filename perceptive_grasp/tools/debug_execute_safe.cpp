@@ -20,9 +20,7 @@
 
 #include "grasp_executor.h"
 
-extern "C" {
-#include "kinematics_interface.h"
-}
+#include "executor_kinematics.h"
 
 namespace fs = std::filesystem;
 using perceptive_grasp::ExecutorConfig;
@@ -31,6 +29,14 @@ using perceptive_grasp::GraspResult;
 using perceptive_grasp::JointConstraint;
 using perceptive_grasp::Pose3D;
 using perceptive_grasp::SupportPlane;
+using perceptive_grasp::PlanningPose;
+using perceptive_grasp::PlanningJoints;
+using perceptive_grasp::PlanningInverseOptions;
+using perceptive_grasp::PlanningJointCount;
+using perceptive_grasp::PlanningJointLimits;
+using perceptive_grasp::PlanningInverse;
+using perceptive_grasp::kKinematicsOk;
+using perceptive_grasp::kKinematicsMaximumJoints;
 
 static constexpr const char* kDefaultConfigPath = "../config/grasp_pipeline.yaml";
 
@@ -238,8 +244,16 @@ static ExecutorConfig LoadExecutorConfig(const std::string& config_path) {
 
     if (auto m = root["manipulator"]) {
         cfg.manip_driver = m["driver"].as<std::string>(cfg.manip_driver);
-        cfg.uart_device = m["uart_device"].as<std::string>(cfg.uart_device);
-        cfg.baudrate = m["baudrate"].as<int>(cfg.baudrate);
+        const auto resolve = [&](const char* key) {
+            const auto value = m[key].as<std::string>("");
+            return value.empty() ? value :
+                fs::absolute(fs::path(config_path).parent_path() / value).string();
+        };
+        cfg.device_plan = resolve("device_plan");
+        cfg.model = resolve("model");
+        cfg.kinematics_solver = m["kinematics_solver"].as<std::string>(cfg.kinematics_solver);
+        cfg.gripper_command_duration_s = m["gripper_command_duration_s"].as<float>(
+            cfg.gripper_command_duration_s);
         cfg.urdf_path = m["urdf_path"].as<std::string>(cfg.urdf_path);
         cfg.base_link = m["base_link"].as<std::string>(cfg.base_link);
         cfg.tip_link = m["tip_link"].as<std::string>(cfg.tip_link);
@@ -367,7 +381,7 @@ int main(int argc, char* argv[]) {
         ExecutorConfig exec_cfg = LoadExecutorConfig(app.config_path);
 
         std::cout << "[debug_execute_safe] config: " << app.config_path << std::endl;
-        std::cout << "[debug_execute_safe] uart:   " << exec_cfg.uart_device << std::endl;
+        std::cout << "[debug_execute_safe] device: " << exec_cfg.device_plan << std::endl;
         std::cout << "[debug_execute_safe] urdf:   " << exec_cfg.urdf_path << std::endl;
         if (app.recover_held_object) {
             std::cout
@@ -625,7 +639,7 @@ int main(int argc, char* argv[]) {
             }
 
             // 构造 IK 目标
-            kin_pose_t ik_target;
+            PlanningPose ik_target;
             ik_target.x  = app.pre_grasp_pose.x;
             ik_target.y  = app.pre_grasp_pose.y;
             ik_target.z  = app.pre_grasp_pose.z;
@@ -634,22 +648,22 @@ int main(int argc, char* argv[]) {
             ik_target.qy = app.pre_grasp_pose.qy;
             ik_target.qz = app.pre_grasp_pose.qz;
 
-            kin_ik_params_t ik_params = {};
+            PlanningInverseOptions ik_params = {};
             ik_params.epsilon = 1e-3;
             ik_params.position_weight = 1.0;
             ik_params.timeout_s = 0.1;
 
             // 获取关节数和限位
-            int n_joints = kin_get_num_joints(executor.GetKinSolver());
+            int n_joints = PlanningJointCount(executor.GetKinSolver());
             std::vector<double> lower(n_joints), upper(n_joints);
-            kin_get_joint_limits(executor.GetKinSolver(), lower.data(), upper.data());
+            PlanningJointLimits(executor.GetKinSolver(), lower.data(), upper.data());
 
             std::mt19937 rng(42);
             std::vector<float> best_joints;
             bool found_valid = false;
 
             // 检查一组关节角是否满足所有约束
-            auto check_constraints = [&](const kin_joints_t& q) -> bool {
+            auto check_constraints = [&](const PlanningJoints& q) -> bool {
                 for (const auto& c : constraints) {
                     if (c.joint_index >= 0 && c.joint_index < q.count) {
                         float val = static_cast<float>(q.q[c.joint_index]);
@@ -660,7 +674,7 @@ int main(int argc, char* argv[]) {
             };
 
             for (int trial = 0; trial < max_trials; ++trial) {
-                kin_joints_t q_seed;
+                PlanningJoints q_seed;
                 q_seed.count = static_cast<uint8_t>(n_joints);
 
                 if (trial == 0) {
@@ -684,10 +698,10 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                kin_joints_t q_result;
-                int ik_ret = kin_inverse(executor.GetKinSolver(), &ik_target,
+                PlanningJoints q_result;
+                int ik_ret = PlanningInverse(executor.GetKinSolver(), &ik_target,
                                         &q_seed, &ik_params, &q_result);
-                if (ik_ret != KIN_OK) continue;
+                if (ik_ret != kKinematicsOk) continue;
 
                 // 检查所有关节约束
                 if (check_constraints(q_result)) {

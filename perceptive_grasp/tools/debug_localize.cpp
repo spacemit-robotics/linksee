@@ -267,8 +267,7 @@ static StereoCameraConfig LoadCameraConfig(
             throw std::runtime_error("camera.mujoco configuration is required");
         }
         auto& settings = config.mujoco;
-        settings.xml_path = mujoco["xml_path"].as<std::string>(
-            settings.xml_path);
+        settings.device_plan = root["manipulator"]["mujoco"]["device_plan"].as<std::string>();
         settings.camera_name = mujoco["camera_name"].as<std::string>(
             settings.camera_name);
         settings.width = mujoco["width"].as<int>(settings.width);
@@ -298,7 +297,7 @@ static StereoCameraConfig LoadCameraConfig(
     if (config_dir.empty()) config_dir = ".";
     ResolveConfigPath(config_dir, &config.spacemit_las2.model_path);
     ResolveConfigPath(config_dir, &config.spacemit_las2.calib_path);
-    ResolveConfigPath(config_dir, &config.mujoco.xml_path);
+    ResolveConfigPath(config_dir, &config.mujoco.device_plan);
     return config;
 }
 

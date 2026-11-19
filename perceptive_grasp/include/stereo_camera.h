@@ -45,7 +45,7 @@ struct SpacemitLas2CameraConfig {
 
 /** Configuration for the MuJoCo rendered camera backend. */
 struct MujocoCameraConfig {
-    std::string xml_path;
+    std::string device_plan;
     std::string camera_name = "cam";
     int width = 640;
     int height = 480;

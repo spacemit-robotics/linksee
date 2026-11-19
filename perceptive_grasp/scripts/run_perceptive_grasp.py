@@ -16,6 +16,7 @@ from typing import Sequence
 
 STRUCTURED_PREFIXES = (
     "[Main]",
+    "[Config]",
     "[Init]",
     "[Loop]",
     "[Stage ",
@@ -39,7 +40,7 @@ def should_keep_line(line: str) -> bool:
         return True
     if text.startswith("=== perceptive_grasp ==="):
         return True
-    if text.startswith(("Config:", "Target:")):
+    if text.startswith(("Config:", "Target:", "Mode:")):
         return True
     if text.startswith(("Usage:", "Options:", "Examples:", "  --", "  /")):
         return True
@@ -99,6 +100,8 @@ def _default_voice_bridge() -> str:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = (
         os.path.join(script_dir, "local_voice_bridge.py"),
+        os.path.normpath(os.path.join(
+            script_dir, "..", "share", "perceptive_grasp", "scripts", "local_voice_bridge.py")),
         os.path.join(os.getcwd(), "scripts", "local_voice_bridge.py"),
     )
     return next((path for path in candidates if os.path.isfile(path)),
