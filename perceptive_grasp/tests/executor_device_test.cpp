@@ -58,7 +58,12 @@ public:
             (state_->stale ? std::chrono::seconds(5) : std::chrono::seconds(0));
         return state_->arm;
     }
-    void Enable() override { ++state_->torque_writes; }
+    // Confirmed, counted and idempotent, like the shipped drivers which return early.
+    void Enable() override {
+        if (state_->arm.enabled) return;
+        ++state_->torque_writes;
+        state_->arm.enabled = true;
+    }
     void Submit(const manipulation::JointPoint& point) override {
         if (state_->reject_arm) throw manipulation::CommandRejected("test refusal");
         if (state_->block_arm) {
@@ -90,7 +95,11 @@ public:
         state_->gripper.received_at = manipulation::Clock::now();
         return state_->gripper;
     }
-    void Enable() override { ++state_->torque_writes; }
+    void Enable() override {
+        if (state_->gripper.enabled.value_or(false)) return;
+        ++state_->torque_writes;
+        state_->gripper.enabled = true;
+    }
     void Submit(const manipulation::EffectorPoint& point) override {
         ++state_->gripper_writes;
         if (state_->throw_gripper) throw std::runtime_error("partial write");
@@ -147,6 +156,7 @@ void ConnectionAndOwnership() {
     fixture.state->gripper.enabled = false;
     auto device = fixture.Device();
     device->Connect();
+    // Connection alone still takes no torque: the read-only path must stay read-only.
     assert(fixture.state->arm_writes == 0 && fixture.state->gripper_writes == 0);
     assert(fixture.state->torque_writes == 0 && fixture.state->holds == 0);
     assert(!device->ReadArm().enabled && !device->ReadGripper().enabled.value());
@@ -156,6 +166,38 @@ void ConnectionAndOwnership() {
     Reject([&] { device->FollowArm({0.1f}, 0.1); });
     assert(fixture.state->arm_writes == 0 && fixture.state->torque_writes == 0);
     assert(fixture.state->holds == 0);
+}
+
+void EnableTakesTorqueOnce() {
+    Fixture fixture;
+    // A freshly powered rig reports torque released on both roles.
+    fixture.state->arm.enabled = false;
+    fixture.state->gripper.enabled = false;
+    auto device = fixture.Device();
+    device->Connect();
+    assert(fixture.state->torque_writes == 0);
+    // One explicit enable writes torque to the arm and the jaws, and nothing else.
+    device->Enable();
+    assert(fixture.state->torque_writes == 2);
+    assert(fixture.state->arm_writes == 0 && fixture.state->gripper_writes == 0);
+    assert(fixture.state->holds == 0);
+    assert(device->ReadArm().enabled && device->ReadGripper().enabled.value());
+    // Already enabled: both drivers return before writing, so a repeat must not write again.
+    device->Enable();
+    assert(fixture.state->torque_writes == 2);
+    assert(!device->Failed());
+}
+
+void EnableWithoutConnectionOrInPositionModeIsRefused() {
+    Fixture fixture;
+    auto device = fixture.Device();
+    Reject([&] { device->Enable(); });
+    assert(fixture.state->torque_writes == 0 && fixture.state->holds == 0);
+    device->Connect();
+    // A device that cannot confirm position mode must not be handed torque silently.
+    fixture.state->arm.position_mode = false;
+    Reject([&] { device->Enable(); });
+    assert(device->Failed());
 }
 
 void FollowAndHold() {
@@ -324,6 +366,8 @@ void RefusedContinuationAndPartialWrite() {
 
 int main() {
     ConnectionAndOwnership();
+    EnableTakesTorqueOnce();
+    EnableWithoutConnectionOrInPositionModeIsRefused();
     FollowAndHold();
     ReadFailure(false, false);
     ReadFailure(true, false);

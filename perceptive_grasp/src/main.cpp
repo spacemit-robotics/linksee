@@ -185,6 +185,7 @@ static void PrintUsage(const char* prog) {
                 << "  --loop            Auto-loop; Ctrl+C returns home and exits\n"
                 << "  --step            Step mode: pause before each stage\n"
                 << "  --plan-only       Validate perception and arm path without motion\n"
+                << "  --no-enable       Connect the arm read-only instead of enabling it\n"
                 << "  --validate-config Validate configuration without initializing hardware\n"
                 << "  --remote-host <host>  Override remote_mujoco server host\n"
                 << "  --remote-port <port>  Override remote_mujoco server port\n"
@@ -684,6 +685,8 @@ static PipelineConfig LoadConfig(const std::string& config_path) {
             cfg.executor.urdf_path);
         cfg.executor.legacy_top_ik = m["legacy_top_ik"].as<bool>(
             cfg.executor.legacy_top_ik);
+        cfg.executor.enable_on_start = m["enable_on_start"].as<bool>(
+            cfg.executor.enable_on_start);
 
         // 解析 URDF 相对路径: 相对于配置文件所在目录
         if (!cfg.executor.urdf_path.empty() &&
@@ -1192,6 +1195,7 @@ int main(int argc, char* argv[]) {
     bool auto_loop = false;
     bool step_mode = false;
     bool plan_only = false;
+    bool no_enable = false;
     bool voice_mode = false;
     bool tts_mode = false;
     bool voice_stdin = false;
@@ -1229,6 +1233,8 @@ int main(int argc, char* argv[]) {
             step_mode = true;
         } else if (arg == "--plan-only") {
             plan_only = true;
+        } else if (arg == "--no-enable") {
+            no_enable = true;
         } else if (arg == "--validate-config") {
             validate_config_only = true;
         } else if (arg == "--remote-host" && i + 1 < argc) {
@@ -1283,6 +1289,7 @@ int main(int argc, char* argv[]) {
     }
     if (step_mode) std::cout << "Mode: step (pause before each stage)" << std::endl;
     if (plan_only) std::cout << "Mode: plan-only (no motion commands)" << std::endl;
+    if (no_enable) std::cout << "Mode: torque untouched (arm stays as found)" << std::endl;
     std::cout << std::endl;
 
     // 加载配置
@@ -1296,6 +1303,8 @@ int main(int argc, char* argv[]) {
     cfg.auto_loop = auto_loop;
     cfg.step_mode = step_mode;
     cfg.plan_only = plan_only;
+    // A planning-only run never moves, so it must not take torque either.
+    if (no_enable || plan_only) cfg.executor.enable_on_start = false;
     if (plan_only) cfg.mobile_base.enabled = false;
     cfg.voice.enabled = voice_mode || voice_stdin;
     if (tts_mode || status_stdout) cfg.voice.tts_enabled = true;

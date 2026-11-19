@@ -24,7 +24,12 @@ namespace perceptive_grasp {
 /// Narrow a double device range to float planner bounds without enlarging it.
 std::pair<float, float> PlannerJointRange(double lower, double upper);
 
-/** Serialized device access. No connection or read implicitly enables, homes or clears faults. */
+/**
+ * @brief Serialized device access.
+ *
+ * Connection and reads stay read-only: no feedback call enables, homes or clears faults. Torque is
+ * requested only by Enable(), which the executor calls once at startup unless it is switched off.
+ */
 class ExecutorDevice {
 public:
     explicit ExecutorDevice(std::unique_ptr<spacemit::manipulation::DeviceSession> session);
@@ -32,6 +37,8 @@ public:
     /// Validate a registered assembly offline, without connecting it.
     static std::unique_ptr<ExecutorDevice> Create(const std::string& plan_path);
     void Connect();
+    /// Apply torque to the arm first, then the jaws; idempotent when already enabled.
+    void Enable();
     const std::vector<std::string>& JointNames() const;
     std::vector<double> LowerLimits() const;
     std::vector<double> UpperLimits() const;

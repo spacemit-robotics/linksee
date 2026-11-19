@@ -298,14 +298,32 @@ bool GraspExecutor::Init() {
         if (!safety->Init(config_.urdf_path, config_.base_link, config_.tip_link, &detail)) {
             throw std::runtime_error(detail);
         }
-        device->Connect();  // No motor setup, enable, target, homing or fault reset.
+        device->Connect();  // Read-only: no target, homing or fault reset.
+        if (config_.enable_on_start) {
+            device->Enable();  // Torque on the arm, then the jaws; the first gate needs both.
+        }
         device_ = std::move(device);
         kin_ = std::move(kinematics);
         arm_path_safety_ = std::move(safety);
-        std::cout << "[GraspExecutor] manipulation device connected" << std::endl;
+        std::cout << "[GraspExecutor] manipulation device connected"
+                  << (config_.enable_on_start ? " and enabled" : " (torque untouched)") << std::endl;
         return true;
     } catch (const std::exception& error) {
         std::cerr << "[GraspExecutor] " << error.what() << std::endl;
+        if (config_.enable_on_start) {
+            std::cerr << "[GraspExecutor] Enable failed. Common causes, in order of likelihood:"
+                      << std::endl
+                      << "  1. The arm sagged while torque was off (SO101) and a joint is now"
+                         " outside its calibrated travel." << std::endl
+                      << "     Support the arm, move the offending joint back inside the range by"
+                         " hand, then rerun." << std::endl
+                      << "  2. Another program holds the device (vendor tool, teleoperation,"
+                         " hand-eye page). Close it; do not delete the lock file." << std::endl
+                      << "  3. The serial path changed. Check the port in the device plan against"
+                         " `ls /dev/serial/by-id/`." << std::endl
+                      << "  Recover by hand with `manipulation enable`, or start with"
+                         " `--no-enable` if the arm is already energised." << std::endl;
+        }
         RecordResult(GraspResult::MOVE_FAILED, "init", error.what());
         return false;
     }

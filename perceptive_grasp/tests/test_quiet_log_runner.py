@@ -76,6 +76,10 @@ class QuietLogRunnerTest(unittest.TestCase):
             "Error loading config: unsupported camera.type: remote_mujoco\n"))
         self.assertTrue(MODULE.should_keep_line(
             "Failed to start ./perceptive_grasp_core: permission denied\n"))
+        self.assertTrue(MODULE.should_keep_line(
+            "Mode: torque untouched (arm stays as found)\n"))
+        self.assertTrue(MODULE.should_keep_line(
+            "Mode: plan-only (no motion commands)\n"))
 
     def test_extracts_status_event_from_interleaved_module_log(self):
         line = (

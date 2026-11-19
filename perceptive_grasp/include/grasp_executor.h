@@ -127,6 +127,9 @@ struct ExecutorConfig {
     std::string device_plan;
     std::string model;
     std::string kinematics_solver = "eigen";
+    // Startup takes torque on the arm and jaws so the first motion gate passes. Turn it off to
+    // connect read-only, for example to inspect a rig that must stay limp.
+    bool enable_on_start = true;
     // 运动学
     std::string urdf_path = "../urdf/so101.urdf";
     std::string base_link = "base_link";

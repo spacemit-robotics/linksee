@@ -16,6 +16,14 @@
 namespace perceptive_grasp {
 namespace manipulation = spacemit::manipulation;
 
+namespace {
+// A latched device refuses every later call, so the first failure is the only useful one. The
+// latch lives in this process: rerunning the command is a clean reconnect, no replug needed.
+constexpr char kLatched[] =
+        "grasp device latched by an earlier error; rerun the command to reconnect "
+        "(see the first failure above for the cause)";
+}  // namespace
+
 std::pair<float, float> PlannerJointRange(double lower, double upper) {
     if (!std::isfinite(lower) || !std::isfinite(upper) || lower > upper)
         throw std::runtime_error("invalid device joint range");
@@ -87,6 +95,25 @@ void ExecutorDevice::Connect() {
     }
 }
 
+void ExecutorDevice::Enable() {
+    std::lock_guard<std::recursive_mutex> guard(mutex_);
+    if (!connected_) throw std::runtime_error("grasp device is not connected");
+    if (failed_) throw std::runtime_error(kLatched);
+    // Arm first: the jaws are only allowed to take torque while the arm holds its pose.
+    try {
+        session_->EnableArm();
+        session_->EnableEffector();
+        const auto arm = ReadArm();
+        const auto gripper = ReadGripper();
+        if (!arm.enabled || !arm.position_mode || !gripper.enabled.value_or(false)) {
+            throw std::runtime_error("grasp device did not confirm torque on the arm and jaws");
+        }
+    } catch (...) {
+        Fail();
+        throw;
+    }
+}
+
 const std::vector<std::string>& ExecutorDevice::JointNames() const { return joints_; }
 
 std::vector<double> ExecutorDevice::LowerLimits() const {
@@ -103,7 +130,7 @@ std::vector<double> ExecutorDevice::UpperLimits() const {
 
 manipulation::ArmState ExecutorDevice::ReadArm() {
     std::lock_guard<std::recursive_mutex> guard(mutex_);
-    if (failed_) throw std::runtime_error("grasp device latched; reconnect required");
+    if (failed_) throw std::runtime_error(kLatched);
     try {
         auto state = session_->ReadArm();
         if (state.fault || state.sample_id <= arm_sample_) {
@@ -119,7 +146,7 @@ manipulation::ArmState ExecutorDevice::ReadArm() {
 
 manipulation::EffectorState ExecutorDevice::ReadGripper() {
     std::lock_guard<std::recursive_mutex> guard(mutex_);
-    if (failed_) throw std::runtime_error("grasp device latched; reconnect required");
+    if (failed_) throw std::runtime_error(kLatched);
     try {
         auto state = session_->ReadEffector();
         if (state.fault || state.positions.size() != 1 ||
@@ -137,7 +164,7 @@ manipulation::EffectorState ExecutorDevice::ReadGripper() {
 
 void ExecutorDevice::FollowArm(const std::vector<float>& joints, double speed_scale) {
     std::lock_guard<std::recursive_mutex> guard(mutex_);
-    if (failed_) throw std::runtime_error("grasp device latched; reconnect required");
+    if (failed_) throw std::runtime_error(kLatched);
     manipulation::JointPoint point;
     point.target_rad.assign(joints.begin(), joints.end());
     point.speed_scale = speed_scale;
@@ -159,7 +186,7 @@ void ExecutorDevice::FollowArm(const std::vector<float>& joints, double speed_sc
 
 void ExecutorDevice::FollowGripper(double position, double duration_s) {
     std::lock_guard<std::recursive_mutex> guard(mutex_);
-    if (failed_) throw std::runtime_error("grasp device latched; reconnect required");
+    if (failed_) throw std::runtime_error(kLatched);
     try {
         const auto result = session_->FollowEffector({{position}, duration_s});
         if (result.status != manipulation::Result::kSucceeded) {

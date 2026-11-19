@@ -1,62 +1,54 @@
 # perceptive_grasp
 
-`perceptive_grasp` 是一套面向桌面场景的闭环视觉抓取方案。系统从 RGB-D 图像中识别目标、恢复其三维位置与形态，并据此选择抓取方式、验证运动路径和驱动机械臂完成抓取与放置。
-
-观察姿态或底盘位置改变后，系统重新感知场景并更新计划；任务异常时进入安全恢复流程。目标超出舒适抓取区时，底盘完成短距离对齐，系统在停车后重新感知并更新计划。
-
-语音交互作为可选入口，用于下发任务和播报执行状态。
-
-下图以 Linksee 真机抓取为主线，展示从 RGB-D 感知、目标检测与关联、三维几何估计到安全规划和机械臂执行的完整闭环。
+面向桌面场景的闭环视觉抓取方案：从 RGB-D 图像识别目标、恢复三维位置与形态，据此选择抓取
+方式、验证运动路径并驱动机械臂完成抓取与放置。目标超出舒适抓取区时，底盘先短距离对齐，停
+车后重新感知再规划。语音交互是可选入口。
 
 ![perceptive_grasp 真机抓取链路](docs/assets/grasp-system-flow-v2.svg)
 
-同一套 pipeline 支持三种部署方式，共用感知、规划、任务控制和语音接口。
+同一套 pipeline 支持三种部署，共用感知、规划、任务控制和语音接口。真机使用
+`config/grasp_pipeline.yaml`，RGB-D 输入可选 RealSense D435i 或 `spacemit_las2`。
 
-| 部署方式 | 设备及执行后端 | 部署位置 |
+| 部署方式 | 设备及执行后端 | 位置 |
 | --- | --- | --- |
-| Linksee 真机 | `manipulation` 控制 SO101 与夹爪；内置底盘驱动控制底盘 | K3 |
-| MuJoCo 同机部署 | UR5e + Robotiq 2F-85 仿真（`manipulation`） | 仿真服务与 pipeline 在同一台 PC 或 K3 |
-| MuJoCo 跨机部署 | UR5e + Robotiq 2F-85 仿真（`manipulation`） | 服务在 PC，pipeline 在 K3 |
+| Linksee 真机 | `manipulation` 控制 SO101 与夹爪；内置底盘驱动 | K3 |
+| MuJoCo 同机 | UR5e + Robotiq 2F-85（`manipulation`） | 服务与 pipeline 同机 |
+| MuJoCo 跨机 | 同上 | 服务在 PC，pipeline 在 K3 |
 
-真机使用 `config/grasp_pipeline.yaml`，RGB-D 输入选择 RealSense D435i 或 `spacemit_las2`。
-
-本文的仿真部署采用独立的仿真服务和抓取 pipeline，分别读取以下配置：
-
-- **仿真服务**（`mujoco_grasp_sim_server`）：`config/grasp_pipeline_manipulation_mujoco.yaml`，配置仿真场景、模拟 RGB-D 相机和仿真设备。
-- **抓取 pipeline**（`perceptive_grasp`）：`config/grasp_pipeline_manipulation_remote.yaml`，配置服务连接、感知和任务参数。
-
-同机部署直接连接 `127.0.0.1:9090`；跨机部署通过 SSH 端口转发连接 PC 上的服务，K3 的 pipeline 仍使用该回环地址。
+仿真部署分两个进程：服务端 `mujoco_grasp_sim_server` 读
+`config/grasp_pipeline_manipulation_mujoco.yaml`；抓取端 `perceptive_grasp` 读
+`config/grasp_pipeline_manipulation_remote.yaml`。同机连 `127.0.0.1:9090`，跨机走 SSH
+端口转发，pipeline 仍用该回环地址。
 
 ## 1. 功能范围
 
-`perceptive_grasp` 提供以下功能：
+- 真机 RGB-D 后端：RealSense D435i、`spacemit_las2`；另有本地和远程 MuJoCo 后端。
+- YOLOv8-Seg 检测和分割目标，并在连续感知中关联目标实例。
+- 由分割掩码和深度估计目标点云、桌面平面、三维尺寸和水平主轴。
+- 按三维形状和候选可执行性选择顶抓或侧抓，生成对应路径。
+- 规划阶段控制底盘短距离调整，停车后重感知重规划。
+- 动作前验证工作空间、逆运动学、关节限制、桌面间隙和完整路径。
+- 执行接近、夹取、抬升或退出、放置、归位和失败恢复。
+- 可选本地语音桥：接收抓取、取消、结束命令并播报状态。
 
-- 支持 RealSense D435i 和 `spacemit_las2` 两种真机 RGB-D 后端，以及本地和远程 MuJoCo RGB-D 后端。
-- 使用 YOLOv8-Seg 检测和分割目标，并在连续感知过程中关联目标实例；仿真配置可使用实例颜色辅助分割。
-- 根据分割掩码和深度信息估计目标点云、桌面平面、三维尺寸和水平主轴。
-- 根据目标三维形状和候选可执行性选择顶抓或侧抓，并生成对应抓取路径。
-- 在规划阶段控制底盘短距离调整位置，停车后重新感知和规划。
-- 在机械臂动作前验证工作空间、逆运动学、关节限制、桌面间隙和完整路径。
-- 执行接近、夹取、抬升或退出、放置、归位和失败恢复动作。
-- 可通过本地语音桥接收抓取、取消和结束命令，并播报任务状态。
-
-本方案面向桌面或近距离场景中的单目标抓取。底盘辅助不包含导航、避障和全局路径规划。
+面向桌面或近距离单目标抓取。底盘辅助不含导航、避障和全局路径规划。
 
 ## 2. 系统组成
 
 | 模块 | 实现 | 作用 |
 |---|---|---|
-| RGB-D 输入 | RealSense D435i / `spacemit_las2` / MuJoCo | 输出像素对齐的彩色图像、深度图和相机内参 |
-| 目标检测 | `vision_service` / OpenCV DNN | 运行 YOLOv8-Seg，输出目标类别、检测框和分割掩码 |
-| 任务控制 | `grasp_pipeline` | 组织目标关联、策略锁定、观察或底盘动作后的重感知、机械臂执行和失败恢复 |
-| 抓取规划 | `grasp_planner` / `grasp_geometry` | 估计目标点云和桌面平面，生成并验证顶抓或侧抓候选 |
-| 机械臂执行 | `manipulation` | 统一控制 Linksee SO101 或仿真机械臂和夹爪 |
-| 手眼标定 | `manipulation` 标定会话 | 采集静止姿态与图像，求解和导出相机外参 |
+| RGB-D 输入 | RealSense D435i / `spacemit_las2` / MuJoCo | 输出像素对齐的彩色图、深度图和内参 |
+| 目标检测 | `vision_service` / OpenCV DNN | 运行 YOLOv8-Seg，输出类别、检测框和掩码 |
+| 任务控制 | `grasp_pipeline` | 目标关联、策略锁定、动作后重感知、失败恢复 |
+| 抓取规划 | `grasp_planner` / `grasp_geometry` | 估计点云和桌面平面，生成并验证候选 |
+| 机械臂执行 | `manipulation` | 统一控制 SO101 或仿真机械臂与夹爪 |
+| 手眼标定 | `manipulation` 标定会话 | 采集静止姿态与图像，求解导出外参 |
 | 底盘辅助 | `src/chassis/`（内置） | 调整机器人与目标的相对位置 |
-| 语音交互 | `spacemit_audio` / VAD / ASR / TTS | 接收语音命令并播报任务状态 |
-| MuJoCo 仿真 | UR5e / Robotiq 2F-85 场景 | 运行物理仿真、模拟 RGB-D 相机与抓取执行器 |
+| 语音交互 | `spacemit_audio` / VAD / ASR / TTS | 接收命令并播报状态 |
+| MuJoCo 仿真 | UR5e / Robotiq 2F-85 场景 | 物理仿真、模拟 RGB-D 相机与执行器 |
 
-MuJoCo 模式通过仿真相机与仿真执行器替代真实硬件。机械臂与夹爪分别使用 `mujoco_ur5e` 和 `mujoco_robotiq_2f85` 驱动，与真机模式使用相同的设备接口。
+仿真模式用仿真相机和执行器替代真实硬件，机械臂与夹爪分别用 `mujoco_ur5e` 和
+`mujoco_robotiq_2f85` 驱动，与真机共用同一套设备接口。
 
 ## 3. 准备环境
 
@@ -67,14 +59,13 @@ MuJoCo 模式通过仿真相机与仿真执行器替代真实硬件。机械臂�
 
 ## 4. 配置
 
-主配置文件为 [`config/grasp_pipeline.yaml`](config/grasp_pipeline.yaml)。首次部署时至少完成以下配置：
+主配置文件 [`config/grasp_pipeline.yaml`](config/grasp_pipeline.yaml)。首次部署至少完成四项：
+串口路径、RGB-D 后端、手眼标定、音频设备。
 
-1. 在 `config/devices/linksee_so101.yaml` 的机械臂、夹爪 `options.port` 中填写同一个稳定串口路径；底盘串口仍在主配置中设置。
-2. 选择 RGB-D 输入后端，并填写设备、模型和标定参数。LAS2 还须在 `camera.spacemit_las2.serial` 登记本台相机的序列号或固定资产编号。
-3. 完成 eye-to-hand 标定，更新当前相机后端对应的手眼标定结果。
-4. 根据实际音频设备更新 ASR 和 TTS 设备编号。
+**串口**：`config/devices/linksee_so101.yaml` 里机械臂和夹爪的 `options.port` 填同一个稳定
+路径（用 `/dev/serial/by-id/...`，别写 `ttyACM0`，插拔顺序会变）；底盘串口在主配置里设。
 
-将本台 SO101 的舵机校准文件放入应用配置目录，不使用其他设备的偏置和行程：
+**舵机校准文件**：把本台 SO101 的校准文件放进应用配置目录，不要借用其他设备的偏置和行程。
 
 ```bash
 cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
@@ -83,17 +74,9 @@ cp -n "$SO101_CALIBRATION/so101_calibration.json" config/devices/
 cp -n "$SO101_CALIBRATION/so101_gripper_calibration.json" config/devices/
 ```
 
-各类配置的职责如下，路径均相对各自配置文件解析：
+首次使用须先跑 `so101-calibrate` 完成舵机校准；手眼标定不替代它。
 
-| 配置 | 内容 |
-| --- | --- |
-| 设备配置 | 驱动、连接、限位和夹爪端点 |
-| `manipulator.model` | 关节链 |
-| `manipulator.calibration_resources` | 标定采集绑定的校准文件 |
-
-首次使用须先通过 `so101-calibrate` 完成舵机校准。手眼标定不代替舵机校准。
-
-固定相机和末端标定板后，采集 15 个静止姿态并求解外参：
+**手眼标定**：固定相机和末端标定板后，采集 15 个静止姿态并求解外参。
 
 ```bash
 source ~/spacemit_robot/build/envsetup.sh
@@ -106,13 +89,27 @@ python3 scripts/calibrate_hand_eye.py --solve-only --installation-id linksee_sit
   --dataset-dir output/hand_eye --apply-config config/grasp_pipeline.yaml
 ```
 
-示例使用 4 × 5 ChArUco 板，方格 20 mm、标记 14 mm；参数须与实测尺寸一致。标定板到相机的距离默认限制在 0.10~0.40 m，推荐 0.20~0.30 m；工作空间较深、需要更远样本时加 `--max-distance 0.60`，远距样本只补覆盖，近距仍应占多数。
+示例用 4 × 5 ChArUco 板，方格 20 mm、标记 14 mm，参数须与实测尺寸一致。板到相机默认限
+0.10~0.40 m，推荐 0.20~0.30 m；工作空间深、需要更远样本时加 `--max-distance 0.60`，远距
+样本只补覆盖，近距仍应占多数。
 
-- **采集操作**：按现场规程调整姿态并停止，退出其他控制程序后按回车采集（输入 `CAPTURE` 等效）。采集只读取设备，不使能、不释放力矩、不运动。
-- **安装要求**：标定板须相对模型末端刚性固定，采集期间不得改变夹爪开度。
-- **数据管理**：数据目录不可覆盖；采集与导出使用同一安装标识。
+- 采集时按现场规程调整姿态并停止，退出其他控制程序后按回车（输入 `CAPTURE` 等效）。采集
+  只读设备，不使能、不释放力矩、不运动。
+- 标定板须相对模型末端刚性固定，采集期间不得改变夹爪开度。
+- 数据目录不可覆盖；采集与导出使用同一安装标识。
 
 标定板生成和质量要求见[手眼标定](docs/hand_eye_calibration.md)。
+
+**RGB-D**：选后端并填设备、模型、标定参数。LAS2 还须在 `camera.spacemit_las2.serial` 登记
+本台相机序列号或固定资产编号。
+
+各类配置的职责（路径相对各自配置文件解析）：
+
+| 配置 | 内容 |
+| --- | --- |
+| 设备配置 | 驱动、连接、限位和夹爪端点 |
+| `manipulator.model` | 关节链 |
+| `manipulator.calibration_resources` | 标定采集绑定的校准文件 |
 
 ## 5. 构建、安装与检查
 
@@ -183,15 +180,7 @@ python3 scripts/check_runtime_env.py \
 
 **以下命令会驱动机械臂和底盘。启动前清理机器人工作空间，确认急停和断电装置可用，并保持人员远离运动范围。**
 
-确认机械臂空载、支撑可靠后，使能机械臂和夹爪。使能会产生保持力矩；应用不自动使能设备。
-
-```bash
-cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
-source ~/spacemit_robot/build/envsetup.sh
-manipulation inspect --plan config/devices/linksee_so101.yaml
-manipulation enable --plan config/devices/linksee_so101.yaml
-manipulation hand-enable --plan config/devices/linksee_so101.yaml
-```
+启动时会自动给机械臂和夹爪上扭矩。机械臂应处于空载、支撑可靠的状态。
 
 抓取指定目标：
 
@@ -202,6 +191,17 @@ source ~/spacemit_robot/build/envsetup.sh
   --config config/grasp_pipeline.yaml \
   --target banana
 ```
+
+不需要自动使能时（例如只做只读检查，或现场规定必须人工使能），加 `--no-enable`：
+
+```bash
+"$PREFIX/bin/perceptive_grasp" \
+  --config config/grasp_pipeline.yaml \
+  --no-enable --plan-only
+```
+
+`--no-enable` 下只连接、只读状态；机械臂未使能时第一个运动阶段会失败并提示如何使能。
+也可以手工执行 `manipulation enable --plan config/devices/linksee_so101.yaml`。
 
 连续抓取：
 

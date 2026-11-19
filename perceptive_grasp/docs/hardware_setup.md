@@ -1,30 +1,30 @@
 # 硬件部署
 
-本文说明 `perceptive_grasp` 在 Linksee 机器人上的硬件连接和设备权限设置。
+本文说明 `perceptive_grasp` 在 Linksee 机器人上的硬件连接与设备权限设置。
 
 ## 1. 硬件清单
 
 | 硬件 | 作用 | 接口 |
 |---|---|---|
 | SpaceMIT K3 | 运行感知、规划、控制和语音程序 | 主控 |
-| RGB-D 相机 | 输出彩色图像和深度信息 | USB 3.0 |
+| RGB-D 相机 | 输出彩色图像和深度 | USB 3.0 |
 | 机械臂与夹爪 | 执行抓取、放置和归位 | USB 串口 |
 | 底盘 | 执行短距离辅助对齐 | USB 串口 |
 | 麦克风和扬声器 | 接收命令和播报状态 | USB Audio / 板载音频 |
 
-RGB-D 相机可使用 RealSense D435i 或 `spacemit_las2` 双目相机。两种后端使用同一套抓取流程，但设备节点、运行库和标定数据不同。
+RGB-D 相机可用 RealSense D435i 或 `spacemit_las2` 双目相机。两者使用同一套抓取流程，但设备节点、运行库和标定数据不同。
 
 ## 2. 连接硬件
 
-连接设备前关闭机械臂和底盘动力，并确认机器人处于稳定支撑状态。
+连接前关闭机械臂和底盘动力，确认机器人处于稳定支撑状态：
 
-1. 将 RGB-D 相机固定在机身上，使工作区位于彩色图像和深度视野内。
-2. 将机械臂舵机总线连接到 K3 USB 口。
-3. 将底盘连接到 K3 USB 口。
-4. 将 RGB-D 相机连接到 K3 的 USB 3.0 或更高规格接口。
+1. 把 RGB-D 相机固定在机身上，使工作区位于彩色与深度视野内；
+2. 机械臂舵机总线接到 K3 USB 口；
+3. 底盘接到 K3 USB 口；
+4. RGB-D 相机接到 K3 的 USB 3.0 或更高规格接口；
 5. 连接麦克风和扬声器。
 
-首次使用或调整相机位置、相机角度或机械臂安装位置后，先执行[手眼标定](hand_eye_calibration.md)。
+首次使用，或调整过相机位置、角度、机械臂安装位置后，先做[手眼标定](hand_eye_calibration.md)。
 
 ## 3. 配置设备权限
 
@@ -35,7 +35,7 @@ sudo usermod -aG dialout,video,audio "$USER"
 exec su - "$USER"
 ```
 
-spacemit_las2 运行时还需要访问 `/dev/dma_heap/system`。使用 spacemit_las2 后端时创建 udev 规则：
+`spacemit_las2` 运行时还需要访问 `/dev/dma_heap/system`，用该后端时创建 udev 规则：
 
 ```bash
 echo 'SUBSYSTEM=="dma_heap", KERNEL=="system", GROUP="video", MODE="0660"' | \
@@ -46,8 +46,6 @@ sudo chmod 0660 /dev/dma_heap/system
 ```
 
 ## 4. 识别机械臂和底盘串口
-
-运行环境检查：
 
 ```bash
 cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp
@@ -68,22 +66,18 @@ python3 scripts/check_runtime_env.py \
 [SUGGEST] mobile_base.dev_path: "/dev/serial/by-id/..."
 ```
 
-将机械臂路径写入 `config/devices/linksee_so101.yaml` 中机械臂与夹爪的 `options.port`，两者须一致。
-底盘路径写入 `config/grasp_pipeline.yaml` 的 `mobile_base.dev_path`。
-优先使用 `/dev/serial/by-id/...`，避免插拔顺序改变设备编号。
+把机械臂路径写入 `config/devices/linksee_so101.yaml` 中机械臂与夹爪的 `options.port`（两者须一致），底盘路径写入 `config/grasp_pipeline.yaml` 的 `mobile_base.dev_path`。优先用 `/dev/serial/by-id/...`，避免插拔顺序改变设备编号。
 
 ## 5. 验证 RGB-D 相机
 
-### 5.1 验证 RealSense D435i
-
-确认系统能够发现相机：
+### 5.1 RealSense D435i
 
 ```bash
 source /opt/ros/humble/setup.sh
 rs-enumerate-devices
 ```
 
-构建应用后采集彩色图像和深度图：
+构建应用后采集彩色图与深度图：
 
 ```bash
 cd ~/spacemit_robot/application/ros2/linksee/perceptive_grasp/build
@@ -95,18 +89,16 @@ source ~/spacemit_robot/build/envsetup.sh
   --output /tmp/debug_camera
 ```
 
-`/tmp/debug_camera` 中应生成非空的彩色图像和深度图。
+`/tmp/debug_camera` 中应生成非空的彩色图和深度图。
 
-### 5.2 验证 `spacemit_las2` 双目相机
-
-确认相机设备和采集格式：
+### 5.2 `spacemit_las2` 双目相机
 
 ```bash
 v4l2-ctl --list-devices
 v4l2-ctl -d /dev/v4l/by-id/<LAS2_VIDEO_DEVICE> --list-formats-ext
 ```
 
-spacemit_las2 运行库需要 `YUYV 4000x1200@30`、可访问的 `/dev/dma_heap/system`、匹配的 onnx 模型和双目标定 json。环境检查应显示：
+运行库需要 `YUYV 4000x1200@30`、可访问的 `/dev/dma_heap/system`、匹配的 onnx 模型和双目标定 json。环境检查应显示：
 
 ```text
 [OK] LAS2 video device: ...
@@ -115,32 +107,24 @@ spacemit_las2 运行库需要 `YUYV 4000x1200@30`、可访问的 `/dev/dma_heap/
 [OK] LAS2 calibration fields: complete
 ```
 
-构建应用后，可使用同一个 `debug_view` 命令采集 spacemit_las2 的彩色图像和深度图。工具根据 `camera.type` 自动选择后端。
+同一个 `debug_view` 命令也可采集 LAS2 的彩色图与深度图，工具按 `camera.type` 自动选后端。
 
 ## 6. 验证音频设备
-
-列出 ALSA 采集和播放设备：
 
 ```bash
 arecord -l
 aplay -l
 ```
 
-环境检查会输出可供 `voice.asr.device` 和 `voice.tts.playback_device` 使用的设备编号。只运行命令行抓取时不需要音频设备。
+环境检查会输出可用于 `voice.asr.device` 和 `voice.tts.playback_device` 的设备编号。只跑命令行抓取时不需要音频设备。
 
 ## 7. 完成运行前检查
 
-硬件和配置正确时，环境检查最后一行显示：
-
-```text
-[SUMMARY] ready
-```
-
-如果检查失败，先按输出中的 `[FAIL]` 和 `[SUGGEST]` 修正设备或配置，再运行抓取程序。常见故障见[故障诊断](debugging.md)。
+硬件和配置正确时，环境检查最后一行显示 `[SUMMARY] ready`。失败时先按输出中的 `[FAIL]` 和 `[SUGGEST]` 修正设备或配置，再运行抓取程序；常见故障见[故障诊断](debugging.md)。
 
 真实运动前确认：
 
-- 机械臂工作空间内没有人员和障碍物。
-- 底盘前后左右留有移动和转向空间。
-- 底盘急停、供电和地面摩擦条件正常。
-- RGB-D 相机、机械臂和底盘安装没有松动。
+- 机械臂工作空间内没有人员和障碍物；
+- 底盘前后左右留有移动和转向空间；
+- 底盘急停、供电和地面摩擦条件正常；
+- 相机、机械臂和底盘安装没有松动。

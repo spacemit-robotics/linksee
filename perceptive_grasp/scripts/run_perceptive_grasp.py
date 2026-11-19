@@ -40,7 +40,7 @@ def should_keep_line(line: str) -> bool:
         return True
     if text.startswith("=== perceptive_grasp ==="):
         return True
-    if text.startswith(("Config:", "Target:")):
+    if text.startswith(("Config:", "Target:", "Mode:")):
         return True
     if text.startswith(("Usage:", "Options:", "Examples:", "  --", "  /")):
         return True

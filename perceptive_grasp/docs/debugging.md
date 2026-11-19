@@ -181,55 +181,48 @@ python3 scripts/check_runtime_env.py \
 
 ## 5. 排查机械臂执行
 
-### 5.1 确认机械臂已使能
+### 5.1 连接、使能与报错含义
 
-管线只连接设备、只读状态，**不使能、不只清零位、不发送目标**。机械臂或夹爪没使能时，
-第一个需要运动的阶段就会失败，报 `arm is not enabled; enable the arm before moving the
-end effector`。
-
-```
-[03] OBSERVING elapsed_ms=102 result=FAILED
-message=Observe move failed: motion or device error (action=gripper_command,
-        detail=arm is not enabled; enable the arm before moving the end effector)
-```
-
-用 operator CLI 查看与设置使能状态：
+管线启动时连接设备，随后**默认给机械臂和夹爪上扭矩**，所以直接运行不需要先手动使能。用
+`--no-enable` 或 `--plan-only` 可关闭，此时只连接、只读状态。
 
 ```bash
-manipulation inspect       # 只读;看 enabled / fault / latched
-manipulation enable        # 使能机械臂扭矩
-manipulation hand-enable   # 使能夹爪扭矩
+manipulation inspect       # 只读；看 enabled / fault / latched
 ```
 
-使能会锁住扭矩，机械臂保持当前姿态并抗外力。执行前清理工作空间，确认周围无人且可随时
-切断驱动电源。使能状态由舵机保持，一次使能后反复运行管线不必重新使能。
+使能会锁住扭矩，机械臂保持当前姿态并抗外力。执行前清理工作空间，确认可随时切断驱动电源。
+扭矩状态由舵机保持，一次使能后反复运行管线不必重新使能。
 
-**`grasp device latched; reconnect required` 通常不是独立故障。** 执行器里任一读失败都会置位
-内部 `failed_`，之后所有操作返回这条错误。它只在当前进程内有效，重跑一次就是干净的，
-不需要重启系统或重新插拔。真正的原因要看第一次失败的那条 detail。
+三条报错的含义和下一步：
+
+| 报错 | 含义 | 下一步 |
+| --- | --- | --- |
+| `arm is not enabled; run ...` | 本次没有使能（用了 `--no-enable`，或使能被驱动拒绝） | 去掉 `--no-enable` 重跑；或先 `manipulation enable <plan>` |
+| `grasp device latched ... rerun the command` | 本进程内已因更早的错误锁存，后续调用全被拒 | 看**第一条**失败的 detail；重跑命令即干净重连，无需重启或重插 |
+| `cannot open <port>: serial port does not exist` | 配置的串口不存在 | `ls -l /dev/serial/by-id/`，把完整路径写进 `device.yaml` |
+
+`manipulation enable <plan>` 和 `manipulation hand-enable <plan>` 分别给机械臂和夹爪上扭矩。
 
 ### 5.2 串口设备名错位
 
-同一台机器上接多个 USB 串口设备时，`/dev/ttyACM0` 和 `ttyACM1` 谁是谁由枚举顺序决定，
-**每次插拔都可能互换**。设备配置写死 `port: "/dev/ttyACM0"` 的话，某天就会指向别的设备，
-表现为读不到电机：
+同机接多个 USB 串口时，`/dev/ttyACM0` 和 `ttyACM1` 谁是谁由枚举顺序决定，**每次插拔都可能
+互换**。配置写死 `ttyACM0` 的话，某天就会指向别的设备：
 
 ```
 [Feetech] Read paras failed! ID: 1, Addr: 0
-read SO101 motor 1: Input/output error
+read SO101 motor 1 failed: no reply on /dev/ttyACM0 — ...
 ```
 
-按 USB 序列号固定路径可以避免。`/dev/serial/by-id/` 由系统自动维护，不插拔就不会变：
+按 USB 序列号固定路径即可避免。`/dev/serial/by-id/` 由系统自动维护，不插拔就不会变：
 
 ```bash
 ls -l /dev/serial/by-id/
 # usb-1a86_USB_Single_Serial_5B14113459-if00 -> ../../ttyACM1
 ```
 
-把 `device.yaml` 的 `port` 改成这个完整路径即可。写成 `by-id` 路径后，硬件序列号换了
-（换线、换舵机板）要同步改配置。
+把 `device.yaml` 的 `port` 改成这个完整路径。换线或换舵机板后序列号变了，要同步改配置。
 
-判断某个口上到底是不是电机总线，可以直接发 Feetech PING 看有没有标准应答包：
+要判断某个口上是不是电机总线，直接发 Feetech PING 看有没有标准应答：
 
 ```bash
 python3 - <<'PY'
@@ -245,27 +238,16 @@ for port in ("/dev/ttyACM0", "/dev/ttyACM1"):
 PY
 ```
 
-应答以 `ffff` 开头（例如 `ffff010200fc`）才是电机总线。读到一串 ASCII 文本说明那个口是
-别的设备，不是总线。注意：读参数失败但 PING 有应答，说明总线通、只是该 ID 的舵机没上电
-或不在这个总线上。
+应答以 `ffff` 开头（例如 `ffff010200fc`）才是电机总线；读到一串 ASCII 文本说明那个口是别的
+设备。读参数失败但 PING 有应答，说明总线通、只是该 ID 的舵机没上电或不在这个总线上。
 
-### 5.3 读取当前关节角
-
-通过设备配置只读获取机械臂关节角：
+### 5.3 只读查看关节角与验证小范围运动
 
 ```bash
-./build/read_joints \
-  --plan config/devices/linksee_so101.yaml
+./build/read_joints --plan config/devices/linksee_so101.yaml   # 只读，弧度为单位的关节数组
 ```
 
-工具输出弧度关节数组，不使能、不发送目标。读取失败时，检查设备配置、串口权限和控制权交接。
-
-执行中出现反馈故障或超时后，程序请求保持并锁存，后续目标被拒绝。先排除故障、确认现场安全，再重新启动应用；不自动清错或恢复运动。
-真机执行器的 `EmergencyStop()` 请求保持并锁存，不释放力矩，也不替代实体急停。
-
-### 5.4 验证小范围运动
-
-**该步骤会驱动真实机械臂。清理工作空间，并确保可以立即切断驱动电源。**
+**下一步会驱动真实机械臂。清理工作空间，确保可立即切断驱动电源。**
 
 ```bash
 ./build/debug_execute_safe \
@@ -274,9 +256,11 @@ PY
   --yaw 90
 ```
 
-首次测试使用交互确认，不要增加 `--yes`。工具先移动到观察姿态，再移动到指定位置；不会下探，也不会闭合夹爪。
+首次测试用交互确认，不要加 `--yes`。工具先到观察姿态再到指定位置，不下探、不闭合夹爪。
 
-如果 IK 成功但机械臂不动，使用主程序 `--debug` 日志检查串口、舵机响应和动作超时。机械臂运动方向或关节姿态异常时，停止运行并重新核对 URDF、关节零位和预定义姿态。
+机械臂不动或姿态异常时，停止运行，核对 URDF、关节零位和预定义姿态。执行中出现反馈故障或
+超时后，程序请求保持并锁存，后续目标被拒绝：先排除故障、确认现场安全，再重新启动。真机
+执行器的 `EmergencyStop()` 只请求保持并锁存，不释放力矩，也不替代实体急停。
 
 ## 6. 排查底盘辅助对齐
 

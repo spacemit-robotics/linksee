@@ -464,13 +464,14 @@ card 1: Camera [2K USB Camera], device 0: USB Audio [USB Audio]
         main_source = (ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
         self.assertIn('voice["home_words"]', main_source)
 
-    def test_pipeline_config_enables_webrtc_aec_for_usb_audio(self):
+    def test_pipeline_config_uses_a_mode_the_default_build_supports(self):
+        # K3 默认构建 ENABLE_WEBRTC_AEC=OFF，默认配置不能要求 WebRTC AEC。
         config_path = ROOT / "config" / "grasp_pipeline.yaml"
         with config_path.open("r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
 
         echo_config = config["voice"]["echo_cancellation"]
-        self.assertEqual(echo_config["mode"], "webrtc_aec")
+        self.assertEqual(echo_config["mode"], "half_duplex")
         self.assertGreaterEqual(echo_config["delay_ms"], 0)
         self.assertTrue(echo_config["noise_suppression"])
 
